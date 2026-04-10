@@ -1,5 +1,10 @@
 # agent-dispatch
 
+[![PyPI](https://img.shields.io/pypi/v/agent-dispatch)](https://pypi.org/project/agent-dispatch/)
+[![CI](https://github.com/ginkida/agent-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/ginkida/agent-dispatch/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/agent-dispatch)](https://pypi.org/project/agent-dispatch/)
+[![License](https://img.shields.io/github/license/ginkida/agent-dispatch)](LICENSE)
+
 **MCP server that lets Claude Code agents delegate tasks to agents in other project directories.**
 
 Each agent runs as a separate `claude -p` session in its own project directory — inheriting that project's MCP servers, CLAUDE.md, and tools. The calling agent just gets the result back.
