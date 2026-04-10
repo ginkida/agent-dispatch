@@ -117,7 +117,8 @@ class TestDispatch:
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
 
-    def test_missing_directory(self, tmp_path: Path):
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    def test_missing_directory(self, _which, tmp_path: Path):
         agent = AgentConfig(directory=tmp_path / "nonexistent", description="test")
         result = dispatch("test", "hello", agent, self.settings)
         assert not result.success
@@ -249,7 +250,8 @@ class TestDispatchStream:
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
 
-    def test_missing_directory(self, tmp_path: Path):
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    def test_missing_directory(self, _which, tmp_path: Path):
         agent = AgentConfig(directory=tmp_path / "nonexistent", description="test")
         result = dispatch_stream("test", "hello", agent, self.settings)
         assert not result.success
