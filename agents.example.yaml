@@ -1,0 +1,24 @@
+agents:
+  # Infrastructure agent — has Portainer MCP for container management
+  infra:
+    directory: ~/projects/infra
+    description: "Infrastructure agent. MCP servers: portainer. Can check container logs, restart services, inspect Docker state."
+    timeout: 300
+
+  # Backend agent — source code, tests, database
+  backend:
+    directory: ~/projects/backend
+    description: "Backend API agent. Python, FastAPI, PostgreSQL. Can modify code, run tests, check migrations."
+    timeout: 300
+    model: null  # use default model
+
+  # Frontend agent
+  # frontend:
+  #   directory: ~/projects/frontend
+  #   description: "Frontend React app. Can modify components, run build, check TypeScript errors."
+  #   timeout: 180
+
+settings:
+  default_timeout: 300
+  max_dispatch_depth: 3
+  # default_max_budget_usd: 1.0  # optional cost limit per dispatch
