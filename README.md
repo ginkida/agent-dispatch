@@ -1,35 +1,8 @@
 # agent-dispatch
 
-**Delegate tasks between Claude Code agents across projects.**
+**MCP server that lets Claude Code agents delegate tasks to agents in other project directories.**
 
-One agent doesn't need to know everything. Let your backend agent ask the infra agent to check container logs — without switching chats, copy-pasting, or wasting context.
-
-## The Problem
-
-You have multiple Claude Code projects, each with their own MCP servers and tools:
-
-```
-~/projects/infra/     → Portainer MCP (container logs, restarts)
-~/projects/backend/   → Source code, tests, database
-~/projects/frontend/  → React app, build tools
-```
-
-When your backend agent needs container logs, you manually copy-paste between chats. That's slow, error-prone, and wastes context window on both sides.
-
-## The Solution
-
-```
-Backend agent: "The service is crashing, find and fix the bug"
-  │
-  ├─ dispatch("infra", "find recent errors in container logs",
-  │           caller="backend", goal="debug production crash")
-  │    └─→ runs claude -p in ~/projects/infra/ (has Portainer MCP)
-  │    └─→ returns: "TypeError in scheduler.py:42"
-  │
-  └─ fixes scheduler.py:42
-```
-
-`agent-dispatch` is an MCP server that gives every Claude Code session a `dispatch()` tool. It runs `claude -p` in the target project's directory — so the dispatched agent inherits that project's MCP servers, CLAUDE.md, and tools. The calling agent just gets the result.
+Each agent runs as a separate `claude -p` session in its own project directory — inheriting that project's MCP servers, CLAUDE.md, and tools. The calling agent just gets the result back.
 
 Works with OAuth, API key, and Claude subscription authentication.
 
@@ -38,7 +11,7 @@ Works with OAuth, API key, and Claude subscription authentication.
 ```bash
 pip install agent-dispatch
 
-# Initialize: creates config + registers MCP server
+# Initialize: creates config + registers MCP server with Claude Code
 agent-dispatch init
 
 # Add agents (description auto-generated from project files)
@@ -46,189 +19,290 @@ agent-dispatch add infra ~/projects/infra
 agent-dispatch add backend ~/projects/backend
 
 # Test it works
-agent-dispatch test infra "What containers are running?"
+agent-dispatch test infra
 ```
 
 Done. Every Claude Code session now has access to all dispatch tools.
 
-## MCP Tools
+## When to Dispatch
 
-### `list_agents()`
+**Do dispatch** when a task needs tools, files, or context from another project:
+- Check container logs via infra agent's Portainer MCP
+- Query a database via db agent's postgres MCP
+- Read code or run tests in another repository
 
-Lists all configured agents with descriptions and health status.
+**Don't dispatch** when you can do it yourself — dispatching spawns a full Claude session.
 
-### `dispatch(agent, task, context?, caller?, goal?)`
+## MCP Tools Reference
 
-Delegate a one-shot task. Results are cached by default — identical requests within the TTL return instantly.
+### `list_agents`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `agent` | string | Agent name from config |
-| `task` | string | What to do (be specific) |
-| `context` | string | Optional: error messages, code snippets |
-| `caller` | string | Who is dispatching — helps the agent understand the request |
-| `goal` | string | The broader objective — the agent can make better trade-offs |
-
-### `dispatch_session(agent, task, session_id?, context?, caller?, goal?)`
-
-Multi-turn dispatch. First call starts a new session; pass back `session_id` to continue.
-
-```
-result = dispatch_session("infra", "List running containers")
-# result.session_id = "abc-123"
-
-result = dispatch_session("infra", "Restart the nginx one", session_id="abc-123")
-# agent remembers previous context
-```
-
-### `dispatch_parallel(dispatches, aggregate?)`
-
-Run multiple dispatch tasks concurrently. Much faster than sequential calls.
+Lists all configured agents. **Call this first** to see what's available.
 
 ```json
-dispatches = [
-  {"agent": "infra", "task": "check pod logs for errors"},
-  {"agent": "db", "task": "are all migrations applied?"},
-  {"agent": "monitoring", "task": "any alerts in the last hour?"}
+// Response
+[
+  {
+    "name": "infra",
+    "directory": "/home/user/projects/infra",
+    "description": "Infrastructure agent. MCP: portainer. Stack: Python, Docker",
+    "healthy": true,
+    "has_claude_md": true,
+    "has_mcp_config": true
+  }
 ]
 ```
 
-With aggregation — results are synthesized by a designated agent:
+### `dispatch`
+
+One-shot task delegation. Results are cached — identical requests within TTL return instantly.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent` | string | yes | Agent name from `list_agents` |
+| `task` | string | yes | What to do — be specific, the agent has no context from your conversation |
+| `context` | string | no | Extra context: error messages, code snippets, stack traces |
+| `caller` | string | no | Your project/role — helps the agent understand who's asking |
+| `goal` | string | no | Broader objective — helps the agent make better trade-offs |
+
+```json
+// Response
+{
+  "agent": "infra",
+  "success": true,
+  "result": "Found 3 errors in container logs: TypeError in scheduler.py:42...",
+  "session_id": "sess-abc-123",
+  "cost_usd": 0.02,
+  "duration_ms": 5000,
+  "num_turns": 2
+}
+```
+
+**Always pass `caller` and `goal`** — the dispatched agent sees a structured prompt:
+
+```markdown
+## Goal
+debug production crash
+
+## Dispatched by
+backend
+
+## Context
+Error: TypeError at scheduler.py:42
+
+## Task
+Check container logs for recent errors related to the scheduler service
+```
+
+### `dispatch_session`
+
+Multi-turn: continue a conversation with an agent. First call starts a session, pass `session_id` back to continue. Never cached.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent` | string | yes | Agent name |
+| `task` | string | yes | Task or follow-up message |
+| `session_id` | string | no | From previous response — empty for new session |
+| `context` | string | no | Extra context |
+| `caller` | string | no | Who is dispatching |
+| `goal` | string | no | Broader objective |
 
 ```
-dispatch_parallel(dispatches, aggregate="backend")
-→ returns { individual_results: [...], aggregated: { result: "Summary: ..." } }
+Turn 1: dispatch_session("infra", "List running containers")
+         → session_id: "sess-abc"
+
+Turn 2: dispatch_session("infra", "Restart the nginx one", session_id="sess-abc")
+         → agent remembers previous context
 ```
 
-### `dispatch_stream(agent, task, context?, caller?, goal?)`
+### `dispatch_parallel`
 
-Same as `dispatch()` but shows live progress via log messages. Use for long-running tasks where you want to monitor what the agent is doing.
+Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
-### `dispatch_dialogue(requester, responder, topic, max_rounds?)`
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `dispatches` | string (JSON) | yes | JSON array of `{"agent", "task", "context?", "caller?", "goal?"}` |
+| `aggregate` | string | no | Agent name to synthesize all results into one answer |
 
-Two agents collaborate through multi-turn dialogue. The `requester` poses a problem, the `responder` provides expertise. They alternate turns until one signals completion or `max_rounds` is reached.
+**Important:** `dispatches` is a JSON string, not a list.
 
+```json
+// Input
+[
+  {"agent": "infra", "task": "check pod logs for errors", "caller": "backend", "goal": "debug crash"},
+  {"agent": "db", "task": "are all migrations applied?", "caller": "backend", "goal": "debug crash"}
+]
 ```
-dispatch_dialogue(
-  requester="backend",
-  responder="db",
-  topic="staging is broken, check if migrations are the cause"
-)
+
+```json
+// Response (without aggregate)
+[
+  {"agent": "infra", "success": true, "result": "No errors in pod logs", ...},
+  {"agent": "db", "success": true, "result": "All migrations applied", ...}
+]
 ```
 
-Returns full conversation, aggregated cost, and whether the dialogue resolved.
+```json
+// Response (with aggregate="backend")
+{
+  "individual_results": [
+    {"agent": "infra", "success": true, "result": "No errors in pod logs", ...},
+    {"agent": "db", "success": true, "result": "All migrations applied", ...}
+  ],
+  "aggregated": {
+    "agent": "backend",
+    "success": true,
+    "result": "Summary: all systems nominal. No pod errors, all migrations applied."
+  }
+}
+```
 
-### `cache_stats()` / `cache_clear()`
+### `dispatch_stream`
+
+Same as `dispatch` but shows live progress while the agent works. Use for long-running tasks. Not cached.
+
+Parameters are identical to `dispatch`.
+
+### `dispatch_dialogue`
+
+Two agents collaborate through multi-turn conversation. Never cached.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `requester` | string | yes | Agent with the problem/context |
+| `responder` | string | yes | Agent with the expertise/tools |
+| `topic` | string | yes | Problem or question to discuss |
+| `max_rounds` | int | no | Max back-and-forth rounds (default: 3, max: 10) |
+
+Each round costs up to 2 dispatches. Agents signal completion with `[RESOLVED]`.
+
+```json
+// Response
+{
+  "resolved": true,
+  "rounds": 2,
+  "total_cost_usd": 0.04,
+  "total_duration_ms": 12000,
+  "final_answer": "Staging had 1 pending migration. Applied successfully.",
+  "conversation": [
+    {"agent": "db", "role": "responder", "round": 1, "message": "Which environment?", "cost_usd": 0.01},
+    {"agent": "backend", "role": "requester", "round": 1, "message": "Staging", "cost_usd": 0.01},
+    {"agent": "db", "role": "responder", "round": 2, "message": "Applied. [RESOLVED]", "cost_usd": 0.01}
+  ]
+}
+```
+
+### `add_agent`
+
+Register a new project directory as an agent. Description is auto-generated from project files if omitted.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Agent name (letters, digits, hyphens, underscores) |
+| `directory` | string | yes | Absolute path to project directory |
+| `description` | string | no | What this agent can do — auto-generated if empty |
+
+### `remove_agent`
+
+Remove an agent from config.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Agent name to remove |
+
+### `cache_stats` / `cache_clear`
 
 View cache hit rate and size, or clear all cached results.
 
+### Error Responses
+
+All tools return errors as:
+
+```json
+{"error": "Unknown agent: 'foo'. Available: infra, db, monitoring"}
+```
+
+## Which Tool to Use
+
+| Scenario | Tool |
+|----------|------|
+| Quick one-off question to another project | `dispatch` |
+| Multi-step workflow with follow-ups | `dispatch_session` |
+| Need answers from several agents at once | `dispatch_parallel` |
+| Long task, want to see progress | `dispatch_stream` |
+| Two agents need to collaborate | `dispatch_dialogue` |
+| Need a combined summary from multiple agents | `dispatch_parallel` with `aggregate` |
+
 ## Configuration
 
-Config lives at `~/.config/agent-dispatch/agents.yaml`:
+Config at `~/.config/agent-dispatch/agents.yaml` (override: `AGENT_DISPATCH_CONFIG` env var):
 
 ```yaml
 agents:
   infra:
     directory: ~/projects/infra
-    description: "Infrastructure agent. MCP servers: portainer."
-    timeout: 300            # seconds (default: 300)
+    description: "Infrastructure agent. MCP: portainer."
+    timeout: 300            # seconds, default: 300
     # model: sonnet         # optional model override
-    # max_budget_usd: 1.0   # optional cost limit per dispatch
-    # permission_mode: auto # optional permission mode
+    # max_budget_usd: 1.0   # cost limit per dispatch
+    # permission_mode: auto # permission mode for the agent
+    # allowed_tools:        # restrict which tools the agent can use
+    #   - Read
+    #   - Grep
+    # disallowed_tools:     # block specific tools
+    #   - Write
 
 settings:
   default_timeout: 300
-  max_dispatch_depth: 3     # recursion protection (min: 1)
-  max_concurrency: 5        # max parallel claude -p processes (min: 1)
+  max_dispatch_depth: 3     # recursion protection
+  max_concurrency: 5        # max parallel claude -p processes
   cache:
     enabled: true
-    ttl: 300                # seconds; 0 effectively disables
+    ttl: 300                # seconds
 ```
+
+Config is reloaded on every tool call — add agents without restarting.
 
 ### Auto-Description
 
-When you run `agent-dispatch add` without `--description`, it reads the target project's files to generate one:
+`agent-dispatch add` without `--description` generates one from:
 
-- `CLAUDE.md` — first meaningful paragraph
-- `.mcp.json` — lists MCP server names
+- `CLAUDE.md` — first meaningful paragraph (priority)
+- `README.md` — first substantial line (fallback)
 - `pyproject.toml` / `package.json` — project description
-- `Dockerfile`, `Cargo.toml`, `go.mod` — stack indicators
+- `.mcp.json` — lists MCP server names
+- Stack indicators — Docker, Rust, Go, Python, Node.js
+- DB indicators — Prisma, Alembic, migrations
 
 ## How It Works
 
 ```
-┌─────────────────────┐
-│ Claude Code Session  │
-│ (backend project)    │
-│                      │
-│ calls dispatch(      │
-│   "infra",           │
-│   "find errors",     │
-│   caller="backend",  │
-│   goal="debug crash" │
-│ )                    │
-└──────────┬───────────┘
-           │ MCP tool call
-┌──────────▼───────────┐
-│ agent-dispatch        │
-│ MCP Server            │
-│                       │
-│ ┌─ cache check ──┐   │
-│ │ hit? → return   │   │
-│ └─────────────────┘   │
-│ ┌─ semaphore ─────┐   │
-│ │ limit parallel  │   │
-│ └─────────────────┘   │
-│ subprocess.run(       │
-│   "claude -p ...",    │
-│   cwd=~/projects/     │
-│       infra/          │
-│ )                     │
-└──────────┬───────────┘
-           │ inherits project context
-┌──────────▼───────────┐
-│ Claude Code Session   │
-│ (infra project)       │
-│                       │
-│ ## Goal               │
-│ debug crash           │
-│ ## Dispatched by      │
-│ backend               │
-│ ## Task               │
-│ find errors           │
-│                       │
-│ ✓ Portainer MCP       │
-│ ✓ CLAUDE.md           │
-│ ✓ project tools       │
-│                       │
-│ → finds errors        │
-│ → returns result      │
-└───────────────────────┘
+Your Claude Code session
+  │
+  ├─ dispatch("infra", "find errors", caller="backend", goal="debug crash")
+  │
+  ▼
+agent-dispatch MCP server
+  ├─ cache check → hit? return cached result
+  ├─ semaphore → limit concurrent processes
+  └─ subprocess.run("claude -p ...", cwd=~/projects/infra/)
+       │
+       ▼
+     New Claude Code session in ~/projects/infra/
+       ├─ Inherits: CLAUDE.md, .mcp.json, project tools
+       ├─ Receives structured prompt with goal/caller/context/task
+       └─ Returns result → cached for future identical requests
 ```
 
 ## Safety
 
-### Recursion Protection
+- **Recursion protection** — `AGENT_DISPATCH_DEPTH` env var tracks nesting. Default limit: 3.
+- **Cost control** — `max_budget_usd` per agent or globally.
+- **Concurrency** — `max_concurrency` (default: 5) limits parallel `claude -p` processes.
+- **Timeout** — per-agent or global (default: 300s). Orphaned processes are cleaned up.
+- **Caching** — identical `(agent, task, context)` requests return cached results. Only successes are cached. Sessions and dialogues are never cached.
 
-If Agent A dispatches to Agent B, and B tries to dispatch back to A, `agent-dispatch` stops it. The `AGENT_DISPATCH_DEPTH` environment variable tracks nesting depth. Default limit: 3.
-
-### Cost Control
-
-Set `max_budget_usd` per agent or globally to limit spending per dispatch.
-
-### Concurrency Control
-
-`max_concurrency` (default: 5) limits how many `claude -p` processes run simultaneously. Prevents hitting OAuth/API rate limits during `dispatch_parallel`.
-
-### Timeout
-
-Each dispatch has a configurable timeout (default: 300s). Streaming dispatches clean up orphaned processes on timeout or interruption.
-
-### Caching
-
-Identical `(agent, task, context)` requests within the TTL window return cached results instantly. Only successful results are cached. Session dispatches and dialogues are never cached.
-
-## CLI Reference
+## CLI
 
 | Command | Description |
 |---------|-------------|
@@ -237,12 +311,12 @@ Identical `(agent, task, context)` requests within the TTL window return cached 
 | `agent-dispatch remove <name>` | Remove an agent |
 | `agent-dispatch list` | List agents with health status |
 | `agent-dispatch test <name> [task]` | Test an agent with a dispatch |
-| `agent-dispatch serve` | Start MCP server (used by Claude Code) |
+| `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
 
 ## Requirements
 
 - Python >= 3.10
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (OAuth, API key, or subscription)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 
 ## License
 
