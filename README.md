@@ -7,6 +7,10 @@
 
 **MCP server that lets Claude Code agents delegate tasks to agents in other project directories.**
 
+<p align="center">
+  <img src="assets/mascot.png" alt="agent-dispatch mascot" width="600">
+</p>
+
 Each agent runs as a separate `claude -p` session in its own project directory — inheriting that project's MCP servers, CLAUDE.md, and tools. The calling agent just gets the result back.
 
 Works with OAuth, API key, and Claude subscription authentication.
