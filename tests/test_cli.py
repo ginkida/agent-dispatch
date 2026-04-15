@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from click.testing import CliRunner
 
 from agent_dispatch.cli import cli
 from agent_dispatch.config import load_config
+from agent_dispatch.models import DispatchResult
 
 
 @pytest.fixture(autouse=True)
@@ -201,3 +203,108 @@ class TestUpdate:
         runner.invoke(cli, ["update", "proj", "--max-budget", "0"])
         config = load_config()
         assert config.agents["proj"].max_budget_usd is None
+
+
+class TestInit:
+    def test_init_creates_config(self, _isolated_config: Path):
+        config_file = _isolated_config
+        assert not config_file.exists()
+        with (
+            patch("agent_dispatch.cli.shutil.which", return_value=None),
+        ):
+            result = runner.invoke(cli, ["init"])
+        assert result.exit_code == 0
+        assert "Created config" in result.output
+        assert config_file.exists()
+
+    def test_init_existing_config(self, _isolated_config: Path):
+        config_file = _isolated_config
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("agents: {}\n")
+        with patch("agent_dispatch.cli.shutil.which", return_value=None):
+            result = runner.invoke(cli, ["init"])
+        assert "already exists" in result.output
+
+    def test_init_claude_not_found(self, _isolated_config: Path):
+        with patch("agent_dispatch.cli.shutil.which", return_value=None):
+            result = runner.invoke(cli, ["init"])
+        assert result.exit_code == 0
+        assert "claude CLI not found" in result.output
+
+    def test_init_registers_mcp_server(self, _isolated_config: Path):
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            patch("agent_dispatch.cli.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            result = runner.invoke(cli, ["init"])
+        assert "Registered MCP server" in result.output
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "claude" in cmd[0]
+        assert "mcp" in cmd
+        assert "add-json" in cmd
+
+    def test_init_mcp_registration_fails(self, _isolated_config: Path):
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            patch("agent_dispatch.cli.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="registration failed"
+            )
+            result = runner.invoke(cli, ["init"])
+        assert "Failed to register" in result.output
+
+
+class TestTestCommand:
+    def test_success(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test agent"])
+        with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj", success=True, result="This is a test project.",
+                cost_usd=0.01, num_turns=1,
+            )
+            result = runner.invoke(cli, ["test", "proj"])
+        assert result.exit_code == 0
+        assert "This is a test project" in result.output
+        assert "$0.0100" in result.output
+
+    def test_agent_not_found(self):
+        result = runner.invoke(cli, ["test", "nonexistent"])
+        assert result.exit_code != 0
+        assert "not found" in result.output
+
+    def test_permission_error_shows_diagnosis(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj", success=False, result="",
+                error="permission denied for tool Bash",
+                error_type="permission",
+            )
+            result = runner.invoke(cli, ["test", "proj"])
+        assert result.exit_code != 0
+        assert "Diagnosis: permission error" in result.output
+        assert "bypassPermissions" in result.output
+
+    def test_timeout_error_shows_diagnosis(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj", success=False, result="",
+                error="timed out after 300s",
+                error_type="timeout",
+            )
+            result = runner.invoke(cli, ["test", "proj"])
+        assert result.exit_code != 0
+        assert "Diagnosis: timeout" in result.output
+        assert "--timeout 600" in result.output
