@@ -9,6 +9,7 @@ from agent_dispatch.models import (
     DispatchConfig,
     DispatchResult,
     Settings,
+    check_permission_mode,
     validate_agent_name,
 )
 
@@ -65,6 +66,16 @@ def test_dispatch_result_success():
     assert r.success
     assert r.session_id is None
     assert r.error is None
+    assert r.error_type is None
+
+
+def test_dispatch_result_error_type():
+    r = DispatchResult(
+        agent="test", success=False, result="", error="permission denied",
+        error_type="permission",
+    )
+    assert not r.success
+    assert r.error_type == "permission"
 
 
 class TestAgentNameValidation:
@@ -76,6 +87,34 @@ class TestAgentNameValidation:
         for name in ["", "-start", "_start", "has space", "special!", "a/b"]:
             with pytest.raises(ValueError, match="Invalid agent name"):
                 validate_agent_name(name)
+
+
+class TestPermissionModeValidation:
+    def test_known_modes_no_warning(self):
+        for mode in ("default", "plan", "bypassPermissions"):
+            assert check_permission_mode(mode) is None
+
+    def test_unknown_mode_returns_warning(self):
+        warning = check_permission_mode("bypassPermision")  # typo
+        assert warning is not None
+        assert "Unknown" in warning
+        assert "bypassPermision" in warning
+
+    def test_none_no_warning(self):
+        assert check_permission_mode(None) is None
+
+    def test_empty_string_no_warning(self):
+        assert check_permission_mode("") is None
+
+
+def test_settings_default_permissions():
+    s = Settings(
+        default_permission_mode="bypassPermissions",
+        default_allowed_tools=["Bash", "Read"],
+    )
+    assert s.default_permission_mode == "bypassPermissions"
+    assert s.default_allowed_tools == ["Bash", "Read"]
+    assert s.default_disallowed_tools == []
 
 
 def test_dispatch_result_with_metadata():

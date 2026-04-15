@@ -13,7 +13,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from . import runner
 from .cache import DispatchCache
 from .config import auto_describe, load_config, save_config
-from .models import AgentConfig, DispatchConfig, validate_agent_name
+from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +27,17 @@ mcp = FastMCP(
         "code you don't have access to. Don't dispatch for things you can do yourself.\n\n"
         "HOW TO USE:\n"
         "1. list_agents() — see who's available and what they can do\n"
-        "2. dispatch(agent, task) — delegate a specific task\n"
-        "3. Always pass caller= (your project name) and goal= (why you need this)\n"
-        "4. Be specific in the task — the agent doesn't see your conversation\n\n"
-        "MANAGING AGENTS: Use add_agent() to register a new project directory. "
-        "The description is auto-generated from the project's files (CLAUDE.md, "
-        "MCP servers, package files). You can also provide a custom description."
+        "2. dispatch(agent, task) — one-shot delegation (cached)\n"
+        "3. dispatch_session(agent, task, session_id?) — multi-turn conversation\n"
+        "4. dispatch_parallel(dispatches, aggregate?) — concurrent tasks\n"
+        "5. dispatch_stream(agent, task) — live progress updates\n"
+        "6. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
+        "7. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "MANAGING AGENTS:\n"
+        "- add_agent(name, directory) — register a project, auto-generates description\n"
+        "- update_agent(name, ...) — change permissions, timeout, model, etc.\n"
+        "- remove_agent(name) — unregister an agent\n"
+        "- cache_stats() / cache_clear() — monitor and manage result cache"
     ),
 )
 
@@ -82,7 +87,7 @@ def _validate_agent(config: DispatchConfig, name: str) -> str | None:
 
 
 @mcp.tool()
-async def list_agents(ctx: Context) -> str:
+async def list_agents(ctx: Context | None = None) -> str:
     """List all configured agents with descriptions and health status.
 
     Call this first to see which agents are available and what they can do.
@@ -98,17 +103,23 @@ async def list_agents(ctx: Context) -> str:
     agents = []
     for name, agent in config.agents.items():
         healthy = agent.directory.is_dir()
-        agents.append(
-            {
-                "name": name,
-                "directory": str(agent.directory),
-                "description": agent.description,
-                "healthy": healthy,
-                "has_claude_md": (agent.directory / "CLAUDE.md").exists() if healthy else False,
-                "has_mcp_config": (agent.directory / ".mcp.json").exists() if healthy else False,
-            }
-        )
-    await ctx.info(f"Found {len(agents)} configured agents")
+        entry: dict = {
+            "name": name,
+            "directory": str(agent.directory),
+            "description": agent.description,
+            "healthy": healthy,
+            "has_claude_md": (agent.directory / "CLAUDE.md").exists() if healthy else False,
+            "has_mcp_config": (agent.directory / ".mcp.json").exists() if healthy else False,
+        }
+        if agent.permission_mode:
+            entry["permission_mode"] = agent.permission_mode
+        if agent.allowed_tools:
+            entry["allowed_tools"] = agent.allowed_tools
+        if agent.disallowed_tools:
+            entry["disallowed_tools"] = agent.disallowed_tools
+        agents.append(entry)
+    if ctx:
+        await ctx.info(f"Found {len(agents)} configured agents")
     return json.dumps(agents, indent=2)
 
 
@@ -515,13 +526,17 @@ async def dispatch_dialogue(
         total_cost += resp_result.cost_usd or 0
         total_duration += resp_result.duration_ms or 0
 
-        conversation.append({
+        resp_entry: dict = {
             "agent": responder,
             "role": "responder",
             "round": round_num,
             "message": resp_result.result,
             "cost_usd": resp_result.cost_usd,
-        })
+        }
+        if not resp_result.success:
+            resp_entry["error"] = resp_result.error
+            resp_entry["error_type"] = resp_result.error_type
+        conversation.append(resp_entry)
 
         if ctx:
             await ctx.info(
@@ -531,6 +546,8 @@ async def dispatch_dialogue(
         if _RESOLVED_MARKER in resp_result.result or not resp_result.success:
             resolved = _RESOLVED_MARKER in resp_result.result
             final_answer = resp_result.result.replace(_RESOLVED_MARKER, "").strip()
+            if not resp_result.success and resp_result.error:
+                final_answer = resp_result.error
             break
 
         # ---- Requester turn ----
@@ -556,13 +573,17 @@ async def dispatch_dialogue(
         total_cost += req_result.cost_usd or 0
         total_duration += req_result.duration_ms or 0
 
-        conversation.append({
+        req_entry: dict = {
             "agent": requester,
             "role": "requester",
             "round": round_num,
             "message": req_result.result,
             "cost_usd": req_result.cost_usd,
-        })
+        }
+        if not req_result.success:
+            req_entry["error"] = req_result.error
+            req_entry["error_type"] = req_result.error_type
+        conversation.append(req_entry)
 
         if ctx:
             await ctx.info(
@@ -572,6 +593,8 @@ async def dispatch_dialogue(
         if _RESOLVED_MARKER in req_result.result or not req_result.success:
             resolved = _RESOLVED_MARKER in req_result.result
             final_answer = req_result.result.replace(_RESOLVED_MARKER, "").strip()
+            if not req_result.success and req_result.error:
+                final_answer = req_result.error
             break
 
     if not final_answer and conversation:
@@ -600,6 +623,11 @@ async def add_agent(
     name: str,
     directory: str,
     description: str = "",
+    timeout: int = 0,
+    max_budget_usd: float = 0,
+    permission_mode: str = "",
+    allowed_tools: str = "",
+    disallowed_tools: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Register a project directory as a dispatchable agent.
@@ -613,6 +641,14 @@ async def add_agent(
             with letter or digit).
         directory: Absolute path to the project directory.
         description: What this agent can do. Leave empty for auto-generation.
+        timeout: Timeout in seconds (0 uses global default of 300).
+        max_budget_usd: Max cost in USD per dispatch (0 = no limit).
+        permission_mode: Permission mode for the claude CLI
+            (e.g. default, plan, bypassPermissions). Leave empty for default.
+        allowed_tools: Comma-separated list of allowed tools
+            (e.g. "Bash,Read,Edit"). Leave empty for no restrictions.
+        disallowed_tools: Comma-separated list of disallowed tools.
+            Leave empty for no restrictions.
     """
     try:
         validate_agent_name(name)
@@ -630,21 +666,38 @@ async def add_agent(
         return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
 
     desc = description or auto_describe(dir_path)
+    parsed_allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else []
+    parsed_disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else []
 
-    config.agents[name] = AgentConfig(directory=dir_path, description=desc)
+    config.agents[name] = AgentConfig(
+        directory=dir_path,
+        description=desc,
+        timeout=timeout or 300,
+        max_budget_usd=max_budget_usd or None,
+        permission_mode=permission_mode or None,
+        allowed_tools=parsed_allowed,
+        disallowed_tools=parsed_disallowed,
+    )
     save_config(config)
 
     if ctx:
+        if warning := check_permission_mode(permission_mode or None):
+            await ctx.info(f"Warning: {warning}")
         await ctx.info(f"Added agent '{name}' -> {dir_path}")
 
-    return json.dumps(
-        {
-            "added": name,
-            "directory": str(dir_path),
-            "description": desc,
-        },
-        indent=2,
-    )
+    result: dict = {
+        "added": name,
+        "directory": str(dir_path),
+        "description": desc,
+    }
+    if permission_mode:
+        result["permission_mode"] = permission_mode
+    if parsed_allowed:
+        result["allowed_tools"] = parsed_allowed
+    if parsed_disallowed:
+        result["disallowed_tools"] = parsed_disallowed
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -669,6 +722,87 @@ async def remove_agent(
         await ctx.info(f"Removed agent '{name}'")
 
     return json.dumps({"removed": name})
+
+
+@mcp.tool()
+async def update_agent(
+    name: str,
+    description: str = "",
+    timeout: int = 0,
+    max_budget_usd: float = 0,
+    model: str = "",
+    permission_mode: str = "",
+    allowed_tools: str = "",
+    disallowed_tools: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """Update an existing agent's configuration.
+
+    Only fields with non-empty values are updated. To clear a string field,
+    pass "none". To clear a list field (allowed_tools, disallowed_tools),
+    pass "none".
+
+    Args:
+        name: Agent name to update.
+        description: New description.
+        timeout: New timeout in seconds (0 = don't change).
+        max_budget_usd: Max cost in USD per dispatch (0 = don't change,
+            negative = clear limit).
+        model: Model override. Pass "none" to clear.
+        permission_mode: Permission mode. Pass "none" to clear.
+        allowed_tools: Comma-separated allowed tools. Pass "none" to clear.
+        disallowed_tools: Comma-separated disallowed tools. Pass "none" to clear.
+    """
+    config = _get_config()
+    if name not in config.agents:
+        available = ", ".join(config.agents.keys()) or "(none)"
+        return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+
+    agent = config.agents[name]
+    updated: list[str] = []
+
+    if description:
+        agent.description = description
+        updated.append("description")
+    if timeout:
+        agent.timeout = timeout
+        updated.append("timeout")
+    if max_budget_usd:
+        agent.max_budget_usd = None if max_budget_usd < 0 else max_budget_usd
+        updated.append("max_budget_usd")
+    if model:
+        agent.model = None if model.lower() == "none" else model
+        updated.append("model")
+    if permission_mode:
+        effective = None if permission_mode.lower() == "none" else permission_mode
+        agent.permission_mode = effective
+        if ctx and (warning := check_permission_mode(effective)):
+            await ctx.info(f"Warning: {warning}")
+        updated.append("permission_mode")
+    if allowed_tools:
+        if allowed_tools.lower() == "none":
+            agent.allowed_tools = []
+        else:
+            agent.allowed_tools = [t.strip() for t in allowed_tools.split(",") if t.strip()]
+        updated.append("allowed_tools")
+    if disallowed_tools:
+        if disallowed_tools.lower() == "none":
+            agent.disallowed_tools = []
+        else:
+            agent.disallowed_tools = [
+                t.strip() for t in disallowed_tools.split(",") if t.strip()
+            ]
+        updated.append("disallowed_tools")
+
+    if not updated:
+        return json.dumps({"error": "Nothing to update. Pass at least one non-empty field."})
+
+    save_config(config)
+
+    if ctx:
+        await ctx.info(f"Updated agent '{name}': {', '.join(updated)}")
+
+    return json.dumps({"updated": name, "fields": updated}, indent=2)
 
 
 # ---------------------------------------------------------------------------

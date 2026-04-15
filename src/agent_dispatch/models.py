@@ -8,6 +8,18 @@ from pydantic import BaseModel, Field, field_validator
 
 _AGENT_NAME_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$"
 
+KNOWN_PERMISSION_MODES = frozenset({
+    "default", "plan", "bypassPermissions",
+})
+
+
+def check_permission_mode(mode: str | None) -> str | None:
+    """Return a warning message if mode is unknown, else None."""
+    if mode and mode not in KNOWN_PERMISSION_MODES:
+        known = ", ".join(sorted(KNOWN_PERMISSION_MODES))
+        return f"Unknown permission_mode: {mode!r}. Known values: {known}"
+    return None
+
 
 class AgentConfig(BaseModel):
     """Configuration for a single agent."""
@@ -46,6 +58,9 @@ class Settings(BaseModel):
 
     default_timeout: int = 300
     default_max_budget_usd: float | None = None
+    default_permission_mode: str | None = None
+    default_allowed_tools: list[str] = Field(default_factory=list)
+    default_disallowed_tools: list[str] = Field(default_factory=list)
     max_dispatch_depth: int = Field(default=3, ge=1)
     max_concurrency: int = Field(default=5, ge=1)
     cache: CacheSettings = Field(default_factory=CacheSettings)
@@ -82,3 +97,4 @@ class DispatchResult(BaseModel):
     duration_ms: int | None = None
     num_turns: int | None = None
     error: str | None = None
+    error_type: str | None = None  # permission, timeout, recursion, not_found, cli_error

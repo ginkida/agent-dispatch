@@ -16,6 +16,38 @@ logger = logging.getLogger(__name__)
 
 _DEPTH_ENV_VAR = "AGENT_DISPATCH_DEPTH"
 
+_PERMISSION_PATTERNS = [
+    "permission denied",
+    "not allowed",
+    "not permitted",
+    "disallowed tool",
+    "permission mode",
+    "not have permission",
+    "tool is not available",
+    "tool_use is not allowed",
+    "unauthorized",
+]
+
+
+def _classify_error(error_text: str) -> str:
+    """Classify an error message into a category."""
+    lower = error_text.lower()
+    for pattern in _PERMISSION_PATTERNS:
+        if pattern in lower:
+            return "permission"
+    return "cli_error"
+
+
+def _permission_hint(agent_name: str) -> str:
+    """Generate actionable hint for permission errors."""
+    return (
+        f"\n\nHint: Agent '{agent_name}' was denied a tool or action. "
+        "To fix, configure permissions in agents.yaml:\n"
+        f"  agent-dispatch update {agent_name} --permission-mode bypassPermissions\n"
+        f"  agent-dispatch update {agent_name} "
+        "--allowed-tools Bash,Read,Edit,Write,Glob,Grep"
+    )
+
 
 def _current_depth() -> int:
     raw = os.environ.get(_DEPTH_ENV_VAR, "0")
@@ -65,13 +97,16 @@ def _build_command(
     if agent.model:
         cmd.extend(["--model", agent.model])
 
-    if agent.permission_mode:
-        cmd.extend(["--permission-mode", agent.permission_mode])
+    permission_mode = agent.permission_mode or settings.default_permission_mode
+    if permission_mode:
+        cmd.extend(["--permission-mode", permission_mode])
 
-    for tool in agent.allowed_tools:
+    allowed = agent.allowed_tools or settings.default_allowed_tools
+    for tool in allowed:
         cmd.extend(["--allowedTools", tool])
 
-    for tool in agent.disallowed_tools:
+    disallowed = agent.disallowed_tools or settings.default_disallowed_tools
+    for tool in disallowed:
         cmd.extend(["--disallowedTools", tool])
 
     return cmd
@@ -121,12 +156,18 @@ def dispatch(
     try:
         _check_recursion(settings.max_dispatch_depth)
     except RecursionError as e:
-        return DispatchResult(agent=agent_name, success=False, result="", error=str(e))
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="recursion",
+        )
 
     try:
         claude_path = _find_claude()
     except FileNotFoundError as e:
-        return DispatchResult(agent=agent_name, success=False, result="", error=str(e))
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="not_found",
+        )
 
     if not agent.directory.is_dir():
         return DispatchResult(
@@ -134,6 +175,7 @@ def dispatch(
             success=False,
             result="",
             error=f"Directory does not exist: {agent.directory}",
+            error_type="not_found",
         )
 
     full_task = _build_prompt(task, context, caller, goal)
@@ -164,14 +206,20 @@ def dispatch(
             result="",
             error=f"Agent '{agent_name}' timed out after {timeout}s. "
             "Increase timeout in agents.yaml if the task needs more time.",
+            error_type="timeout",
         )
 
     if proc.returncode != 0 and not proc.stdout.strip():
+        error_text = proc.stderr.strip() or f"claude exited with code {proc.returncode}"
+        error_type = _classify_error(error_text)
+        if error_type == "permission":
+            error_text += _permission_hint(agent_name)
         return DispatchResult(
             agent=agent_name,
             success=False,
             result="",
-            error=proc.stderr.strip() or f"claude exited with code {proc.returncode}",
+            error=error_text,
+            error_type=error_type,
         )
 
     # Parse JSON output
@@ -186,15 +234,31 @@ def dispatch(
         )
 
     is_error = data.get("is_error", False)
+    if is_error:
+        error_text = data.get("result", "")
+        error_type = _classify_error(error_text)
+        if error_type == "permission":
+            error_text += _permission_hint(agent_name)
+        return DispatchResult(
+            agent=agent_name,
+            success=False,
+            result=data.get("result", ""),
+            session_id=data.get("session_id"),
+            cost_usd=data.get("total_cost_usd"),
+            duration_ms=data.get("duration_ms"),
+            num_turns=data.get("num_turns"),
+            error=error_text,
+            error_type=error_type,
+        )
+
     return DispatchResult(
         agent=agent_name,
-        success=not is_error,
+        success=True,
         result=data.get("result", ""),
         session_id=data.get("session_id"),
         cost_usd=data.get("total_cost_usd"),
         duration_ms=data.get("duration_ms"),
         num_turns=data.get("num_turns"),
-        error=data.get("result") if is_error else None,
     )
 
 
@@ -218,12 +282,18 @@ def dispatch_stream(
     try:
         _check_recursion(settings.max_dispatch_depth)
     except RecursionError as e:
-        return DispatchResult(agent=agent_name, success=False, result="", error=str(e))
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="recursion",
+        )
 
     try:
         claude_path = _find_claude()
     except FileNotFoundError as e:
-        return DispatchResult(agent=agent_name, success=False, result="", error=str(e))
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="not_found",
+        )
 
     if not agent.directory.is_dir():
         return DispatchResult(
@@ -231,6 +301,7 @@ def dispatch_stream(
             success=False,
             result="",
             error=f"Directory does not exist: {agent.directory}",
+            error_type="not_found",
         )
 
     full_task = _build_prompt(task, context, caller, goal)
@@ -256,7 +327,10 @@ def dispatch_stream(
             env=env,
         )
     except OSError as e:
-        return DispatchResult(agent=agent_name, success=False, result="", error=str(e))
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="not_found",
+        )
 
     # Kill the process if it exceeds the timeout
     timed_out = threading.Event()
@@ -277,6 +351,7 @@ def dispatch_stream(
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
+                logger.debug("Non-JSON line in stream: %s", line[:200])
                 continue
 
             msg_type = data.get("type")
@@ -306,26 +381,47 @@ def dispatch_stream(
             result="",
             error=f"Agent '{agent_name}' timed out after {timeout}s. "
             "Increase timeout in agents.yaml if the task needs more time.",
+            error_type="timeout",
         )
 
     if result_data:
         is_error = result_data.get("is_error", False)
+        if is_error:
+            error_text = result_data.get("result", "")
+            error_type = _classify_error(error_text)
+            if error_type == "permission":
+                error_text += _permission_hint(agent_name)
+            return DispatchResult(
+                agent=agent_name,
+                success=False,
+                result=result_data.get("result", ""),
+                session_id=result_data.get("session_id"),
+                cost_usd=result_data.get("total_cost_usd"),
+                duration_ms=result_data.get("duration_ms"),
+                num_turns=result_data.get("num_turns"),
+                error=error_text,
+                error_type=error_type,
+            )
         return DispatchResult(
             agent=agent_name,
-            success=not is_error,
+            success=True,
             result=result_data.get("result", ""),
             session_id=result_data.get("session_id"),
             cost_usd=result_data.get("total_cost_usd"),
             duration_ms=result_data.get("duration_ms"),
             num_turns=result_data.get("num_turns"),
-            error=result_data.get("result") if is_error else None,
         )
 
     # Fallback: no result line received
     stderr = proc.stderr.read() if proc.stderr else ""
+    error_text = stderr.strip() or f"No result received (exit code {proc.returncode})"
+    error_type = _classify_error(error_text)
+    if error_type == "permission":
+        error_text += _permission_hint(agent_name)
     return DispatchResult(
         agent=agent_name,
         success=False,
         result="",
-        error=stderr.strip() or f"No result received (exit code {proc.returncode})",
+        error=error_text,
+        error_type=error_type,
     )

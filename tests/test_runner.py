@@ -15,7 +15,9 @@ from agent_dispatch.runner import (
     _build_command,
     _build_prompt,
     _check_recursion,
+    _classify_error,
     _current_depth,
+    _permission_hint,
     dispatch,
     dispatch_stream,
 )
@@ -40,6 +42,26 @@ class TestRecursionProtection:
         with patch.dict(os.environ, {"AGENT_DISPATCH_DEPTH": "3"}):
             with pytest.raises(RecursionError, match="depth 3 >= max 3"):
                 _check_recursion(max_depth=3)
+
+
+class TestErrorClassification:
+    def test_permission_patterns(self):
+        assert _classify_error("Error: permission denied for tool Bash") == "permission"
+        assert _classify_error("Tool_use is not allowed in this mode") == "permission"
+        assert _classify_error("Tool is not available for this agent") == "permission"
+        assert _classify_error("Action not permitted by policy") == "permission"
+        assert _classify_error("Unauthorized access attempt") == "permission"
+
+    def test_non_permission_errors(self):
+        assert _classify_error("connection refused") == "cli_error"
+        assert _classify_error("claude exited with code 1") == "cli_error"
+        assert _classify_error("some random error") == "cli_error"
+
+    def test_permission_hint_contains_agent_name(self):
+        hint = _permission_hint("myagent")
+        assert "myagent" in hint
+        assert "bypassPermissions" in hint
+        assert "allowed-tools" in hint
 
 
 class TestBuildPrompt:
@@ -111,6 +133,44 @@ class TestBuildCommand:
         assert "--permission-mode" in cmd
         assert "auto" in cmd
 
+    def test_default_permission_mode_from_settings(self):
+        settings = Settings(default_permission_mode="bypassPermissions")
+        agent = AgentConfig(directory="/tmp")  # no agent-level override
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert "--permission-mode" in cmd
+        assert "bypassPermissions" in cmd
+
+    def test_agent_permission_mode_overrides_default(self):
+        settings = Settings(default_permission_mode="plan")
+        agent = AgentConfig(directory="/tmp", permission_mode="bypassPermissions")
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert "--permission-mode" in cmd
+        assert "bypassPermissions" in cmd
+        assert "plan" not in cmd
+
+    def test_default_allowed_tools_from_settings(self):
+        settings = Settings(default_allowed_tools=["Bash", "Read"])
+        agent = AgentConfig(directory="/tmp")
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert cmd.count("--allowedTools") == 2
+        assert "Bash" in cmd
+        assert "Read" in cmd
+
+    def test_agent_allowed_tools_overrides_default(self):
+        settings = Settings(default_allowed_tools=["Bash", "Read"])
+        agent = AgentConfig(directory="/tmp", allowed_tools=["Edit"])
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert cmd.count("--allowedTools") == 1
+        assert "Edit" in cmd
+        assert "Bash" not in cmd
+
+    def test_default_disallowed_tools_from_settings(self):
+        settings = Settings(default_disallowed_tools=["Write"])
+        agent = AgentConfig(directory="/tmp")
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert "--disallowedTools" in cmd
+        assert "Write" in cmd
+
 
 class TestDispatch:
     def setup_method(self):
@@ -123,18 +183,21 @@ class TestDispatch:
         result = dispatch("test", "hello", agent, self.settings)
         assert not result.success
         assert "does not exist" in result.error
+        assert result.error_type == "not_found"
 
     def test_recursion_exceeded(self):
         with patch.dict(os.environ, {"AGENT_DISPATCH_DEPTH": "5"}):
             result = dispatch("test", "hello", self.agent, self.settings)
             assert not result.success
             assert "depth" in result.error.lower()
+            assert result.error_type == "recursion"
 
     @patch("agent_dispatch.runner.shutil.which", return_value=None)
     def test_claude_not_found(self, _mock):
         result = dispatch("test", "hello", self.agent, self.settings)
         assert not result.success
         assert "not found" in result.error.lower()
+        assert result.error_type == "not_found"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
@@ -167,6 +230,7 @@ class TestDispatch:
         result = dispatch("test", "slow task", self.agent, self.settings)
         assert not result.success
         assert "timed out" in result.error.lower()
+        assert result.error_type == "timeout"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
@@ -209,6 +273,57 @@ class TestDispatch:
         dispatch("test", "hello", self.agent, self.settings)
         cwd = mock_run.call_args[1]["cwd"]
         assert cwd == str(self.agent.directory)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_permission_error_detected_from_stderr(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="Error: permission denied for tool Bash"
+        )
+        result = dispatch("test", "run command", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "permission"
+        assert "Hint" in result.error
+        assert "bypassPermissions" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_permission_error_detected_from_is_error(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": "Tool_use is not allowed in this permission mode",
+                "is_error": True,
+            }),
+            stderr="",
+        )
+        result = dispatch("test", "run command", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "permission"
+        assert "Hint" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_non_permission_cli_error(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="connection refused"
+        )
+        result = dispatch("test", "check", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert "Hint" not in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_successful_dispatch_has_no_error_type(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
+        )
+        result = dispatch("test", "check", self.agent, self.settings)
+        assert result.success
+        assert result.error_type is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
@@ -256,18 +371,21 @@ class TestDispatchStream:
         result = dispatch_stream("test", "hello", agent, self.settings)
         assert not result.success
         assert "does not exist" in result.error
+        assert result.error_type == "not_found"
 
     def test_recursion_exceeded(self):
         with patch.dict(os.environ, {"AGENT_DISPATCH_DEPTH": "5"}):
             result = dispatch_stream("test", "hello", self.agent, self.settings)
             assert not result.success
             assert "depth" in result.error.lower()
+            assert result.error_type == "recursion"
 
     @patch("agent_dispatch.runner.shutil.which", return_value=None)
     def test_claude_not_found(self, _mock):
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert not result.success
         assert "not found" in result.error.lower()
+        assert result.error_type == "not_found"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")

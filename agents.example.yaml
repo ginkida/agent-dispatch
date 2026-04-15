@@ -12,6 +12,20 @@ agents:
     timeout: 300
     model: null  # use default model
 
+  # Agent with permission controls — useful when you want to restrict tool access
+  staging-db:
+    directory: ~/projects/staging-db
+    description: "Read-only database agent. Can query staging DB but not modify data."
+    timeout: 120
+    permission_mode: bypassPermissions  # skip permission prompts (agent runs non-interactively)
+    allowed_tools:                      # only these tools are available
+      - Read
+      - Grep
+      - Bash
+    # disallowed_tools:                 # alternatively, block specific tools
+    #   - Write
+    #   - Edit
+
   # Frontend agent
   # frontend:
   #   directory: ~/projects/frontend
@@ -20,5 +34,14 @@ agents:
 
 settings:
   default_timeout: 300
-  max_dispatch_depth: 3
-  # default_max_budget_usd: 1.0  # optional cost limit per dispatch
+  max_dispatch_depth: 3           # recursion protection: A -> B -> A
+  max_concurrency: 5              # max parallel claude -p processes
+  # default_max_budget_usd: 1.0   # cost limit per dispatch (all agents)
+  # default_permission_mode: bypassPermissions  # inherited by agents without override
+  # default_allowed_tools:         # inherited by agents without override
+  #   - Bash
+  #   - Read
+  #   - Edit
+  cache:
+    enabled: true
+    ttl: 300                       # seconds; identical (agent, task, context) requests are cached

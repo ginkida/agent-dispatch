@@ -56,7 +56,7 @@ def _collect_mcp_servers(directory: Path) -> list[str]:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 servers.extend(data.get("mcpServers", {}).keys())
             except (json.JSONDecodeError, KeyError):
-                pass
+                logger.debug("Failed to parse MCP config: %s", path)
     return list(dict.fromkeys(servers))  # deduplicate, preserve order
 
 
@@ -115,7 +115,7 @@ def auto_describe(directory: Path) -> str:
             if pkg.get("description"):
                 parts.append(pkg["description"])
         except (json.JSONDecodeError, KeyError):
-            pass
+            logger.debug("Failed to parse package.json: %s", pkg_json)
 
     # MCP servers — critical for understanding what tools this agent has
     servers = _collect_mcp_servers(directory)

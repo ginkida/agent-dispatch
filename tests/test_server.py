@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from unittest.mock import AsyncMock
+
 from agent_dispatch.models import AgentConfig, CacheSettings, DispatchConfig, DispatchResult, Settings
 from agent_dispatch import server
 
@@ -454,6 +456,34 @@ class TestDispatchDialogue:
         assert "confirmed" in result["final_answer"]
 
 
+    @pytest.mark.asyncio
+    async def test_dialogue_error_type_in_conversation(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, session_id=None, **kw):
+            if name == "db":
+                return DispatchResult(
+                    agent=name, success=False, result="",
+                    error="permission denied for tool Bash",
+                    error_type="permission",
+                )
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_dialogue("backend", "db", "check migrations")
+            result = json.loads(raw)
+
+        assert result["resolved"] is False
+        assert len(result["conversation"]) == 1
+        entry = result["conversation"][0]
+        assert entry["error_type"] == "permission"
+        assert "permission denied" in entry["error"]
+        assert "permission denied" in result["final_answer"]
+
+
 class TestAggregation:
     @pytest.mark.asyncio
     async def test_aggregate_dispatches_to_aggregator(self, tmp_path: Path):
@@ -511,6 +541,46 @@ class TestAggregation:
             assert "error" in json.loads(raw)
 
 
+class TestListAgentsPermissions:
+    @pytest.mark.asyncio
+    async def test_list_shows_permission_config(self, tmp_path: Path):
+        d = tmp_path / "proj"
+        d.mkdir()
+        config = DispatchConfig(
+            agents={
+                "proj": AgentConfig(
+                    directory=d,
+                    description="test",
+                    permission_mode="bypassPermissions",
+                    allowed_tools=["Bash", "Read"],
+                    disallowed_tools=["Write"],
+                ),
+            }
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+            agents = json.loads(raw)
+        assert agents[0]["permission_mode"] == "bypassPermissions"
+        assert agents[0]["allowed_tools"] == ["Bash", "Read"]
+        assert agents[0]["disallowed_tools"] == ["Write"]
+
+    @pytest.mark.asyncio
+    async def test_list_omits_empty_permissions(self, tmp_path: Path):
+        d = tmp_path / "proj"
+        d.mkdir()
+        config = DispatchConfig(
+            agents={"proj": AgentConfig(directory=d, description="test")}
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+            agents = json.loads(raw)
+        assert "permission_mode" not in agents[0]
+        assert "allowed_tools" not in agents[0]
+        assert "disallowed_tools" not in agents[0]
+
+
 class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_add_agent(self, tmp_path: Path):
@@ -546,6 +616,38 @@ class TestAddRemoveAgent:
             raw = await server.add_agent("proj", str(agent_dir), description="My custom desc")
             result = json.loads(raw)
             assert result["description"] == "My custom desc"
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
+
+    @pytest.mark.asyncio
+    async def test_add_agent_with_permissions(self, tmp_path: Path):
+        import os
+        from agent_dispatch.config import load_config
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "secured"
+            agent_dir.mkdir()
+
+            raw = await server.add_agent(
+                "secured", str(agent_dir),
+                description="Secured agent",
+                permission_mode="bypassPermissions",
+                allowed_tools="Bash,Read,Edit",
+                disallowed_tools="Write",
+            )
+            result = json.loads(raw)
+            assert result["added"] == "secured"
+            assert result["permission_mode"] == "bypassPermissions"
+            assert result["allowed_tools"] == ["Bash", "Read", "Edit"]
+            assert result["disallowed_tools"] == ["Write"]
+
+            # Verify persisted
+            loaded = load_config(config_file)
+            agent = loaded.agents["secured"]
+            assert agent.permission_mode == "bypassPermissions"
+            assert agent.allowed_tools == ["Bash", "Read", "Edit"]
+            assert agent.disallowed_tools == ["Write"]
         finally:
             os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 
@@ -598,6 +700,101 @@ class TestAddRemoveAgent:
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.remove_agent("nonexistent")
             assert "not found" in json.loads(raw)["error"]
+
+
+class TestUpdateAgent:
+    @pytest.mark.asyncio
+    async def test_update_permissions(self, tmp_path: Path):
+        import os
+        from agent_dispatch.config import load_config
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "proj"
+            agent_dir.mkdir()
+            await server.add_agent("proj", str(agent_dir), description="test")
+
+            raw = await server.update_agent(
+                "proj",
+                permission_mode="bypassPermissions",
+                allowed_tools="Bash,Read",
+            )
+            result = json.loads(raw)
+            assert result["updated"] == "proj"
+            assert "permission_mode" in result["fields"]
+            assert "allowed_tools" in result["fields"]
+
+            # Verify persisted
+            loaded = load_config(config_file)
+            agent = loaded.agents["proj"]
+            assert agent.permission_mode == "bypassPermissions"
+            assert agent.allowed_tools == ["Bash", "Read"]
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
+
+    @pytest.mark.asyncio
+    async def test_update_clear_fields(self, tmp_path: Path):
+        import os
+        from agent_dispatch.config import load_config
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "proj"
+            agent_dir.mkdir()
+            await server.add_agent(
+                "proj", str(agent_dir), description="test",
+                permission_mode="bypassPermissions", allowed_tools="Bash",
+            )
+
+            raw = await server.update_agent(
+                "proj", permission_mode="none", allowed_tools="none",
+            )
+            result = json.loads(raw)
+            assert result["updated"] == "proj"
+
+            loaded = load_config(config_file)
+            agent = loaded.agents["proj"]
+            assert agent.permission_mode is None
+            assert agent.allowed_tools == []
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
+
+    @pytest.mark.asyncio
+    async def test_update_nonexistent(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.update_agent("nonexistent", description="x")
+            assert "not found" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_nothing(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.update_agent("infra")
+            assert "error" in json.loads(raw)
+            assert "Nothing to update" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_description_and_timeout(self, tmp_path: Path):
+        import os
+        from agent_dispatch.config import load_config
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "proj"
+            agent_dir.mkdir()
+            await server.add_agent("proj", str(agent_dir), description="old")
+
+            raw = await server.update_agent("proj", description="new desc", timeout=600)
+            result = json.loads(raw)
+            assert "description" in result["fields"]
+            assert "timeout" in result["fields"]
+
+            loaded = load_config(config_file)
+            assert loaded.agents["proj"].description == "new desc"
+            assert loaded.agents["proj"].timeout == 600
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 
 
 class TestConcurrencyLimit:

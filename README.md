@@ -29,6 +29,9 @@ agent-dispatch add backend ~/projects/backend
 
 # Test it works
 agent-dispatch test infra
+
+# If agents hit permission errors, grant tool access:
+agent-dispatch update infra --permission-mode bypassPermissions
 ```
 
 Done. Every Claude Code session now has access to all dispatch tools.
@@ -49,7 +52,7 @@ Done. Every Claude Code session now has access to all dispatch tools.
 Lists all configured agents. **Call this first** to see what's available.
 
 ```json
-// Response
+// Response (permission fields shown only when configured)
 [
   {
     "name": "infra",
@@ -57,7 +60,9 @@ Lists all configured agents. **Call this first** to see what's available.
     "description": "Infrastructure agent. MCP: portainer. Stack: Python, Docker",
     "healthy": true,
     "has_claude_md": true,
-    "has_mcp_config": true
+    "has_mcp_config": true,
+    "permission_mode": "bypassPermissions",
+    "allowed_tools": ["Bash", "Read", "Grep"]
   }
 ]
 ```
@@ -75,7 +80,7 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `goal` | string | no | Broader objective — helps the agent make better trade-offs |
 
 ```json
-// Response
+// Response (success)
 {
   "agent": "infra",
   "success": true,
@@ -85,7 +90,18 @@ One-shot task delegation. Results are cached — identical requests within TTL r
   "duration_ms": 5000,
   "num_turns": 2
 }
+
+// Response (failure — error_type helps you handle programmatically)
+{
+  "agent": "infra",
+  "success": false,
+  "result": "",
+  "error": "Tool_use is not allowed in this permission mode\n\nHint: ...",
+  "error_type": "permission"
+}
 ```
+
+**`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `cli_error` (other failures). Permission errors include an actionable hint.
 
 **Always pass `caller` and `goal`** — the dispatched agent sees a structured prompt:
 
@@ -210,6 +226,24 @@ Register a new project directory as an agent. Description is auto-generated from
 | `name` | string | yes | Agent name (letters, digits, hyphens, underscores) |
 | `directory` | string | yes | Absolute path to project directory |
 | `description` | string | no | What this agent can do — auto-generated if empty |
+| `timeout` | int | no | Timeout in seconds (0 = use global default) |
+| `permission_mode` | string | no | Permission mode (e.g. `default`, `plan`, `bypassPermissions`) |
+| `allowed_tools` | string | no | Comma-separated allowed tools (e.g. `"Bash,Read,Edit"`) |
+| `disallowed_tools` | string | no | Comma-separated disallowed tools |
+
+### `update_agent`
+
+Update an existing agent's configuration. Only non-empty fields are changed. Pass `"none"` to clear a field.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Agent name to update |
+| `description` | string | no | New description |
+| `timeout` | int | no | New timeout (0 = don't change) |
+| `model` | string | no | Model override. `"none"` to clear |
+| `permission_mode` | string | no | Permission mode. `"none"` to clear |
+| `allowed_tools` | string | no | Comma-separated. `"none"` to clear |
+| `disallowed_tools` | string | no | Comma-separated. `"none"` to clear |
 
 ### `remove_agent`
 
@@ -263,6 +297,11 @@ agents:
 
 settings:
   default_timeout: 300
+  # default_permission_mode: bypassPermissions  # inherited by all agents
+  # default_allowed_tools:                      # inherited when agent has none
+  #   - Bash
+  #   - Read
+  #   - Edit
   max_dispatch_depth: 3     # recursion protection
   max_concurrency: 5        # max parallel claude -p processes
   cache:
@@ -317,8 +356,9 @@ agent-dispatch MCP server
 |---------|-------------|
 | `agent-dispatch init` | Create config + register MCP server with Claude Code |
 | `agent-dispatch add <name> <dir>` | Add an agent (auto-generates description) |
+| `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, etc.) |
 | `agent-dispatch remove <name>` | Remove an agent |
-| `agent-dispatch list` | List agents with health status |
+| `agent-dispatch list` | List agents with health status and permissions |
 | `agent-dispatch test <name> [task]` | Test an agent with a dispatch |
 | `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
 
