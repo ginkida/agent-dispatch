@@ -8,9 +8,29 @@ import subprocess
 from pathlib import Path
 
 import click
+import yaml
+from pydantic import ValidationError
 
 from .config import auto_describe, config_path, load_config, save_config
 from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
+
+
+def _load_or_exit() -> DispatchConfig:
+    """Load config, exiting with a friendly error on malformed YAML or schema."""
+    try:
+        return load_config()
+    except ValidationError as e:
+        click.echo(click.style(
+            f"Error: config at {config_path()} has an invalid schema:", fg="red"
+        ))
+        click.echo(str(e))
+        raise SystemExit(1)
+    except yaml.YAMLError as e:
+        click.echo(click.style(
+            f"Error: config at {config_path()} is not valid YAML:", fg="red"
+        ))
+        click.echo(str(e))
+        raise SystemExit(1)
 
 
 @click.group()
@@ -107,7 +127,7 @@ def add(
         click.echo(f"Error: {e}")
         raise SystemExit(1)
 
-    config = load_config()
+    config = _load_or_exit()
     dir_path = Path(directory).resolve()
 
     if name in config.agents:
@@ -126,9 +146,9 @@ def add(
         max_budget_usd=max_budget,
         permission_mode=permission_mode,
         allowed_tools=[t.strip() for t in allowed_tools.split(",") if t.strip()]
-        if allowed_tools else [],
+        if allowed_tools else None,
         disallowed_tools=[t.strip() for t in disallowed_tools.split(",") if t.strip()]
-        if disallowed_tools else [],
+        if disallowed_tools else None,
     )
     if warning := check_permission_mode(permission_mode):
         click.echo(click.style(f"Warning: {warning}", fg="yellow"))
@@ -141,7 +161,7 @@ def add(
 @click.argument("name")
 def remove(name: str) -> None:
     """Remove an agent."""
-    config = load_config()
+    config = _load_or_exit()
     if name not in config.agents:
         click.echo(f"Agent '{name}' not found.")
         raise SystemExit(1)
@@ -154,14 +174,20 @@ def remove(name: str) -> None:
 @cli.command("list")
 def list_agents() -> None:
     """List configured agents with health status."""
-    config = load_config()
+    config = _load_or_exit()
     if not config.agents:
         click.echo("No agents configured. Run: agent-dispatch add <name> <directory>")
         return
 
     for name, agent in config.agents.items():
-        healthy = agent.directory.is_dir()
-        status = click.style("OK", fg="green") if healthy else click.style("NOT FOUND", fg="red")
+        try:
+            healthy = agent.directory.is_dir()
+            status_label = "OK" if healthy else "NOT FOUND"
+            status_color = "green" if healthy else "red"
+        except OSError:
+            status_label = "UNREADABLE"
+            status_color = "red"
+        status = click.style(status_label, fg=status_color)
         click.echo(f"  {name} [{status}]")
         click.echo(f"    dir:  {agent.directory}")
         click.echo(f"    desc: {agent.description}")
@@ -214,7 +240,7 @@ def update(
     disallowed_tools: str | None,
 ) -> None:
     """Update an existing agent's configuration."""
-    config = load_config()
+    config = _load_or_exit()
     if name not in config.agents:
         click.echo(f"Agent '{name}' not found. Run 'agent-dispatch list' to see agents.")
         raise SystemExit(1)
@@ -229,26 +255,27 @@ def update(
         agent.timeout = timeout
         updated.append("timeout")
     if model is not None:
-        agent.model = None if model.lower() == "none" else model
+        agent.model = None if model.strip().lower() in ("none", "") else model
         updated.append("model")
     if max_budget is not None:
         agent.max_budget_usd = None if max_budget == 0 else max_budget
         updated.append("max_budget_usd")
     if permission_mode is not None:
-        effective = None if permission_mode.lower() == "none" else permission_mode
+        stripped = permission_mode.strip()
+        effective = None if stripped.lower() in ("none", "") else stripped
         agent.permission_mode = effective
         if warning := check_permission_mode(effective):
             click.echo(click.style(f"Warning: {warning}", fg="yellow"))
         updated.append("permission_mode")
     if allowed_tools is not None:
-        if allowed_tools.lower() == "none":
-            agent.allowed_tools = []
+        if allowed_tools.strip().lower() in ("none", ""):
+            agent.allowed_tools = None
         else:
             agent.allowed_tools = [t.strip() for t in allowed_tools.split(",") if t.strip()]
         updated.append("allowed_tools")
     if disallowed_tools is not None:
-        if disallowed_tools.lower() == "none":
-            agent.disallowed_tools = []
+        if disallowed_tools.strip().lower() in ("none", ""):
+            agent.disallowed_tools = None
         else:
             agent.disallowed_tools = [
                 t.strip() for t in disallowed_tools.split(",") if t.strip()
@@ -268,7 +295,7 @@ def update(
 @click.argument("task", default="What project is this? Describe in one sentence.")
 def test(name: str, task: str) -> None:
     """Test an agent by dispatching a task."""
-    config = load_config()
+    config = _load_or_exit()
     if name not in config.agents:
         click.echo(f"Agent '{name}' not found. Run 'agent-dispatch list' to see agents.")
         raise SystemExit(1)

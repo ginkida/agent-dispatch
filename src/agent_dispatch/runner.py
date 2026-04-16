@@ -29,9 +29,14 @@ _PERMISSION_PATTERNS = [
 ]
 
 
-def _classify_error(error_text: str) -> str:
-    """Classify an error message into a category."""
-    lower = error_text.lower()
+def _classify_error(error_text: object) -> str:
+    """Classify an error message into a category.
+
+    Accepts any type and coerces to string — some claude CLI error paths
+    produce non-string values (None, dict) that would crash `.lower()`.
+    """
+    text = str(error_text) if error_text else ""
+    lower = text.lower()
     for pattern in _PERMISSION_PATTERNS:
         if pattern in lower:
             return "permission"
@@ -101,11 +106,18 @@ def _build_command(
     if permission_mode:
         cmd.extend(["--permission-mode", permission_mode])
 
-    allowed = agent.allowed_tools or settings.default_allowed_tools
+    # None = inherit from settings; [] = explicitly empty (no inheritance)
+    allowed = (
+        agent.allowed_tools if agent.allowed_tools is not None
+        else settings.default_allowed_tools
+    )
     for tool in allowed:
         cmd.extend(["--allowedTools", tool])
 
-    disallowed = agent.disallowed_tools or settings.default_disallowed_tools
+    disallowed = (
+        agent.disallowed_tools if agent.disallowed_tools is not None
+        else settings.default_disallowed_tools
+    )
     for tool in disallowed:
         cmd.extend(["--disallowedTools", tool])
 
@@ -227,22 +239,36 @@ def dispatch(
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         # Fallback: treat stdout as plain text
-        return DispatchResult(
-            agent=agent_name,
-            success=proc.returncode == 0,
-            result=proc.stdout.strip(),
-        )
-
-    is_error = data.get("is_error", False)
-    if is_error:
-        error_text = data.get("result", "")
+        success = proc.returncode == 0
+        text = proc.stdout.strip()
+        if success:
+            return DispatchResult(agent=agent_name, success=True, result=text)
+        error_text = text or f"claude exited with code {proc.returncode} (non-JSON output)"
         error_type = _classify_error(error_text)
         if error_type == "permission":
             error_text += _permission_hint(agent_name)
         return DispatchResult(
             agent=agent_name,
             success=False,
-            result=data.get("result", ""),
+            result=text,
+            error=error_text,
+            error_type=error_type,
+        )
+
+    is_error = data.get("is_error", False)
+    if is_error:
+        raw_result = data.get("result", "")
+        error_text = str(raw_result) if raw_result else (
+            f"Agent '{agent_name}' reported an error with no details "
+            f"(exit code {proc.returncode})"
+        )
+        error_type = _classify_error(error_text)
+        if error_type == "permission":
+            error_text += _permission_hint(agent_name)
+        return DispatchResult(
+            agent=agent_name,
+            success=False,
+            result=str(raw_result) if raw_result else "",
             session_id=data.get("session_id"),
             cost_usd=data.get("total_cost_usd"),
             duration_ms=data.get("duration_ms"),
@@ -326,10 +352,20 @@ def dispatch_stream(
             text=True,
             env=env,
         )
-    except OSError as e:
+    except FileNotFoundError as e:
         return DispatchResult(
             agent=agent_name, success=False, result="", error=str(e),
             error_type="not_found",
+        )
+    except PermissionError as e:
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="permission",
+        )
+    except OSError as e:
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="cli_error",
         )
 
     # Kill the process if it exceeds the timeout
@@ -387,14 +423,17 @@ def dispatch_stream(
     if result_data:
         is_error = result_data.get("is_error", False)
         if is_error:
-            error_text = result_data.get("result", "")
+            raw_result = result_data.get("result", "")
+            error_text = str(raw_result) if raw_result else (
+                f"Agent '{agent_name}' reported an error with no details"
+            )
             error_type = _classify_error(error_text)
             if error_type == "permission":
                 error_text += _permission_hint(agent_name)
             return DispatchResult(
                 agent=agent_name,
                 success=False,
-                result=result_data.get("result", ""),
+                result=str(raw_result) if raw_result else "",
                 session_id=result_data.get("session_id"),
                 cost_usd=result_data.get("total_cost_usd"),
                 duration_ms=result_data.get("duration_ms"),

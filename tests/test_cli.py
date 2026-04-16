@@ -204,6 +204,77 @@ class TestUpdate:
         config = load_config()
         assert config.agents["proj"].max_budget_usd is None
 
+    def test_update_empty_string_clears_model(self, tmp_path: Path):
+        """B2: --model "" should clear to None, not store empty string."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, [
+            "add", "proj", str(agent_dir), "-d", "Test", "--model", "sonnet",
+        ])
+        result = runner.invoke(cli, ["update", "proj", "--model", ""])
+        assert result.exit_code == 0
+        config = load_config()
+        assert config.agents["proj"].model is None
+
+    def test_update_empty_string_clears_permission_mode(self, tmp_path: Path):
+        """B2: --permission-mode "" should clear to None."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, [
+            "add", "proj", str(agent_dir), "-d", "Test",
+            "--permission-mode", "bypassPermissions",
+        ])
+        result = runner.invoke(cli, ["update", "proj", "--permission-mode", ""])
+        assert result.exit_code == 0
+        config = load_config()
+        assert config.agents["proj"].permission_mode is None
+
+    def test_update_allowed_tools_empty_clears_to_none(self, tmp_path: Path):
+        """B1+B2: --allowed-tools "" clears to None (inherit defaults)."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, [
+            "add", "proj", str(agent_dir), "-d", "Test",
+            "--allowed-tools", "Bash,Read",
+        ])
+        runner.invoke(cli, ["update", "proj", "--allowed-tools", ""])
+        config = load_config()
+        assert config.agents["proj"].allowed_tools is None
+
+
+class TestListUnreadable:
+    def test_list_unreadable_directory(self, tmp_path: Path):
+        """A4: is_dir() OSError should show UNREADABLE, not crash."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+
+        with patch(
+            "agent_dispatch.cli.Path.is_dir",
+            side_effect=PermissionError("access denied"),
+        ):
+            result = runner.invoke(cli, ["list"])
+        assert result.exit_code == 0
+        assert "UNREADABLE" in result.output
+
+
+class TestListMalformedConfig:
+    def test_list_handles_bad_yaml(self, _isolated_config: Path):
+        """A5: malformed YAML shows friendly error, not traceback."""
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text("agents: [not a dict\n")  # invalid YAML
+        result = runner.invoke(cli, ["list"])
+        assert result.exit_code != 0
+        assert "not valid YAML" in result.output
+
+    def test_list_handles_bad_schema(self, _isolated_config: Path):
+        """A5: YAML that doesn't match schema shows friendly error."""
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text("agents: 42\nsettings: {}\n")
+        result = runner.invoke(cli, ["list"])
+        assert result.exit_code != 0
+        assert "invalid schema" in result.output
+
 
 class TestInit:
     def test_init_creates_config(self, _isolated_config: Path):

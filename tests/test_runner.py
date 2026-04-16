@@ -63,6 +63,22 @@ class TestErrorClassification:
         assert "bypassPermissions" in hint
         assert "allowed-tools" in hint
 
+    def test_classify_error_handles_none(self):
+        """A1: don't crash on None input."""
+        assert _classify_error(None) == "cli_error"
+
+    def test_classify_error_handles_empty_string(self):
+        """A1: don't crash on empty string."""
+        assert _classify_error("") == "cli_error"
+
+    def test_classify_error_handles_dict(self):
+        """A1: don't crash on non-string (e.g. dict from malformed JSON)."""
+        assert _classify_error({"weird": "value"}) == "cli_error"
+
+    def test_classify_error_handles_integer(self):
+        """A1: don't crash on int."""
+        assert _classify_error(42) == "cli_error"
+
 
 class TestBuildPrompt:
     def test_task_only(self):
@@ -156,6 +172,15 @@ class TestBuildCommand:
         assert "Bash" in cmd
         assert "Read" in cmd
 
+    def test_explicit_empty_allowed_tools_overrides_default(self):
+        """B1: allowed_tools=[] means 'explicitly none', not 'inherit'."""
+        settings = Settings(default_allowed_tools=["Bash", "Read"])
+        agent = AgentConfig(directory="/tmp", allowed_tools=[])
+        cmd = _build_command("claude", "hello", agent, settings)
+        assert "--allowedTools" not in cmd
+        assert "Bash" not in cmd
+        assert "Read" not in cmd
+
     def test_agent_allowed_tools_overrides_default(self):
         settings = Settings(default_allowed_tools=["Bash", "Read"])
         agent = AgentConfig(directory="/tmp", allowed_tools=["Edit"])
@@ -241,6 +266,47 @@ class TestDispatch:
         result = dispatch("test", "hello", self.agent, self.settings)
         assert result.success
         assert result.result == "Just plain text"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_plain_text_fallback_failure_sets_error_type(self, mock_run, _which):
+        """A2: non-JSON stdout with non-zero exit should set error_type."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="something broke", stderr=""
+        )
+        result = dispatch("test", "x", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert "something broke" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_is_error_true_with_empty_result(self, mock_run, _which):
+        """A3: is_error=true with empty/missing result should get a fallback error message."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"is_error": True, "result": ""}),
+            stderr="",
+        )
+        result = dispatch("test", "x", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert "no details" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_is_error_true_with_none_result(self, mock_run, _which):
+        """A1+A3: is_error=true with result=null should not crash."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"is_error": True, "result": None}),
+            stderr="",
+        )
+        result = dispatch("test", "x", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert result.error  # non-empty fallback
+        assert result.result == ""  # coerced safely
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
@@ -469,3 +535,30 @@ class TestDispatchStream:
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert not result.success
         assert "No result received" in result.error or result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_popen_file_not_found_error_type(self, mock_popen, _which):
+        """B5: Popen FileNotFoundError maps to not_found."""
+        mock_popen.side_effect = FileNotFoundError("claude not found")
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "not_found"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_popen_permission_error_type(self, mock_popen, _which):
+        """B5: Popen PermissionError maps to permission."""
+        mock_popen.side_effect = PermissionError("not executable")
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "permission"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_popen_generic_os_error_type(self, mock_popen, _which):
+        """B5: Popen generic OSError maps to cli_error."""
+        mock_popen.side_effect = OSError("disk full")
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"

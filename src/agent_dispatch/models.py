@@ -15,14 +15,24 @@ KNOWN_PERMISSION_MODES = frozenset({
 
 def check_permission_mode(mode: str | None) -> str | None:
     """Return a warning message if mode is unknown, else None."""
-    if mode and mode not in KNOWN_PERMISSION_MODES:
+    if not mode:
+        return None
+    trimmed = mode.strip()
+    if not trimmed:
+        return None
+    if trimmed not in KNOWN_PERMISSION_MODES:
         known = ", ".join(sorted(KNOWN_PERMISSION_MODES))
-        return f"Unknown permission_mode: {mode!r}. Known values: {known}"
+        return f"Unknown permission_mode: {trimmed!r}. Known values: {known}"
     return None
 
 
 class AgentConfig(BaseModel):
-    """Configuration for a single agent."""
+    """Configuration for a single agent.
+
+    `allowed_tools` / `disallowed_tools` use `None` to mean
+    "inherit from settings.default_*" and `[]` to mean "explicitly empty
+    (override defaults to no tools)".
+    """
 
     directory: Path
     description: str = ""
@@ -30,8 +40,8 @@ class AgentConfig(BaseModel):
     max_budget_usd: float | None = None
     model: str | None = None
     permission_mode: str | None = None
-    allowed_tools: list[str] = Field(default_factory=list)
-    disallowed_tools: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] | None = None
+    disallowed_tools: list[str] | None = None
 
     @field_validator("directory", mode="before")
     @classmethod

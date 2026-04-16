@@ -26,6 +26,14 @@ def test_agent_config_defaults():
     assert agent.description == ""
     assert agent.max_budget_usd is None
     assert agent.model is None
+    # None = inherit from settings (B1)
+    assert agent.allowed_tools is None
+    assert agent.disallowed_tools is None
+
+
+def test_agent_config_explicit_empty_tools():
+    """Empty list means 'explicitly no tools', distinct from None (inherit)."""
+    agent = AgentConfig(directory="/tmp", allowed_tools=[], disallowed_tools=[])
     assert agent.allowed_tools == []
     assert agent.disallowed_tools == []
 
@@ -105,6 +113,14 @@ class TestPermissionModeValidation:
 
     def test_empty_string_no_warning(self):
         assert check_permission_mode("") is None
+
+    def test_trims_whitespace(self):
+        """C1: ' bypassPermissions ' (trailing space) should be recognized as valid."""
+        assert check_permission_mode(" bypassPermissions ") is None
+        assert check_permission_mode("\tplan\n") is None
+
+    def test_whitespace_only_no_warning(self):
+        assert check_permission_mode("   ") is None
 
 
 def test_settings_default_permissions():

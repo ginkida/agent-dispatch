@@ -147,6 +147,32 @@ class TestDispatchParallel:
         assert results[0]["success"]
         assert not results[1]["success"]
 
+    @pytest.mark.asyncio
+    async def test_parallel_exception_has_error_type(self, tmp_path: Path):
+        """B4: when a dispatch raises (not returns failure), exception-path preserves error_type."""
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            if name == "db":
+                raise RuntimeError("boom")
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            dispatches = json.dumps([
+                {"agent": "infra", "task": "check"},
+                {"agent": "db", "task": "check"},
+            ])
+            raw = await server.dispatch_parallel(dispatches)
+            results = json.loads(raw)
+
+        assert results[0]["success"]
+        assert not results[1]["success"]
+        assert results[1]["error_type"] == "cli_error"
+        assert "boom" in results[1]["error"]
+
 
 class TestDispatchCaching:
     @pytest.mark.asyncio
@@ -755,7 +781,8 @@ class TestUpdateAgent:
             loaded = load_config(config_file)
             agent = loaded.agents["proj"]
             assert agent.permission_mode is None
-            assert agent.allowed_tools == []
+            # "none" sentinel clears to None (inherit defaults), not []
+            assert agent.allowed_tools is None
         finally:
             os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 

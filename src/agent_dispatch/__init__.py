@@ -1,3 +1,3 @@
 """agent-dispatch: Delegate tasks between Claude Code agents across projects."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

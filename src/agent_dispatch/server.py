@@ -326,6 +326,7 @@ async def dispatch_parallel(
                 "success": False,
                 "result": "",
                 "error": str(res),
+                "error_type": "cli_error",
             })
         else:
             output.append(res)
@@ -421,16 +422,22 @@ async def dispatch_stream(
         # Forward progress messages while the subprocess runs
         while not future.done():
             await asyncio.sleep(0.1)
-            while not progress_queue.empty():
-                msg = progress_queue.get_nowait()
+            while True:
+                try:
+                    msg = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
                 if ctx:
                     await ctx.info(f"[{agent}] {msg[:300]}")
 
         result = await asyncio.wrap_future(future)
 
         # Drain any remaining messages
-        while not progress_queue.empty():
-            msg = progress_queue.get_nowait()
+        while True:
+            try:
+                msg = progress_queue.get_nowait()
+            except queue.Empty:
+                break
             if ctx:
                 await ctx.info(f"[{agent}] {msg[:300]}")
 
@@ -642,7 +649,7 @@ async def add_agent(
         directory: Absolute path to the project directory.
         description: What this agent can do. Leave empty for auto-generation.
         timeout: Timeout in seconds (0 uses global default of 300).
-        max_budget_usd: Max cost in USD per dispatch (0 = no limit).
+        max_budget_usd: Max cost in USD per dispatch (0 or omitted = no limit).
         permission_mode: Permission mode for the claude CLI
             (e.g. default, plan, bypassPermissions). Leave empty for default.
         allowed_tools: Comma-separated list of allowed tools
@@ -666,8 +673,17 @@ async def add_agent(
         return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
 
     desc = description or auto_describe(dir_path)
-    parsed_allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else []
-    parsed_disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else []
+    parsed_allowed = (
+        [t.strip() for t in allowed_tools.split(",") if t.strip()]
+        if allowed_tools else None
+    )
+    parsed_disallowed = (
+        [t.strip() for t in disallowed_tools.split(",") if t.strip()]
+        if disallowed_tools else None
+    )
+
+    if ctx and (warning := check_permission_mode(permission_mode or None)):
+        await ctx.info(f"Warning: {warning}")
 
     config.agents[name] = AgentConfig(
         directory=dir_path,
@@ -681,8 +697,6 @@ async def add_agent(
     save_config(config)
 
     if ctx:
-        if warning := check_permission_mode(permission_mode or None):
-            await ctx.info(f"Warning: {warning}")
         await ctx.info(f"Added agent '{name}' -> {dir_path}")
 
     result: dict = {
@@ -746,8 +760,8 @@ async def update_agent(
         name: Agent name to update.
         description: New description.
         timeout: New timeout in seconds (0 = don't change).
-        max_budget_usd: Max cost in USD per dispatch (0 = don't change,
-            negative = clear limit).
+        max_budget_usd: New max cost in USD per dispatch (0 = don't change;
+            pass a negative number to clear the limit).
         model: Model override. Pass "none" to clear.
         permission_mode: Permission mode. Pass "none" to clear.
         allowed_tools: Comma-separated allowed tools. Pass "none" to clear.
@@ -781,13 +795,13 @@ async def update_agent(
         updated.append("permission_mode")
     if allowed_tools:
         if allowed_tools.lower() == "none":
-            agent.allowed_tools = []
+            agent.allowed_tools = None
         else:
             agent.allowed_tools = [t.strip() for t in allowed_tools.split(",") if t.strip()]
         updated.append("allowed_tools")
     if disallowed_tools:
         if disallowed_tools.lower() == "none":
-            agent.disallowed_tools = []
+            agent.disallowed_tools = None
         else:
             agent.disallowed_tools = [
                 t.strip() for t in disallowed_tools.split(",") if t.strip()
