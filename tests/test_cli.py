@@ -145,6 +145,40 @@ class TestList:
         assert "permission_mode: bypassPermissions" in result.output
         assert "allowed_tools: Bash, Read" in result.output
 
+    def test_list_distinguishes_empty_from_inherit(self, tmp_path: Path):
+        """Explicit allowed_tools=[] should show '(none)' to distinguish from inherit (None)."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        # Write config directly with explicit empty list
+        import yaml
+        from agent_dispatch.config import config_path
+        cfg_path = config_path()
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        yaml.safe_dump({
+            "agents": {
+                "proj": {
+                    "directory": str(agent_dir),
+                    "description": "Test",
+                    "allowed_tools": [],
+                    "disallowed_tools": [],
+                },
+            },
+        }, cfg_path.open("w"))
+
+        result = runner.invoke(cli, ["list"])
+        assert result.exit_code == 0
+        assert "allowed_tools: (none)" in result.output
+        assert "disallowed_tools: (none)" in result.output
+
+    def test_list_hides_tools_when_none(self, tmp_path: Path):
+        """allowed_tools=None (the default, meaning 'inherit') should not appear in list."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        result = runner.invoke(cli, ["list"])
+        assert "allowed_tools" not in result.output
+        assert "disallowed_tools" not in result.output
+
 
 class TestUpdate:
     def test_update_permission_mode(self, tmp_path: Path):

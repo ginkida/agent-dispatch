@@ -593,6 +593,7 @@ class TestListAgentsPermissions:
 
     @pytest.mark.asyncio
     async def test_list_omits_empty_permissions(self, tmp_path: Path):
+        """allowed_tools=None (inherit) should NOT appear in response."""
         d = tmp_path / "proj"
         d.mkdir()
         config = DispatchConfig(
@@ -605,6 +606,26 @@ class TestListAgentsPermissions:
         assert "permission_mode" not in agents[0]
         assert "allowed_tools" not in agents[0]
         assert "disallowed_tools" not in agents[0]
+
+    @pytest.mark.asyncio
+    async def test_list_includes_explicit_empty_tools(self, tmp_path: Path):
+        """allowed_tools=[] (explicit empty) SHOULD appear as [] to signal override."""
+        d = tmp_path / "proj"
+        d.mkdir()
+        config = DispatchConfig(
+            agents={
+                "proj": AgentConfig(
+                    directory=d, description="test",
+                    allowed_tools=[], disallowed_tools=[],
+                ),
+            }
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+            agents = json.loads(raw)
+        assert agents[0]["allowed_tools"] == []
+        assert agents[0]["disallowed_tools"] == []
 
 
 class TestAddRemoveAgent:

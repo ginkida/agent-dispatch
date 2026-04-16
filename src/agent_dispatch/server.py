@@ -113,9 +113,10 @@ async def list_agents(ctx: Context | None = None) -> str:
         }
         if agent.permission_mode:
             entry["permission_mode"] = agent.permission_mode
-        if agent.allowed_tools:
+        # Include when explicitly set (even []) to distinguish from inheriting defaults
+        if agent.allowed_tools is not None:
             entry["allowed_tools"] = agent.allowed_tools
-        if agent.disallowed_tools:
+        if agent.disallowed_tools is not None:
             entry["disallowed_tools"] = agent.disallowed_tools
         agents.append(entry)
     if ctx:

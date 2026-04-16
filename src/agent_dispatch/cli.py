@@ -202,10 +202,12 @@ def list_agents() -> None:
             click.echo(f"    config: {', '.join(extras)}")
         if agent.permission_mode:
             click.echo(f"    permission_mode: {agent.permission_mode}")
-        if agent.allowed_tools:
-            click.echo(f"    allowed_tools: {', '.join(agent.allowed_tools)}")
-        if agent.disallowed_tools:
-            click.echo(f"    disallowed_tools: {', '.join(agent.disallowed_tools)}")
+        if agent.allowed_tools is not None:
+            rendered = ", ".join(agent.allowed_tools) if agent.allowed_tools else "(none)"
+            click.echo(f"    allowed_tools: {rendered}")
+        if agent.disallowed_tools is not None:
+            rendered = ", ".join(agent.disallowed_tools) if agent.disallowed_tools else "(none)"
+            click.echo(f"    disallowed_tools: {rendered}")
         click.echo()
 
 

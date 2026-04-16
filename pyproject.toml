@@ -1,6 +1,6 @@
 [project]
 name = "agent-dispatch"
-version = "0.2.1"
+version = "0.2.2"
 description = "MCP server that lets Claude Code agents delegate tasks to agents in other project directories"
 readme = "README.md"
 license = "MIT"
