@@ -32,6 +32,9 @@ agent-dispatch test infra
 
 # If agents hit permission errors, grant tool access:
 agent-dispatch update infra --permission-mode bypassPermissions
+
+# If something doesn't work, run the diagnostic:
+agent-dispatch doctor
 ```
 
 Done. Every Claude Code session now has access to all dispatch tools.
@@ -359,7 +362,9 @@ agent-dispatch MCP server
 | `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, etc.) |
 | `agent-dispatch remove <name>` | Remove an agent |
 | `agent-dispatch list` | List agents with health status and permissions |
-| `agent-dispatch test <name> [task]` | Test an agent with a dispatch |
+| `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
+| `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
+| `agent-dispatch doctor` | Diagnose installation: claude CLI, MCP registration, agent health |
 | `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
 
 ## Requirements

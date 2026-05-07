@@ -364,6 +364,297 @@ class TestInit:
         assert "Failed to register" in result.output
 
 
+class TestDescribe:
+    """Tests for `agent-dispatch describe <name>` command."""
+
+    def test_describe_basic(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, [
+            "add", "proj", str(agent_dir),
+            "-d", "My agent",
+            "--timeout", "600",
+            "--model", "sonnet",
+            "--max-budget", "1.5",
+            "--permission-mode", "bypassPermissions",
+            "--allowed-tools", "Bash,Read",
+        ])
+        result = runner.invoke(cli, ["describe", "proj"])
+        assert result.exit_code == 0
+        assert "proj" in result.output
+        assert "OK" in result.output
+        assert "My agent" in result.output
+        assert "600s" in result.output
+        assert "sonnet" in result.output
+        assert "$1.5" in result.output
+        assert "bypassPermissions" in result.output
+        assert "Bash, Read" in result.output
+
+    def test_describe_nonexistent(self):
+        result = runner.invoke(cli, ["describe", "nonexistent"])
+        assert result.exit_code != 0
+        assert "not found" in result.output
+
+    def test_describe_inherit_vs_explicit_empty(self, _isolated_config: Path, tmp_path: Path):
+        """Tools field should distinguish None (inherit) from [] (override)."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        # Explicit empty list (override defaults)
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        import yaml as _yaml
+        _yaml.safe_dump({
+            "agents": {
+                "proj": {
+                    "directory": str(agent_dir),
+                    "description": "Test",
+                    "allowed_tools": [],         # explicit override
+                    # disallowed_tools omitted → None → inherit
+                },
+            },
+        }, _isolated_config.open("w"))
+        result = runner.invoke(cli, ["describe", "proj"])
+        assert result.exit_code == 0
+        # allowed_tools=[] → "(none — explicit override)"
+        assert "explicit override" in result.output
+        # disallowed_tools=None → "(inherit defaults)"
+        assert "inherit defaults" in result.output
+
+    def test_describe_missing_directory_shows_not_found(self, _isolated_config: Path):
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text(
+            "agents:\n"
+            "  proj:\n"
+            "    directory: /nonexistent/xyz\n"
+            "    description: Test\n"
+        )
+        result = runner.invoke(cli, ["describe", "proj"])
+        assert result.exit_code == 0
+        assert "NOT FOUND" in result.output
+
+    def test_describe_lists_project_files(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        (agent_dir / "CLAUDE.md").write_text("# Proj")
+        (agent_dir / "README.md").write_text("# Proj README")
+        (agent_dir / ".mcp.json").write_text("{}")
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        result = runner.invoke(cli, ["describe", "proj"])
+        assert "CLAUDE.md" in result.output
+        assert "README.md" in result.output
+        assert ".mcp.json" in result.output
+
+
+class TestDoctor:
+    """Tests for `agent-dispatch doctor` diagnostic command."""
+
+    def _patch_claude_mcp_list(
+        self, *, registered: bool = True, fail: bool = False, stdout: str | None = None,
+    ):
+        """Helper: patch subprocess.run for `claude mcp list` calls.
+
+        Mirrors the real CLI output format:
+            agent-dispatch: /path/to/agent-dispatch serve - Connected
+        """
+        if fail:
+            return patch(
+                "agent_dispatch.cli.subprocess.run",
+                side_effect=FileNotFoundError("no claude"),
+            )
+        if stdout is None:
+            if registered:
+                stdout = (
+                    "agent-dispatch: /opt/homebrew/bin/agent-dispatch serve - Connected\n"
+                    "foo: /usr/bin/foo serve - Connected\n"
+                )
+            else:
+                stdout = "foo: /usr/bin/foo serve - Connected\n"
+        return patch(
+            "agent_dispatch.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=stdout, stderr="",
+            ),
+        )
+
+    def test_all_ok(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "claude CLI" in result.output
+        assert "All checks passed" in result.output
+        assert "FAIL" not in result.output
+
+    def test_claude_cli_missing(self, tmp_path: Path):
+        with patch("agent_dispatch.cli.shutil.which", return_value=None):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "claude CLI not found" in result.output
+        assert "FAIL" in result.output
+
+    def test_agent_dispatch_not_on_path_warns(self, tmp_path: Path):
+        def which(name: str):
+            return None if name == "agent-dispatch" else f"/usr/bin/{name}"
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=which),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "agent-dispatch not on PATH" in result.output
+        assert "WARN" in result.output
+
+    def test_config_missing_warns(self, _isolated_config: Path):
+        """No config file → WARN, exit 0."""
+        assert not _isolated_config.exists()
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0  # warnings don't fail
+        assert "Config not found" in result.output
+        assert "agent-dispatch init" in result.output
+
+    def test_config_invalid_yaml_fails(self, _isolated_config: Path):
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text("agents: [not a dict\n")
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "not valid YAML" in result.output
+
+    def test_config_invalid_schema_fails(self, _isolated_config: Path):
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text("agents: 42\nsettings: {}\n")
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "schema invalid" in result.output
+
+    def test_mcp_not_registered_warns(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=False),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0
+        assert "not registered with Claude Code" in result.output
+        assert "WARN" in result.output
+
+    def test_mcp_check_avoids_false_positive_in_path(self, tmp_path: Path):
+        """A line mentioning 'agent-dispatch' only in a path/command — but no
+        MCP server entry by that name — should NOT be treated as registered."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        # Notice: 'agent-dispatch' appears only as a path component of another server
+        misleading = "other-server: /opt/bin/agent-dispatch-helper - Connected\n"
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(stdout=misleading),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "not registered with Claude Code" in result.output
+
+    def test_mcp_check_handles_timeout(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            patch(
+                "agent_dispatch.cli.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=10),
+            ),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0
+        assert "timed out" in result.output
+
+    def test_missing_agent_directory_fails(self, _isolated_config: Path):
+        """Agent's directory was deleted after `add` → FAIL exit."""
+        # Write config pointing at a directory that doesn't exist
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text(
+            "agents:\n"
+            "  proj:\n"
+            "    directory: /nonexistent/path/xyz\n"
+            "    description: Test\n"
+        )
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "directory missing" in result.output
+
+    def test_unreadable_directory_fails(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+            patch(
+                "agent_dispatch.cli.Path.is_dir",
+                side_effect=PermissionError("denied"),
+            ),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "unreadable" in result.output
+
+    def test_no_agents_warns(self, _isolated_config: Path):
+        """Config exists but has no agents → WARN, exit 0."""
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text("agents: {}\nsettings: {}\n")
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0
+        assert "No agents configured" in result.output
+
+    def test_lists_claude_md_and_mcp_json(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        (agent_dir / "CLAUDE.md").write_text("# Proj")
+        (agent_dir / ".mcp.json").write_text("{}")
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0
+        assert "CLAUDE.md" in result.output
+        assert ".mcp.json" in result.output
+
+    def test_summary_singular_plural(self, tmp_path: Path):
+        """One issue should say 'issue' not 'issues'."""
+        with patch("agent_dispatch.cli.shutil.which", return_value=None):
+            result = runner.invoke(cli, ["doctor"])
+        # Exactly one FAIL (claude CLI missing)
+        assert "1 issue" in result.output
+        assert "1 issues" not in result.output
+
+
 class TestTestCommand:
     def test_success(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
@@ -413,3 +704,47 @@ class TestTestCommand:
         assert result.exit_code != 0
         assert "Diagnosis: timeout" in result.output
         assert "--timeout 600" in result.output
+
+    def test_stream_uses_dispatch_stream(self, tmp_path: Path):
+        """--stream should call dispatch_stream, not dispatch, and forward progress."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+
+        def _fake_stream(name, task, agent, settings, on_progress=None, **_kw):
+            assert on_progress is not None
+            on_progress("Reading file foo.py")
+            on_progress("Using tool: Edit")
+            return DispatchResult(
+                agent=name, success=True, result="done",
+                cost_usd=0.01, num_turns=1,
+            )
+
+        with (
+            patch("agent_dispatch.runner.dispatch_stream", side_effect=_fake_stream),
+            patch("agent_dispatch.runner.dispatch") as plain_dispatch,
+        ):
+            result = runner.invoke(cli, ["test", "proj", "--stream"])
+        assert result.exit_code == 0
+        assert "done" in result.output
+        # Progress goes to stderr, captured into result.output by CliRunner
+        assert "Reading file foo.py" in result.output
+        assert "Using tool: Edit" in result.output
+        # Non-stream path must NOT be invoked
+        plain_dispatch.assert_not_called()
+
+    def test_no_stream_uses_dispatch(self, tmp_path: Path):
+        """Default (no --stream) should call dispatch, not dispatch_stream."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with (
+            patch("agent_dispatch.runner.dispatch") as mock_dispatch,
+            patch("agent_dispatch.runner.dispatch_stream") as mock_stream,
+        ):
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj", success=True, result="ok",
+            )
+            runner.invoke(cli, ["test", "proj"])
+        mock_dispatch.assert_called_once()
+        mock_stream.assert_not_called()

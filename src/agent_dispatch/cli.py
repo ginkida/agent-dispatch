@@ -1,8 +1,9 @@
-"""CLI: init, add, remove, list, test, serve."""
+"""CLI: init, add, remove, list, update, test, describe, doctor, serve."""
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -295,7 +296,11 @@ def update(
 @cli.command()
 @click.argument("name")
 @click.argument("task", default="What project is this? Describe in one sentence.")
-def test(name: str, task: str) -> None:
+@click.option(
+    "--stream", "stream", is_flag=True,
+    help="Show live progress (assistant text + tool use) while the agent works.",
+)
+def test(name: str, task: str, stream: bool) -> None:
     """Test an agent by dispatching a task."""
     config = _load_or_exit()
     if name not in config.agents:
@@ -307,9 +312,18 @@ def test(name: str, task: str) -> None:
     click.echo(f"Task: {task}")
     click.echo("---")
 
-    from .runner import dispatch
+    if stream:
+        from .runner import dispatch_stream
 
-    result = dispatch(name, task, agent, config.settings)
+        def _on_progress(msg: str) -> None:
+            click.echo(click.style(f"  -> {msg}", fg="cyan"), err=True)
+
+        result = dispatch_stream(
+            name, task, agent, config.settings, on_progress=_on_progress,
+        )
+    else:
+        from .runner import dispatch
+        result = dispatch(name, task, agent, config.settings)
 
     if result.success:
         click.echo(result.result)
@@ -328,6 +342,177 @@ def test(name: str, task: str) -> None:
             click.echo(click.style("Diagnosis: timeout", fg="yellow"))
             click.echo(f"  agent-dispatch update {name} --timeout 600")
         raise SystemExit(1)
+
+
+@cli.command()
+@click.argument("name")
+def describe(name: str) -> None:
+    """Show full configuration for a single agent."""
+    config = _load_or_exit()
+    if name not in config.agents:
+        click.echo(f"Agent '{name}' not found. Run 'agent-dispatch list' to see agents.")
+        raise SystemExit(1)
+
+    agent = config.agents[name]
+    try:
+        if agent.directory.is_dir():
+            status_label, status_color = "OK", "green"
+        else:
+            status_label, status_color = "NOT FOUND", "red"
+    except OSError:
+        status_label, status_color = "UNREADABLE", "red"
+    status = click.style(status_label, fg=status_color)
+
+    def _render_tools(tools: list[str] | None) -> str:
+        if tools is None:
+            return click.style("(inherit defaults)", fg="cyan")
+        if not tools:
+            return click.style("(none — explicit override)", fg="yellow")
+        return ", ".join(tools)
+
+    click.echo(f"{click.style(name, bold=True)} [{status}]")
+    click.echo(f"  directory:        {agent.directory}")
+    click.echo(f"  description:      {agent.description}")
+    click.echo(f"  timeout:          {agent.timeout}s")
+    if agent.model:
+        click.echo(f"  model:            {agent.model}")
+    if agent.max_budget_usd is not None:
+        click.echo(f"  max_budget_usd:   ${agent.max_budget_usd}")
+    if agent.permission_mode:
+        click.echo(f"  permission_mode:  {agent.permission_mode}")
+    click.echo(f"  allowed_tools:    {_render_tools(agent.allowed_tools)}")
+    click.echo(f"  disallowed_tools: {_render_tools(agent.disallowed_tools)}")
+
+    # Surface project files used by auto_describe so the user can verify
+    # what context the dispatched agent will actually inherit.
+    try:
+        files: list[str] = []
+        for fname in ("CLAUDE.md", ".mcp.json", "README.md", "pyproject.toml", "package.json"):
+            if (agent.directory / fname).exists():
+                files.append(fname)
+        if files:
+            click.echo(f"  project files:    {', '.join(files)}")
+    except OSError:
+        pass
+
+
+@cli.command()
+def doctor() -> None:
+    """Diagnose the agent-dispatch setup and surface common issues."""
+    counters = {"issues": 0, "warnings": 0}
+
+    def section(title: str) -> None:
+        click.echo(f"\n{click.style(title, bold=True)}")
+
+    def ok(msg: str) -> None:
+        click.echo(f"  [{click.style('OK', fg='green')}] {msg}")
+
+    def warn(msg: str) -> None:
+        counters["warnings"] += 1
+        click.echo(f"  [{click.style('WARN', fg='yellow')}] {msg}")
+
+    def fail(msg: str) -> None:
+        counters["issues"] += 1
+        click.echo(f"  [{click.style('FAIL', fg='red')}] {msg}")
+
+    section("Environment")
+    claude_path = shutil.which("claude")
+    if claude_path:
+        ok(f"claude CLI: {claude_path}")
+    else:
+        fail("claude CLI not found on PATH")
+        click.echo("    Install: https://docs.anthropic.com/en/docs/claude-code")
+
+    ad_path = shutil.which("agent-dispatch")
+    if ad_path:
+        ok(f"agent-dispatch CLI: {ad_path}")
+    else:
+        warn(
+            "agent-dispatch not on PATH "
+            "(MCP server still works via absolute path)"
+        )
+
+    section("Config")
+    cp = config_path()
+    config: DispatchConfig | None = None
+    if not cp.exists():
+        warn(f"Config not found: {cp}")
+        click.echo("    Run: agent-dispatch init")
+    else:
+        try:
+            config = load_config()
+            n = len(config.agents)
+            suffix = "agent" if n == 1 else "agents"
+            ok(f"Config: {cp} ({n} {suffix})")
+        except ValidationError as e:
+            fail(f"Config schema invalid: {cp}")
+            click.echo(f"    {e}")
+        except yaml.YAMLError as e:
+            fail(f"Config not valid YAML: {cp}")
+            click.echo(f"    {e}")
+
+    section("MCP registration")
+    if claude_path is None:
+        warn("Skipped (claude CLI missing)")
+    else:
+        try:
+            result = subprocess.run(
+                [claude_path, "mcp", "list"],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Match the server name at the start of any line — `claude mcp list`
+            # prints `<name>: <command> - <status>`, and we want to avoid false
+            # positives from "agent-dispatch" appearing in command paths.
+            entry_re = re.compile(r"^agent-dispatch[:\s]", re.MULTILINE)
+            if result.returncode == 0 and entry_re.search(result.stdout):
+                ok("agent-dispatch is registered with Claude Code")
+            else:
+                warn("agent-dispatch is not registered with Claude Code")
+                click.echo("    Run: agent-dispatch init")
+        except subprocess.TimeoutExpired:
+            warn("Could not check MCP registration: claude mcp list timed out")
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            warn(f"Could not check MCP registration: {e}")
+
+    section("Agents")
+    if config is None:
+        warn("Skipped (config could not be loaded)")
+    elif not config.agents:
+        warn("No agents configured. Add one: agent-dispatch add <name> <directory>")
+    else:
+        for name, agent in config.agents.items():
+            try:
+                if agent.directory.is_dir():
+                    extras: list[str] = []
+                    if (agent.directory / "CLAUDE.md").exists():
+                        extras.append("CLAUDE.md")
+                    if (agent.directory / ".mcp.json").exists():
+                        extras.append(".mcp.json")
+                    suffix = f" [{', '.join(extras)}]" if extras else ""
+                    ok(f"{name}: {agent.directory}{suffix}")
+                else:
+                    fail(f"{name}: directory missing - {agent.directory}")
+            except OSError as e:
+                fail(f"{name}: directory unreadable - {e}")
+
+    section("Summary")
+    issues = counters["issues"]
+    warnings = counters["warnings"]
+    if issues == 0 and warnings == 0:
+        click.echo(click.style("All checks passed.", fg="green"))
+    else:
+        parts: list[str] = []
+        if issues:
+            parts.append(click.style(
+                f"{issues} issue{'s' if issues != 1 else ''}", fg="red",
+            ))
+        if warnings:
+            parts.append(click.style(
+                f"{warnings} warning{'s' if warnings != 1 else ''}", fg="yellow",
+            ))
+        click.echo(", ".join(parts))
+        if issues > 0:
+            raise SystemExit(1)
 
 
 @cli.command()

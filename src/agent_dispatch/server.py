@@ -102,14 +102,28 @@ async def list_agents(ctx: Context | None = None) -> str:
 
     agents = []
     for name, agent in config.agents.items():
-        healthy = agent.directory.is_dir()
+        # is_dir() can raise OSError (PermissionError, network FS hiccup, etc.).
+        # Fall back to "UNREADABLE" so a single broken agent doesn't crash the
+        # whole listing — per CLAUDE.md's documented response shape.
+        try:
+            healthy: bool | str = agent.directory.is_dir()
+            has_claude_md = (
+                (agent.directory / "CLAUDE.md").exists() if healthy else False
+            )
+            has_mcp_config = (
+                (agent.directory / ".mcp.json").exists() if healthy else False
+            )
+        except OSError:
+            healthy = "UNREADABLE"
+            has_claude_md = False
+            has_mcp_config = False
         entry: dict = {
             "name": name,
             "directory": str(agent.directory),
             "description": agent.description,
             "healthy": healthy,
-            "has_claude_md": (agent.directory / "CLAUDE.md").exists() if healthy else False,
-            "has_mcp_config": (agent.directory / ".mcp.json").exists() if healthy else False,
+            "has_claude_md": has_claude_md,
+            "has_mcp_config": has_mcp_config,
         }
         if agent.permission_mode:
             entry["permission_mode"] = agent.permission_mode
@@ -151,10 +165,11 @@ async def dispatch(
     if err := _validate_agent(config, agent):
         return err
 
-    # Check cache
+    # Check cache. caller/goal are part of the key because they change the
+    # prompt sent to Claude and therefore the response.
     cache = _get_cache(config)
     if cache:
-        cached = cache.get(agent, task, context or None)
+        cached = cache.get(agent, task, context or None, caller or None, goal or None)
         if cached:
             if ctx:
                 await ctx.info(f"Cache hit for {agent} — returning cached result")
@@ -180,7 +195,7 @@ async def dispatch(
 
     # Populate cache
     if cache:
-        cache.put(agent, task, result, context or None)
+        cache.put(agent, task, result, context or None, caller or None, goal or None)
 
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -291,9 +306,9 @@ async def dispatch_parallel(
         item_caller = item.get("caller") or None
         item_goal = item.get("goal") or None
 
-        # Check cache
+        # Check cache (caller/goal are part of the key — see dispatch())
         if cache:
-            cached = cache.get(name, task, item_context)
+            cached = cache.get(name, task, item_context, item_caller, item_goal)
             if cached:
                 d = json.loads(cached.model_dump_json(exclude_none=True))
                 d["cached"] = True
@@ -313,7 +328,7 @@ async def dispatch_parallel(
             )
 
         if cache:
-            cache.put(name, task, result, item_context)
+            cache.put(name, task, result, item_context, item_caller, item_goal)
 
         return json.loads(result.model_dump_json(exclude_none=True))
 

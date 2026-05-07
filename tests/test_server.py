@@ -200,6 +200,51 @@ class TestDispatchCaching:
             assert result.get("cached") is True
 
     @pytest.mark.asyncio
+    async def test_cache_differentiates_callers(self, tmp_path: Path):
+        """Same (agent, task) but different caller should dispatch fresh —
+        caller/goal change the prompt, so the cached result is not equivalent."""
+        config = _make_config(tmp_path)
+        call_count = 0
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            nonlocal call_count
+            call_count += 1
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "check pods", caller="frontend")
+            assert call_count == 1
+            # Same task, different caller → must miss the cache and dispatch again
+            await server.dispatch("infra", "check pods", caller="backend")
+            assert call_count == 2
+            # Same caller again → hit
+            raw = await server.dispatch("infra", "check pods", caller="frontend")
+            assert call_count == 2
+            assert json.loads(raw).get("cached") is True
+
+    @pytest.mark.asyncio
+    async def test_cache_differentiates_goals(self, tmp_path: Path):
+        """Different goal → different prompt → cache miss."""
+        config = _make_config(tmp_path)
+        call_count = 0
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            nonlocal call_count
+            call_count += 1
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "check pods", goal="debug crash")
+            await server.dispatch("infra", "check pods", goal="optimize perf")
+            assert call_count == 2
+
+    @pytest.mark.asyncio
     async def test_cache_disabled(self, tmp_path: Path):
         config = _make_config(tmp_path, cache_enabled=False)
         call_count = 0
@@ -626,6 +671,66 @@ class TestListAgentsPermissions:
             agents = json.loads(raw)
         assert agents[0]["allowed_tools"] == []
         assert agents[0]["disallowed_tools"] == []
+
+
+class TestListAgentsHealth:
+    """Health-check edge cases — directory missing, unreadable, etc."""
+
+    @pytest.mark.asyncio
+    async def test_list_handles_unreadable_directory(self, tmp_path: Path):
+        """One agent with PermissionError on is_dir() should NOT crash the
+        whole listing — that agent gets healthy='UNREADABLE', others OK."""
+        good = tmp_path / "good"
+        good.mkdir()
+        bad = tmp_path / "bad"
+        bad.mkdir()
+        config = DispatchConfig(
+            agents={
+                "good": AgentConfig(directory=good, description="ok"),
+                "bad": AgentConfig(directory=bad, description="unreadable"),
+            }
+        )
+        mock_ctx = AsyncMock()
+
+        original_is_dir = Path.is_dir
+
+        def selective_is_dir(self):
+            if self == bad:
+                raise PermissionError("denied")
+            return original_is_dir(self)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(Path, "is_dir", selective_is_dir),
+        ):
+            raw = await server.list_agents(ctx=mock_ctx)
+        agents = json.loads(raw)
+        # Both agents present — one bad agent does not poison the list
+        assert len(agents) == 2
+        by_name = {a["name"]: a for a in agents}
+        assert by_name["good"]["healthy"] is True
+        assert by_name["bad"]["healthy"] == "UNREADABLE"
+        assert by_name["bad"]["has_claude_md"] is False
+        assert by_name["bad"]["has_mcp_config"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_handles_nonexistent_directory(self, tmp_path: Path):
+        """Directory that doesn't exist → healthy=False, child checks=False."""
+        # Note: AgentConfig auto-resolves but doesn't require existence
+        config = DispatchConfig(
+            agents={
+                "ghost": AgentConfig(
+                    directory=tmp_path / "does-not-exist",
+                    description="missing",
+                ),
+            }
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+        agents = json.loads(raw)
+        assert agents[0]["healthy"] is False
+        assert agents[0]["has_claude_md"] is False
 
 
 class TestAddRemoveAgent:

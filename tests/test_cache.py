@@ -53,6 +53,48 @@ class TestCacheBasics:
         cache.put("a", "task", _fail_result())
         assert cache.get("a", "task") is None
 
+    def test_caller_affects_key(self):
+        """Different caller → different prompt → must not collide in cache."""
+        cache = DispatchCache(ttl=60)
+        cache.put("a", "task", _ok_result(text="for-frontend"), caller="frontend")
+        cache.put("a", "task", _ok_result(text="for-backend"), caller="backend")
+        assert cache.get("a", "task", caller="frontend").result == "for-frontend"
+        assert cache.get("a", "task", caller="backend").result == "for-backend"
+        # Different caller from what was stored → miss
+        assert cache.get("a", "task", caller="other") is None
+
+    def test_goal_affects_key(self):
+        """Different goal → different prompt → must not collide in cache."""
+        cache = DispatchCache(ttl=60)
+        cache.put("a", "task", _ok_result(text="for-debug"), goal="debug crash")
+        cache.put("a", "task", _ok_result(text="for-perf"), goal="optimize perf")
+        assert cache.get("a", "task", goal="debug crash").result == "for-debug"
+        assert cache.get("a", "task", goal="optimize perf").result == "for-perf"
+
+    def test_caller_and_goal_combined(self):
+        cache = DispatchCache(ttl=60)
+        cache.put(
+            "a", "task", _ok_result(text="A"),
+            caller="frontend", goal="debug",
+        )
+        # Same caller, different goal → miss
+        assert cache.get("a", "task", caller="frontend", goal="optimize") is None
+        # Same goal, different caller → miss
+        assert cache.get("a", "task", caller="backend", goal="debug") is None
+        # Both match → hit
+        assert cache.get(
+            "a", "task", caller="frontend", goal="debug",
+        ).result == "A"
+
+    def test_caller_none_vs_empty_string_collide(self):
+        """caller=None and caller="" canonicalize the same — both mean
+        'no caller specified'. Document the behavior so future changes
+        don't silently break the contract."""
+        cache = DispatchCache(ttl=60)
+        cache.put("a", "task", _ok_result(text="anon"), caller=None)
+        assert cache.get("a", "task", caller="") is not None
+        assert cache.get("a", "task", caller=None) is not None
+
 
 class TestCacheTTL:
     def test_expired_entry_returns_none(self):
