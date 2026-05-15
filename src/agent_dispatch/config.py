@@ -60,6 +60,47 @@ def _collect_mcp_servers(directory: Path) -> list[str]:
     return list(dict.fromkeys(servers))  # deduplicate, preserve order
 
 
+# Public alias — callers outside config.py should use this name.
+collect_mcp_servers = _collect_mcp_servers
+
+
+def detect_stacks(directory: Path) -> list[str]:
+    """Detect language/runtime stacks present in a project directory.
+
+    Returns a deduplicated list of indicators like ["Python", "Docker"].
+    Used by auto_describe() and by the MCP list_agents tool to surface
+    capabilities cheaply (no claude subprocess needed).
+    """
+    indicators: list[str] = []
+    if (directory / "Dockerfile").exists():
+        indicators.append("Docker")
+    if (directory / "docker-compose.yaml").exists() or (
+        directory / "docker-compose.yml"
+    ).exists():
+        indicators.append("Docker Compose")
+    if (directory / "Cargo.toml").exists():
+        indicators.append("Rust")
+    if (directory / "go.mod").exists():
+        indicators.append("Go")
+    if (directory / "requirements.txt").exists() or (directory / "pyproject.toml").exists():
+        indicators.append("Python")
+    if (directory / "package.json").exists():
+        indicators.append("Node.js")
+    return indicators
+
+
+def detect_dbs(directory: Path) -> list[str]:
+    """Detect database-related artifacts: Prisma, Alembic, generic migrations dir."""
+    indicators: list[str] = []
+    if (directory / "prisma").is_dir() or (directory / "schema.prisma").exists():
+        indicators.append("Prisma")
+    if (directory / "alembic").is_dir() or (directory / "alembic.ini").exists():
+        indicators.append("Alembic")
+    if (directory / "migrations").is_dir():
+        indicators.append("migrations")
+    return indicators
+
+
 def auto_describe(directory: Path) -> str:
     """Generate agent description by reading project files.
 
@@ -122,32 +163,14 @@ def auto_describe(directory: Path) -> str:
     if servers:
         parts.append(f"MCP: {', '.join(servers)}")
 
-    # Stack indicators
-    indicators = []
-    if (directory / "Dockerfile").exists():
-        indicators.append("Docker")
-    if (directory / "docker-compose.yaml").exists() or (directory / "docker-compose.yml").exists():
-        indicators.append("Docker Compose")
-    if (directory / "Cargo.toml").exists():
-        indicators.append("Rust")
-    if (directory / "go.mod").exists():
-        indicators.append("Go")
-    if (directory / "requirements.txt").exists() or pyproject.exists():
-        indicators.append("Python")
-    if pkg_json.exists():
-        indicators.append("Node.js")
-    if indicators:
-        parts.append(f"Stack: {', '.join(indicators)}")
+    # Stack indicators (Python/Node/Rust/Go/Docker)
+    stacks = detect_stacks(directory)
+    if stacks:
+        parts.append(f"Stack: {', '.join(stacks)}")
 
-    # Database indicators
-    db_indicators = []
-    if (directory / "prisma").is_dir() or (directory / "schema.prisma").exists():
-        db_indicators.append("Prisma")
-    if (directory / "alembic").is_dir() or (directory / "alembic.ini").exists():
-        db_indicators.append("Alembic")
-    if (directory / "migrations").is_dir():
-        db_indicators.append("migrations")
-    if db_indicators:
-        parts.append(f"DB: {', '.join(db_indicators)}")
+    # Database indicators (Prisma/Alembic/migrations)
+    dbs = detect_dbs(directory)
+    if dbs:
+        parts.append(f"DB: {', '.join(dbs)}")
 
     return " | ".join(parts) if parts else f"Agent in {directory.name}"

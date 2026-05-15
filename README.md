@@ -55,7 +55,7 @@ Done. Every Claude Code session now has access to all dispatch tools.
 Lists all configured agents. **Call this first** to see what's available.
 
 ```json
-// Response (permission fields shown only when configured)
+// Response (capability + permission fields shown only when populated)
 [
   {
     "name": "infra",
@@ -64,11 +64,27 @@ Lists all configured agents. **Call this first** to see what's available.
     "healthy": true,
     "has_claude_md": true,
     "has_mcp_config": true,
+    "mcp_servers": ["portainer", "postgres"],
+    "stacks": ["Python", "Docker"],
+    "dbs": ["Alembic"],
     "permission_mode": "bypassPermissions",
     "allowed_tools": ["Bash", "Read", "Grep"]
   }
 ]
 ```
+
+`mcp_servers`, `stacks`, and `dbs` are detected from the agent's project files (`.mcp.json`, `Dockerfile`, `pyproject.toml`, `Cargo.toml`, `prisma/`, `alembic.ini`, etc.) so callers can pick the right agent without dispatching a probe.
+
+### `inspect_agent`
+
+Cheap detailed lookup — reads the agent's files without spawning a `claude` session. Returns the full config (timeout, model, budget, permission mode, allowed/disallowed tools), detected MCP/stacks/DBs, plus short previews of `CLAUDE.md` and `README.md` when present.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Agent name from `list_agents` |
+| `preview_lines` | int | no | Max lines of CLAUDE.md/README.md (default 40, max 200, 0 disables) |
+
+Use this **before** `dispatch_async`/`dispatch` to confirm an agent has the tools and context for your task — much cheaper than a probe dispatch.
 
 ### `dispatch`
 

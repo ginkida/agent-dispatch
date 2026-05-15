@@ -1266,3 +1266,146 @@ class TestDispatchGC:
     async def test_dispatch_gc_rejects_zero(self):
         raw = await server.dispatch_gc(max_age_days=0)
         assert "error" in json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Enriched list_agents + inspect_agent
+# ---------------------------------------------------------------------------
+
+
+class TestListAgentsEnriched:
+    @pytest.mark.asyncio
+    async def test_list_surfaces_mcp_stacks_dbs(self, tmp_path: Path):
+        agent_dir = tmp_path / "infra"
+        agent_dir.mkdir()
+        (agent_dir / ".mcp.json").write_text(
+            '{"mcpServers": {"portainer": {}, "postgres": {}}}'
+        )
+        (agent_dir / "pyproject.toml").write_text('description = "x"\n')
+        (agent_dir / "Dockerfile").write_text("FROM python:3.11\n")
+        (agent_dir / "alembic.ini").write_text("[alembic]\n")
+        config = DispatchConfig(
+            agents={"infra": AgentConfig(directory=agent_dir, description="d")}
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+        entry = json.loads(raw)[0]
+        assert "portainer" in entry["mcp_servers"]
+        assert "postgres" in entry["mcp_servers"]
+        assert "Python" in entry["stacks"]
+        assert "Docker" in entry["stacks"]
+        assert "Alembic" in entry["dbs"]
+
+    @pytest.mark.asyncio
+    async def test_list_omits_empty_capability_fields(self, tmp_path: Path):
+        """Plain directory with no MCP/stack/DB markers should omit those keys."""
+        agent_dir = tmp_path / "plain"
+        agent_dir.mkdir()
+        config = DispatchConfig(
+            agents={"plain": AgentConfig(directory=agent_dir, description="d")}
+        )
+        mock_ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents(ctx=mock_ctx)
+        entry = json.loads(raw)[0]
+        assert "mcp_servers" not in entry
+        assert "stacks" not in entry
+        assert "dbs" not in entry
+
+
+class TestInspectAgent:
+    @pytest.mark.asyncio
+    async def test_inspect_returns_full_info(self, tmp_path: Path):
+        agent_dir = tmp_path / "infra"
+        agent_dir.mkdir()
+        (agent_dir / "CLAUDE.md").write_text(
+            "# Infra\nManages production infrastructure.\n"
+        )
+        (agent_dir / "README.md").write_text("Infra README\n" * 50)
+        (agent_dir / ".mcp.json").write_text('{"mcpServers": {"portainer": {}}}')
+        (agent_dir / "pyproject.toml").write_text('description = "x"\n')
+
+        config = DispatchConfig(
+            agents={
+                "infra": AgentConfig(
+                    directory=agent_dir, description="d", timeout=120,
+                    permission_mode="bypassPermissions",
+                    allowed_tools=["Bash", "Read"],
+                ),
+            }
+        )
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.inspect_agent("infra")
+        info = json.loads(raw)
+        assert info["name"] == "infra"
+        assert info["healthy"] is True
+        assert info["timeout"] == 120
+        assert info["permission_mode"] == "bypassPermissions"
+        assert info["allowed_tools"] == ["Bash", "Read"]
+        assert info["mcp_servers"] == ["portainer"]
+        assert "Python" in info["stacks"]
+        assert info["has_claude_md"] is True
+        assert info["has_readme"] is True
+        assert "Manages production infrastructure" in info["claude_md_preview"]
+        # README has 50 identical lines; preview must be truncated to <=40
+        assert info.get("readme_truncated") is True
+
+    @pytest.mark.asyncio
+    async def test_inspect_preview_zero_omits_text(self, tmp_path: Path):
+        agent_dir = tmp_path / "p"
+        agent_dir.mkdir()
+        (agent_dir / "CLAUDE.md").write_text("content here\n")
+        config = DispatchConfig(
+            agents={"p": AgentConfig(directory=agent_dir, description="d")}
+        )
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.inspect_agent("p", preview_lines=0)
+        info = json.loads(raw)
+        assert info["has_claude_md"] is True
+        assert "claude_md_preview" not in info
+
+    @pytest.mark.asyncio
+    async def test_inspect_unknown_agent(self, tmp_path: Path):
+        config = DispatchConfig(agents={})
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.inspect_agent("nope")
+        assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_inspect_directory_missing(self, tmp_path: Path):
+        # AgentConfig validates Path but doesn't require existence
+        ghost = tmp_path / "ghost"
+        config = DispatchConfig(
+            agents={"ghost": AgentConfig(directory=ghost, description="d")}
+        )
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.inspect_agent("ghost")
+        info = json.loads(raw)
+        assert info["healthy"] is False
+        # No previews/scan results when unhealthy
+        assert "claude_md_preview" not in info
+        assert "mcp_servers" not in info
+
+    @pytest.mark.asyncio
+    async def test_inspect_directory_unreadable(self, tmp_path: Path):
+        agent_dir = tmp_path / "bad"
+        agent_dir.mkdir()
+        config = DispatchConfig(
+            agents={"bad": AgentConfig(directory=agent_dir, description="d")}
+        )
+
+        original_is_dir = Path.is_dir
+
+        def selective_is_dir(self):
+            if self == agent_dir:
+                raise PermissionError("denied")
+            return original_is_dir(self)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(Path, "is_dir", selective_is_dir),
+        ):
+            raw = await server.inspect_agent("bad")
+        info = json.loads(raw)
+        assert info["healthy"] == "UNREADABLE"

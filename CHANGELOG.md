@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `list_agents` MCP tool now surfaces `mcp_servers`, `stacks`, and `dbs`
+  per agent (when present) — the same structured data `auto_describe`
+  already collects from `.mcp.json`, `Dockerfile`, `pyproject.toml`,
+  `package.json`, `Cargo.toml`, `go.mod`, `prisma/`, `alembic.ini`, etc.
+  Calling agents no longer need to dispatch a probe just to learn what
+  tools the target has.
+- New `inspect_agent(name, preview_lines=40)` MCP tool — cheap detailed
+  lookup without a `claude` subprocess. Returns the agent's full config
+  fields (timeout, model, budget, permission_mode, tool lists), detected
+  MCP/stacks/DBs, plus short previews of `CLAUDE.md` and `README.md` so
+  the caller can confirm capabilities before spending a real dispatch.
+- `config.collect_mcp_servers()`, `config.detect_stacks()`, and
+  `config.detect_dbs()` are now public helpers (the previous private
+  `_collect_mcp_servers` remains as an alias for compatibility).
 - Async dispatch with a `job_id` pattern — five new MCP tools let calling
   agents fire-and-forget long-running tasks without blocking their own tool
   slot:

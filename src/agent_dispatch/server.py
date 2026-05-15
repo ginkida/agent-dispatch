@@ -15,7 +15,15 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from . import runner
 from .cache import DispatchCache
-from .config import auto_describe, config_path, load_config, save_config
+from .config import (
+    auto_describe,
+    collect_mcp_servers,
+    config_path,
+    detect_dbs,
+    detect_stacks,
+    load_config,
+    save_config,
+)
 from .jobs import JobStore
 from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
 
@@ -31,12 +39,13 @@ mcp = FastMCP(
         "code you don't have access to. Don't dispatch for things you can do yourself.\n\n"
         "HOW TO USE:\n"
         "1. list_agents() — see who's available and what they can do\n"
-        "2. dispatch(agent, task) — one-shot delegation (cached)\n"
-        "3. dispatch_session(agent, task, session_id?) — multi-turn conversation\n"
-        "4. dispatch_parallel(dispatches, aggregate?) — concurrent tasks\n"
-        "5. dispatch_stream(agent, task) — live progress updates\n"
-        "6. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
-        "7. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "2. inspect_agent(name) — cheap detailed lookup (MCP, stack, CLAUDE.md preview)\n"
+        "3. dispatch(agent, task) — one-shot delegation (cached)\n"
+        "4. dispatch_session(agent, task, session_id?) — multi-turn conversation\n"
+        "5. dispatch_parallel(dispatches, aggregate?) — concurrent tasks\n"
+        "6. dispatch_stream(agent, task) — live progress updates\n"
+        "7. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
+        "8. Always pass caller= (your project name) and goal= (why you need this)\n\n"
         "ASYNC DISPATCH (don't block on long tasks):\n"
         "- dispatch_async(agent, task) — fire-and-forget, returns job_id\n"
         "- dispatch_status(job_id) — check progress without blocking\n"
@@ -145,6 +154,9 @@ async def list_agents(ctx: Context | None = None) -> str:
         # is_dir() can raise OSError (PermissionError, network FS hiccup, etc.).
         # Fall back to "UNREADABLE" so a single broken agent doesn't crash the
         # whole listing — per CLAUDE.md's documented response shape.
+        mcp_servers: list[str] = []
+        stacks: list[str] = []
+        dbs: list[str] = []
         try:
             healthy: bool | str = agent.directory.is_dir()
             has_claude_md = (
@@ -153,6 +165,16 @@ async def list_agents(ctx: Context | None = None) -> str:
             has_mcp_config = (
                 (agent.directory / ".mcp.json").exists() if healthy else False
             )
+            if healthy:
+                # Cheap I/O: scans a handful of well-known files in the agent dir.
+                # Surface these so callers can pick the right agent without
+                # dispatching a probe.
+                try:
+                    mcp_servers = collect_mcp_servers(agent.directory)
+                    stacks = detect_stacks(agent.directory)
+                    dbs = detect_dbs(agent.directory)
+                except OSError:
+                    pass
         except OSError:
             healthy = "UNREADABLE"
             has_claude_md = False
@@ -165,6 +187,12 @@ async def list_agents(ctx: Context | None = None) -> str:
             "has_claude_md": has_claude_md,
             "has_mcp_config": has_mcp_config,
         }
+        if mcp_servers:
+            entry["mcp_servers"] = mcp_servers
+        if stacks:
+            entry["stacks"] = stacks
+        if dbs:
+            entry["dbs"] = dbs
         if agent.permission_mode:
             entry["permission_mode"] = agent.permission_mode
         # Include when explicitly set (even []) to distinguish from inheriting defaults
@@ -176,6 +204,112 @@ async def list_agents(ctx: Context | None = None) -> str:
     if ctx:
         await ctx.info(f"Found {len(agents)} configured agents")
     return json.dumps(agents, indent=2)
+
+
+def _read_preview(path, max_lines: int, max_chars: int) -> tuple[str, bool]:
+    """Read a small preview from a file. Returns (text, truncated)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", False
+    lines = text.splitlines()
+    truncated = False
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    preview = "\n".join(lines)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars]
+        truncated = True
+    return preview, truncated
+
+
+@mcp.tool()
+async def inspect_agent(
+    name: str,
+    preview_lines: int = 40,
+    ctx: Context | None = None,
+) -> str:
+    """Inspect an agent's project without dispatching a claude session.
+
+    Reads the agent's directory cheaply (no subprocess) and returns:
+    directory, description, config fields, detected MCP servers/stacks/DBs,
+    plus short previews of CLAUDE.md and README.md when present.
+
+    Use this BEFORE dispatch_async/dispatch to confirm an agent has the
+    right tools and context for your task — much cheaper than a probe
+    dispatch.
+
+    Args:
+        name: Agent name (from list_agents).
+        preview_lines: Max lines of CLAUDE.md / README.md to include
+            (default 40, capped at 200). Pass 0 to omit previews.
+    """
+    config = _get_config()
+    if err := _validate_agent(config, name):
+        return err
+
+    agent = config.agents[name]
+    info: dict = {
+        "name": name,
+        "directory": str(agent.directory),
+        "description": agent.description,
+        "timeout": agent.timeout,
+    }
+    if agent.model:
+        info["model"] = agent.model
+    if agent.max_budget_usd is not None:
+        info["max_budget_usd"] = agent.max_budget_usd
+    if agent.permission_mode:
+        info["permission_mode"] = agent.permission_mode
+    if agent.allowed_tools is not None:
+        info["allowed_tools"] = agent.allowed_tools
+    if agent.disallowed_tools is not None:
+        info["disallowed_tools"] = agent.disallowed_tools
+
+    try:
+        healthy = agent.directory.is_dir()
+    except OSError:
+        info["healthy"] = "UNREADABLE"
+        return json.dumps(info, indent=2)
+
+    info["healthy"] = healthy
+    if not healthy:
+        return json.dumps(info, indent=2)
+
+    try:
+        info["mcp_servers"] = collect_mcp_servers(agent.directory)
+        info["stacks"] = detect_stacks(agent.directory)
+        info["dbs"] = detect_dbs(agent.directory)
+    except OSError as e:
+        info["scan_error"] = str(e)
+
+    info["has_claude_md"] = (agent.directory / "CLAUDE.md").exists()
+    info["has_readme"] = (agent.directory / "README.md").exists()
+    info["has_mcp_config"] = (agent.directory / ".mcp.json").exists()
+
+    lines = max(0, min(int(preview_lines), 200))
+    if lines > 0:
+        char_cap = max(200, lines * 200)  # roughly 200 chars/line cap
+        if info["has_claude_md"]:
+            text, truncated = _read_preview(
+                agent.directory / "CLAUDE.md", lines, char_cap
+            )
+            info["claude_md_preview"] = text
+            if truncated:
+                info["claude_md_truncated"] = True
+        if info["has_readme"]:
+            text, truncated = _read_preview(
+                agent.directory / "README.md", lines, char_cap
+            )
+            info["readme_preview"] = text
+            if truncated:
+                info["readme_truncated"] = True
+
+    if ctx:
+        await ctx.info(f"Inspected {name} ({agent.directory})")
+
+    return json.dumps(info, indent=2)
 
 
 @mcp.tool()
