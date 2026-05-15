@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Result references — `dispatch(..., return_ref=True)` and per-item in
+  `dispatch_parallel` now return a compact `{ref, agent, success, size,
+  summary, summary_chars, cost_usd, ...}` payload instead of the full
+  result text. The full DispatchResult is persisted to disk (reusing the
+  async JobStore) and can be loaded on demand via the new
+  `fetch_result(ref, max_chars=0)` MCP tool. Saves caller context when
+  the result is large; the JSON parsed_result (small by nature) is still
+  inlined alongside the ref. fetch_result also works on any
+  `dispatch_async` job_id — the storage is shared.
+- `JobStore.create_completed(...)` — persists an already-finished
+  DispatchResult as a Job in terminal state. Used by ref mode; future
+  iterations can use it for result archival.
 - Structured JSON response support — `dispatch`, `dispatch_session`,
   `dispatch_async`, `dispatch_stream`, and per-item in `dispatch_parallel`
   now accept `response_format="json"`. When set, the runner appends a clear

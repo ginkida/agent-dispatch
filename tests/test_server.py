@@ -1527,3 +1527,148 @@ class TestStructuredResponseMCP:
             ]))
         assert ("infra", None) in seen
         assert ("db", "json") in seen
+
+
+# ---------------------------------------------------------------------------
+# Result references (return_ref + fetch_result)
+# ---------------------------------------------------------------------------
+
+
+class TestReturnRef:
+    @pytest.mark.asyncio
+    async def test_dispatch_return_ref_compact_response(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        big_text = "X" * 10000
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(
+                agent=name, success=True, result=big_text, cost_usd=0.05,
+                session_id="sid", duration_ms=2000, num_turns=3,
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch(
+                "infra", "audit", return_ref=True, summary_chars=200,
+            )
+        data = json.loads(raw)
+        assert "ref" in data
+        assert data["agent"] == "infra"
+        assert data["success"] is True
+        assert data["size"] == 10000
+        assert data["summary_chars"] == 200
+        assert len(data["summary"]) == 200
+        assert data["session_id"] == "sid"
+        assert data["cost_usd"] == 0.05
+        assert "result" not in data  # full result must NOT be inlined
+
+    @pytest.mark.asyncio
+    async def test_dispatch_ref_includes_parsed_result(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(
+                agent=name, success=True, result='{"a": 1}',
+                parsed_result={"a": 1},
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch(
+                "infra", "task", response_format="json", return_ref=True,
+            )
+        data = json.loads(raw)
+        assert data["parsed_result"] == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_returns_full(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        big_text = "Y" * 5000
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(
+                agent=name, success=True, result=big_text, cost_usd=0.01,
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            ref_resp = json.loads(await server.dispatch(
+                "infra", "task", return_ref=True
+            ))
+            full_resp = json.loads(await server.fetch_result(ref_resp["ref"]))
+        assert full_resp["result"] == big_text
+        assert full_resp["cost_usd"] == 0.01
+        assert "truncated" not in full_resp
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_truncates_on_request(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        big_text = "Z" * 8000
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(agent=name, success=True, result=big_text)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            ref_resp = json.loads(await server.dispatch(
+                "infra", "task", return_ref=True
+            ))
+            raw = await server.fetch_result(ref_resp["ref"], max_chars=100)
+        data = json.loads(raw)
+        assert data["truncated"] is True
+        assert data["full_size"] == 8000
+        assert len(data["result"]) == 100
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_unknown_ref(self):
+        raw = await server.fetch_result("nonexistent-ref")
+        assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_works_for_async_jobs(self, tmp_path: Path):
+        """fetch_result reuses JobStore — async job_ids are valid refs too."""
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, "async-result")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            async_resp = json.loads(await server.dispatch_async("infra", "task"))
+            await _wait_terminal(async_resp["job_id"])
+            raw = await server.fetch_result(async_resp["job_id"])
+        assert json.loads(raw)["result"] == "async-result"
+
+    @pytest.mark.asyncio
+    async def test_parallel_per_item_return_ref(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, f"big-{name}")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_parallel(json.dumps([
+                {"agent": "infra", "task": "t1"},  # full result inline
+                {"agent": "db", "task": "t2", "return_ref": True, "summary_chars": 3},
+            ]))
+        results = json.loads(raw)
+        # First item: full DispatchResult shape
+        assert results[0]["result"] == "big-infra"
+        assert "ref" not in results[0]
+        # Second item: ref shape, summary capped at 3 chars
+        assert "ref" in results[1]
+        assert results[1]["summary"] == "big"
+        assert results[1]["size"] == len("big-db")

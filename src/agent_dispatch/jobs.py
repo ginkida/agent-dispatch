@@ -84,6 +84,39 @@ class JobStore:
             self._write(job)
         return job
 
+    def create_completed(
+        self,
+        agent: str,
+        task: str,
+        result: DispatchResult,
+        *,
+        context: str | None = None,
+        caller: str | None = None,
+        goal: str | None = None,
+    ) -> Job:
+        """Persist a synchronous dispatch result as an already-finished job.
+
+        Used by ``return_ref`` mode so callers can fetch the full result later
+        via ``fetch_result(ref)`` without keeping the text in their context.
+        """
+        now = time.time()
+        job = Job(
+            id=uuid.uuid4().hex,
+            agent=agent,
+            task=task,
+            context=context,
+            caller=caller,
+            goal=goal,
+            status="done" if result.success else "failed",
+            started_at=now,
+            completed_at=now,
+            result=result,
+            error=result.error if not result.success else None,
+        )
+        with self._lock:
+            self._write(job)
+        return job
+
     def get(self, job_id: str) -> Job | None:
         """Read a job by id. Returns None if not found or unreadable."""
         path = self._path(job_id)

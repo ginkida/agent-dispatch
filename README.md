@@ -98,6 +98,8 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `caller` | string | no | Your project/role — helps the agent understand who's asking |
 | `goal` | string | no | Broader objective — helps the agent make better trade-offs |
 | `response_format` | string | no | `"json"` to request a single JSON value; the parsed result lands in `parsed_result`. Empty = free-form text. |
+| `return_ref` | bool | no | When `true`, returns just a `ref` + summary preview instead of the full result text. Use `fetch_result(ref)` to load the full text on demand. |
+| `summary_chars` | int | no | Max chars of result text to include in the ref response (default 500). |
 
 ```json
 // Response (success)
@@ -288,6 +290,24 @@ Remove an agent from config.
 ### `cache_stats` / `cache_clear`
 
 View cache hit rate and size, or clear all cached results.
+
+### Result references — `return_ref` + `fetch_result`
+
+For dispatches whose result text is large (audits, log dumps, code searches), passing the full text back inflates the calling agent's context. Use `return_ref=True` to get just a small reference instead:
+
+```
+dispatch(agent="infra", task="audit every container", return_ref=True, summary_chars=200)
+  -> {"ref": "8f3a...e1", "agent": "infra", "success": true,
+      "size": 14823, "summary_chars": 200,
+      "summary": "Inspected 32 containers. Found 3 OOM kills in the last hour:\n- worker-3...",
+      "cost_usd": 0.08, "duration_ms": 9200}
+
+// Later, when you actually need to read the result:
+fetch_result(ref="8f3a...e1")              -> full DispatchResult JSON
+fetch_result(ref="8f3a...e1", max_chars=2000)  -> truncated, plus {"truncated": true, "full_size": 14823}
+```
+
+Refs reuse the same storage as `dispatch_async` jobs (under `~/.config/agent-dispatch/jobs/`), so any `job_id` returned by `dispatch_async` is also a valid `ref` for `fetch_result`. `parsed_result` (when `response_format="json"` is set) is small and is always inlined directly in the ref response — no second fetch needed.
 
 ### Async dispatch — `dispatch_async`, `dispatch_status`, `dispatch_wait`, `dispatch_jobs`, `dispatch_gc`
 

@@ -177,3 +177,30 @@ class TestJobModel:
             assert Job(id="x", agent="a", task="t", status=s).is_terminal()
         for s in ("pending", "running"):
             assert not Job(id="x", agent="a", task="t", status=s).is_terminal()
+
+
+class TestCreateCompleted:
+    def test_create_completed_success(self, store: JobStore):
+        result = DispatchResult(
+            agent="infra", success=True, result="ok-text", cost_usd=0.03,
+        )
+        job = store.create_completed("infra", "task", result, caller="api")
+        assert job.status == "done"
+        assert job.completed_at is not None
+        assert job.started_at is not None
+        assert job.result is not None
+        assert job.result.cost_usd == 0.03
+        assert job.caller == "api"
+        # Persisted
+        reread = store.get(job.id)
+        assert reread is not None
+        assert reread.status == "done"
+
+    def test_create_completed_failure(self, store: JobStore):
+        result = DispatchResult(
+            agent="infra", success=False, result="",
+            error="boom", error_type="cli_error",
+        )
+        job = store.create_completed("infra", "task", result)
+        assert job.status == "failed"
+        assert job.error == "boom"

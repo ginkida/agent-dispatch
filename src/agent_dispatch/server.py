@@ -51,6 +51,9 @@ mcp = FastMCP(
         "- dispatch_status(job_id) — check progress without blocking\n"
         "- dispatch_wait(job_id, timeout?) — block until done (or timeout)\n"
         "- dispatch_jobs(status?) — list recent async jobs\n\n"
+        "SAVING CONTEXT for big results:\n"
+        "- dispatch(..., return_ref=True) — returns just ref+summary, not full text\n"
+        "- fetch_result(ref, max_chars?) — load the full text only when needed\n\n"
         "MANAGING AGENTS:\n"
         "- add_agent(name, directory) — register a project, auto-generates description\n"
         "- update_agent(name, ...) — change permissions, timeout, model, etc.\n"
@@ -68,6 +71,7 @@ _job_semaphore_limit: int = 0
 
 _RESOLVED_MARKER = "[RESOLVED]"
 _JOB_GC_MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
+_DEFAULT_SUMMARY_CHARS = 500
 
 
 def _get_config() -> DispatchConfig:
@@ -93,6 +97,43 @@ def _get_semaphore(config: DispatchConfig) -> asyncio.Semaphore:
         _semaphore = asyncio.Semaphore(limit)
         _semaphore_limit = limit
     return _semaphore
+
+
+def _ref_payload(job_id: str, result, summary_chars: int = _DEFAULT_SUMMARY_CHARS) -> dict:
+    """Build the compact reference response for return_ref=True dispatches.
+
+    Caller gets just enough to know what happened; fetch_result(ref) reads
+    the full text on demand. Keeps the calling agent's context small.
+    """
+    chars = max(0, int(summary_chars))
+    text = result.result or ""
+    size = len(text)
+    summary = text[:chars] if chars else ""
+    payload: dict = {
+        "ref": job_id,
+        "agent": result.agent,
+        "success": result.success,
+        "size": size,
+        "summary_chars": min(size, chars) if chars else 0,
+        "summary": summary,
+    }
+    if result.session_id:
+        payload["session_id"] = result.session_id
+    if result.cost_usd is not None:
+        payload["cost_usd"] = result.cost_usd
+    if result.duration_ms is not None:
+        payload["duration_ms"] = result.duration_ms
+    if result.num_turns is not None:
+        payload["num_turns"] = result.num_turns
+    if result.error:
+        payload["error"] = result.error
+    if result.error_type:
+        payload["error_type"] = result.error_type
+    if result.parsed_result is not None:
+        # Parsed JSON is structured and typically small — include it inline so
+        # the caller can use it without a fetch round-trip.
+        payload["parsed_result"] = result.parsed_result
+    return payload
 
 
 def _validate_agent(config: DispatchConfig, name: str) -> str | None:
@@ -320,6 +361,8 @@ async def dispatch(
     caller: str = "",
     goal: str = "",
     response_format: str = "",
+    return_ref: bool = False,
+    summary_chars: int = _DEFAULT_SUMMARY_CHARS,
     ctx: Context | None = None,
 ) -> str:
     """Delegate a task to an agent in another project directory.
@@ -338,6 +381,12 @@ async def dispatch(
         response_format: ``"json"`` to ask the agent for a single JSON value.
             On success the parsed value is returned in ``parsed_result``.
             Leave empty for free-form text (default).
+        return_ref: When True, persist the full result and return only a
+            compact reference (ref id + summary preview + metadata). Use
+            fetch_result(ref) to load the full text later. Saves caller
+            context when the result is large.
+        summary_chars: Max chars of the result text to include in the ref
+            response (default 500; only relevant when return_ref=True).
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
@@ -381,6 +430,16 @@ async def dispatch(
         cache.put(
             agent, task, result, context or None, caller or None, goal or None, rf,
         )
+
+    if return_ref:
+        store = _get_job_store()
+        job = store.create_completed(
+            agent, task, result,
+            context=context or None,
+            caller=caller or None,
+            goal=goal or None,
+        )
+        return json.dumps(_ref_payload(job.id, result, summary_chars), indent=2)
 
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -493,6 +552,8 @@ async def dispatch_parallel(
         item_caller = item.get("caller") or None
         item_goal = item.get("goal") or None
         item_rf = item.get("response_format") or None
+        item_return_ref = bool(item.get("return_ref"))
+        item_summary_chars = int(item.get("summary_chars", _DEFAULT_SUMMARY_CHARS))
 
         # Check cache (caller/goal/response_format are part of the key — see dispatch())
         if cache:
@@ -500,6 +561,17 @@ async def dispatch_parallel(
                 name, task, item_context, item_caller, item_goal, item_rf,
             )
             if cached:
+                if item_return_ref:
+                    store = _get_job_store()
+                    job = store.create_completed(
+                        name, task, cached,
+                        context=item_context,
+                        caller=item_caller,
+                        goal=item_goal,
+                    )
+                    payload = _ref_payload(job.id, cached, item_summary_chars)
+                    payload["cached"] = True
+                    return payload
                 d = json.loads(cached.model_dump_json(exclude_none=True))
                 d["cached"] = True
                 return d
@@ -522,6 +594,16 @@ async def dispatch_parallel(
             cache.put(
                 name, task, result, item_context, item_caller, item_goal, item_rf,
             )
+
+        if item_return_ref:
+            store = _get_job_store()
+            job = store.create_completed(
+                name, task, result,
+                context=item_context,
+                caller=item_caller,
+                goal=item_goal,
+            )
+            return _ref_payload(job.id, result, item_summary_chars)
 
         return json.loads(result.model_dump_json(exclude_none=True))
 
@@ -1246,6 +1328,43 @@ async def dispatch_jobs(
             )
         summaries.append(entry)
     return json.dumps(summaries, indent=2)
+
+
+@mcp.tool()
+async def fetch_result(
+    ref: str,
+    max_chars: int = 0,
+    ctx: Context | None = None,
+) -> str:
+    """Fetch the full DispatchResult behind a ref returned by ``return_ref=True``.
+
+    Also works with job_ids returned by ``dispatch_async`` (the underlying
+    storage is the same).
+
+    Args:
+        ref: The ref/job_id whose result you want.
+        max_chars: Truncate ``result`` to this many characters (0 = no limit).
+            Useful when probing a very large result before deciding to load
+            it fully.
+    """
+    store = _get_job_store()
+    job = store.get(ref)
+    if job is None:
+        return json.dumps({"error": f"Ref not found: {ref}"})
+    if job.result is None:
+        # Not yet completed (e.g. async job still running) or failed before
+        # producing a DispatchResult. Return the job record so the caller
+        # can see the status.
+        return job.model_dump_json(indent=2, exclude_none=True)
+
+    payload = json.loads(job.result.model_dump_json(exclude_none=True))
+    text = payload.get("result") or ""
+    cap = max(0, int(max_chars))
+    if cap and len(text) > cap:
+        payload["result"] = text[:cap]
+        payload["truncated"] = True
+        payload["full_size"] = len(text)
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
