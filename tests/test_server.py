@@ -16,15 +16,23 @@ from agent_dispatch import server
 
 
 @pytest.fixture(autouse=True)
-def _reset_globals():
-    """Reset server-level cache and semaphore between tests."""
+def _reset_globals(tmp_path: Path, monkeypatch):
+    """Reset server-level cache, semaphore and job store between tests."""
     server._cache = None
     server._semaphore = None
     server._semaphore_limit = 0
+    server._job_store = None
+    server._job_semaphore = None
+    server._job_semaphore_limit = 0
+    # Isolate job storage per test
+    monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "_jobs"))
     yield
     server._cache = None
     server._semaphore = None
     server._semaphore_limit = 0
+    server._job_store = None
+    server._job_semaphore = None
+    server._job_semaphore_limit = 0
 
 
 def _make_config(tmp_path: Path, cache_enabled: bool = True) -> DispatchConfig:
@@ -1035,3 +1043,226 @@ class TestCacheTools:
             raw = await server.cache_stats()
             result = json.loads(raw)
             assert result["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Async dispatch tests
+# ---------------------------------------------------------------------------
+
+
+async def _wait_terminal(job_id: str, timeout: float = 2.0):
+    """Poll JobStore until job is terminal or timeout."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    store = server._get_job_store()
+    while asyncio.get_running_loop().time() < deadline:
+        job = store.get(job_id)
+        if job and job.is_terminal():
+            return job
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"Job {job_id} did not reach terminal state in {timeout}s")
+
+
+class TestDispatchAsync:
+    @pytest.mark.asyncio
+    async def test_dispatch_async_returns_job_id(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, f"result-{name}")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_async("infra", "check pods")
+            data = json.loads(raw)
+            assert "job_id" in data
+            assert data["agent"] == "infra"
+            assert data["status"] == "pending"
+
+            job = await _wait_terminal(data["job_id"])
+            assert job.status == "done"
+            assert job.result is not None
+            assert job.result.result == "result-infra"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_unknown_agent(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.dispatch_async("ghost", "task")
+            assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_worker_crash_marks_failed(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def boom(*a, **kw):
+            raise RuntimeError("kaboom")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=boom),
+        ):
+            raw = await server.dispatch_async("infra", "task")
+            job_id = json.loads(raw)["job_id"]
+            job = await _wait_terminal(job_id)
+            assert job.status == "failed"
+            assert "kaboom" in (job.error or "")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_failed_dispatch_marks_failed(self, tmp_path: Path):
+        """A DispatchResult with success=False should land as status=failed."""
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(
+                agent=name, success=False, result="",
+                error="permission denied", error_type="permission",
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_async("infra", "task")
+            job_id = json.loads(raw)["job_id"]
+            job = await _wait_terminal(job_id)
+            assert job.status == "failed"
+            assert job.result is not None
+            assert job.result.error_type == "permission"
+
+
+class TestDispatchStatusWait:
+    @pytest.mark.asyncio
+    async def test_dispatch_status_returns_job(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_async("infra", "task")
+            job_id = json.loads(raw)["job_id"]
+            await _wait_terminal(job_id)
+            status_raw = await server.dispatch_status(job_id)
+            data = json.loads(status_raw)
+            assert data["id"] == job_id
+            assert data["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_status_unknown(self, tmp_path: Path):
+        raw = await server.dispatch_status("does-not-exist")
+        assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_wait_returns_when_done(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def slow_dispatch(name, task, agent_config, settings, context=None, **kw):
+            import time
+            time.sleep(0.05)
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=slow_dispatch),
+        ):
+            raw = await server.dispatch_async("infra", "task")
+            job_id = json.loads(raw)["job_id"]
+            wait_raw = await server.dispatch_wait(job_id, timeout_seconds=2)
+            data = json.loads(wait_raw)
+            assert data["status"] == "done"
+            assert "timed_out_waiting" not in data
+
+    @pytest.mark.asyncio
+    async def test_dispatch_wait_times_out(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        # Manually create a stuck pending job (no worker)
+        store = server._get_job_store()
+        job = store.create("infra", "stuck")
+        _ = config  # not used but keeps fixture pattern
+        wait_raw = await server.dispatch_wait(job.id, timeout_seconds=1)
+        data = json.loads(wait_raw)
+        assert data["timed_out_waiting"] is True
+        assert data["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_wait_unknown_job(self):
+        raw = await server.dispatch_wait("nonexistent", timeout_seconds=1)
+        assert "error" in json.loads(raw)
+
+
+class TestDispatchJobsList:
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_empty(self):
+        raw = await server.dispatch_jobs()
+        assert json.loads(raw) == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_lists_and_filters(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            r1 = json.loads(await server.dispatch_async("infra", "a"))
+            r2 = json.loads(await server.dispatch_async("db", "b"))
+            await _wait_terminal(r1["job_id"])
+            await _wait_terminal(r2["job_id"])
+
+            all_raw = await server.dispatch_jobs()
+            all_jobs = json.loads(all_raw)
+            assert len(all_jobs) == 2
+            assert all(j["status"] == "done" for j in all_jobs)
+            assert all("success" in j for j in all_jobs)
+
+            done_raw = await server.dispatch_jobs(status="done")
+            assert len(json.loads(done_raw)) == 2
+
+            pending_raw = await server.dispatch_jobs(status="pending")
+            assert json.loads(pending_raw) == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_invalid_status(self):
+        raw = await server.dispatch_jobs(status="bogus")
+        assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_limit(self, tmp_path: Path):
+        store = server._get_job_store()
+        for i in range(5):
+            store.create("infra", f"task-{i}")
+        raw = await server.dispatch_jobs(limit=2)
+        assert len(json.loads(raw)) == 2
+
+
+class TestDispatchGC:
+    @pytest.mark.asyncio
+    async def test_dispatch_gc_purges_old(self, tmp_path: Path):
+        import time as _time
+        store = server._get_job_store()
+        old = store.create("infra", "old")
+        store.finish(old.id, DispatchResult(agent="infra", success=True, result=""))
+        updated = store.get(old.id)
+        assert updated is not None
+        updated.completed_at = _time.time() - 86400 * 30
+        store._write(updated)
+
+        recent = store.create("db", "recent")
+        store.finish(recent.id, DispatchResult(agent="db", success=True, result=""))
+
+        raw = await server.dispatch_gc(max_age_days=7)
+        data = json.loads(raw)
+        assert data["purged"] == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_gc_rejects_zero(self):
+        raw = await server.dispatch_gc(max_age_days=0)
+        assert "error" in json.loads(raw)

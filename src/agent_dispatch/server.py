@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import sys
+import threading
+import time
 
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import runner
 from .cache import DispatchCache
-from .config import auto_describe, load_config, save_config
+from .config import auto_describe, config_path, load_config, save_config
+from .jobs import JobStore
 from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
 
 logger = logging.getLogger(__name__)
@@ -33,6 +37,11 @@ mcp = FastMCP(
         "5. dispatch_stream(agent, task) — live progress updates\n"
         "6. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
         "7. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "ASYNC DISPATCH (don't block on long tasks):\n"
+        "- dispatch_async(agent, task) — fire-and-forget, returns job_id\n"
+        "- dispatch_status(job_id) — check progress without blocking\n"
+        "- dispatch_wait(job_id, timeout?) — block until done (or timeout)\n"
+        "- dispatch_jobs(status?) — list recent async jobs\n\n"
         "MANAGING AGENTS:\n"
         "- add_agent(name, directory) — register a project, auto-generates description\n"
         "- update_agent(name, ...) — change permissions, timeout, model, etc.\n"
@@ -44,8 +53,12 @@ mcp = FastMCP(
 _cache: DispatchCache | None = None
 _semaphore: asyncio.Semaphore | None = None
 _semaphore_limit: int = 0
+_job_store: JobStore | None = None
+_job_semaphore: threading.BoundedSemaphore | None = None
+_job_semaphore_limit: int = 0
 
 _RESOLVED_MARKER = "[RESOLVED]"
+_JOB_GC_MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 
 
 def _get_config() -> DispatchConfig:
@@ -79,6 +92,33 @@ def _validate_agent(config: DispatchConfig, name: str) -> str | None:
         available = ", ".join(config.agents.keys()) or "(none configured)"
         return json.dumps({"error": f"Unknown agent: {name!r}. Available: {available}"})
     return None
+
+
+def _jobs_dir() -> str:
+    """Return the directory where async job files are stored."""
+    override = os.environ.get("AGENT_DISPATCH_JOBS_DIR")
+    if override:
+        return override
+    return str(config_path().parent / "jobs")
+
+
+def _get_job_store() -> JobStore:
+    """Return the global JobStore instance, creating it on first call."""
+    global _job_store  # noqa: PLW0603
+    if _job_store is None:
+        from pathlib import Path
+        _job_store = JobStore(Path(_jobs_dir()))
+    return _job_store
+
+
+def _get_job_semaphore(config: DispatchConfig) -> threading.BoundedSemaphore:
+    """Threading semaphore for async jobs, recreated if max_concurrency changes."""
+    global _job_semaphore, _job_semaphore_limit  # noqa: PLW0603
+    limit = config.settings.max_concurrency
+    if _job_semaphore is None or _job_semaphore_limit != limit:
+        _job_semaphore = threading.BoundedSemaphore(limit)
+        _job_semaphore_limit = limit
+    return _job_semaphore
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +873,238 @@ async def update_agent(
         await ctx.info(f"Updated agent '{name}': {', '.join(updated)}")
 
     return json.dumps({"updated": name, "fields": updated}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Async dispatch (job_id pattern)
+# ---------------------------------------------------------------------------
+
+
+def _run_job(
+    job_id: str,
+    agent: str,
+    task: str,
+    agent_config: AgentConfig,
+    settings,
+    context: str | None,
+    caller: str | None,
+    goal: str | None,
+    sem: threading.BoundedSemaphore,
+) -> None:
+    """Worker thread body: runs the dispatch and persists the result."""
+    store = _get_job_store()
+    with sem:
+        store.mark_running(job_id)
+        try:
+            result = runner.dispatch(
+                agent,
+                task,
+                agent_config,
+                settings,
+                context,
+                caller=caller,
+                goal=goal,
+            )
+            store.finish(job_id, result)
+        except Exception as e:  # noqa: BLE001 — must not crash worker thread
+            logger.exception("Async job %s crashed: %s", job_id, e)
+            store.fail(job_id, f"Worker crashed: {e}")
+
+
+@mcp.tool()
+async def dispatch_async(
+    agent: str,
+    task: str,
+    context: str = "",
+    caller: str = "",
+    goal: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """Start a dispatch in the background and return immediately with a job_id.
+
+    Use this for long-running tasks where you don't want to block your own
+    tool slot. Poll dispatch_status(job_id) or block on dispatch_wait(job_id)
+    to retrieve the result. Job state persists to disk so it survives across
+    polling sessions.
+
+    Args:
+        agent: Name of the agent.
+        task: The task to perform.
+        context: Optional extra context.
+        caller: Who is dispatching.
+        goal: The broader objective.
+    """
+    config = _get_config()
+    if err := _validate_agent(config, agent):
+        return err
+
+    store = _get_job_store()
+    job = store.create(
+        agent,
+        task,
+        context=context or None,
+        caller=caller or None,
+        goal=goal or None,
+    )
+
+    sem = _get_job_semaphore(config)
+    agent_config = config.agents[agent]
+    thread = threading.Thread(
+        target=_run_job,
+        args=(
+            job.id,
+            agent,
+            task,
+            agent_config,
+            config.settings,
+            context or None,
+            caller or None,
+            goal or None,
+            sem,
+        ),
+        daemon=True,
+        name=f"dispatch-{job.id[:8]}",
+    )
+    thread.start()
+
+    if ctx:
+        await ctx.info(f"Started async dispatch {job.id} to {agent}")
+
+    return json.dumps(
+        {"job_id": job.id, "status": "pending", "agent": agent},
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def dispatch_status(
+    job_id: str,
+    ctx: Context | None = None,
+) -> str:
+    """Check the current state of an async job without blocking.
+
+    Returns the job record including status (pending/running/done/failed),
+    timestamps, and the DispatchResult once complete.
+
+    Args:
+        job_id: ID returned by dispatch_async.
+    """
+    store = _get_job_store()
+    job = store.get(job_id)
+    if job is None:
+        return json.dumps({"error": f"Job not found: {job_id}"})
+    return job.model_dump_json(indent=2, exclude_none=True)
+
+
+@mcp.tool()
+async def dispatch_wait(
+    job_id: str,
+    timeout_seconds: int = 60,
+    ctx: Context | None = None,
+) -> str:
+    """Block until a job completes, or until timeout_seconds elapses.
+
+    Returns the same shape as dispatch_status. If the timeout fires before
+    the job finishes, the response includes "timed_out_waiting": true and
+    the job continues running in the background — call again to keep waiting.
+
+    Args:
+        job_id: ID returned by dispatch_async.
+        timeout_seconds: Max seconds to wait (default 60, capped at 3600).
+    """
+    timeout = max(1, min(int(timeout_seconds), 3600))
+    store = _get_job_store()
+    deadline = time.monotonic() + timeout
+
+    while True:
+        job = store.get(job_id)
+        if job is None:
+            return json.dumps({"error": f"Job not found: {job_id}"})
+        if job.is_terminal():
+            return job.model_dump_json(indent=2, exclude_none=True)
+        if time.monotonic() >= deadline:
+            d = json.loads(job.model_dump_json(exclude_none=True))
+            d["timed_out_waiting"] = True
+            if ctx:
+                await ctx.info(
+                    f"dispatch_wait timed out for {job_id} after {timeout}s "
+                    f"(job still {job.status})"
+                )
+            return json.dumps(d, indent=2)
+        await asyncio.sleep(0.25)
+
+
+@mcp.tool()
+async def dispatch_jobs(
+    status: str = "",
+    limit: int = 50,
+    ctx: Context | None = None,
+) -> str:
+    """List recent async jobs as summaries (most recent first).
+
+    Each entry includes: id, agent, status, task (truncated), created_at,
+    completed_at, success (if terminal). Full record available via
+    dispatch_status(job_id).
+
+    Args:
+        status: Optional filter — "pending", "running", "done", "failed",
+            "cancelled". Empty = all.
+        limit: Max entries returned (default 50).
+    """
+    store = _get_job_store()
+    valid_statuses = {"pending", "running", "done", "failed", "cancelled"}
+    filt = status.strip().lower() or None
+    if filt and filt not in valid_statuses:
+        return json.dumps({
+            "error": f"Invalid status: {status!r}. "
+                     f"Use one of: {', '.join(sorted(valid_statuses))} or empty.",
+        })
+    jobs = store.list(status=filt)  # type: ignore[arg-type]
+    jobs = jobs[: max(1, int(limit))]
+    summaries: list[dict] = []
+    for j in jobs:
+        entry: dict = {
+            "id": j.id,
+            "agent": j.agent,
+            "status": j.status,
+            "task": j.task[:120],
+            "created_at": j.created_at,
+        }
+        if j.started_at is not None:
+            entry["started_at"] = j.started_at
+        if j.completed_at is not None:
+            entry["completed_at"] = j.completed_at
+        if j.result is not None:
+            entry["success"] = j.result.success
+            if j.result.cost_usd is not None:
+                entry["cost_usd"] = j.result.cost_usd
+        if j.error:
+            entry["error_type"] = (
+                j.result.error_type if j.result and j.result.error_type else "cli_error"
+            )
+        summaries.append(entry)
+    return json.dumps(summaries, indent=2)
+
+
+@mcp.tool()
+async def dispatch_gc(
+    max_age_days: float = 7,
+    ctx: Context | None = None,
+) -> str:
+    """Delete terminal jobs (done/failed/cancelled) older than max_age_days.
+
+    Pending and running jobs are never deleted. Returns the count purged.
+
+    Args:
+        max_age_days: Age threshold in days (default 7).
+    """
+    if max_age_days <= 0:
+        return json.dumps({"error": "max_age_days must be > 0"})
+    store = _get_job_store()
+    purged = store.gc(max_age_seconds=float(max_age_days) * 86400)
+    if ctx:
+        await ctx.info(f"Purged {purged} terminal jobs older than {max_age_days}d")
+    return json.dumps({"purged": purged, "max_age_days": max_age_days})
 
 
 # ---------------------------------------------------------------------------

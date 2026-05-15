@@ -260,6 +260,37 @@ Remove an agent from config.
 
 View cache hit rate and size, or clear all cached results.
 
+### Async dispatch — `dispatch_async`, `dispatch_status`, `dispatch_wait`, `dispatch_jobs`, `dispatch_gc`
+
+When a dispatched task is going to take a while, you don't want to block your own tool slot for minutes. Async dispatch returns a `job_id` immediately and lets you check back when you're ready.
+
+```
+// 1. fire and forget
+dispatch_async(agent="infra", task="audit every container log for OOM kills today")
+  -> {"job_id": "8f3a...e1", "status": "pending", "agent": "infra"}
+
+// 2. do other work, then check progress (non-blocking)
+dispatch_status(job_id="8f3a...e1")
+  -> {"id": "8f3a...e1", "status": "running", "started_at": 1730000123.4, ...}
+
+// 3. or block until done (with a timeout cap)
+dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
+  -> {"id": "8f3a...e1", "status": "done", "result": {"agent": "infra", "success": true, ...}}
+
+// If the timeout fires, the job keeps running:
+  -> {"id": "...", "status": "running", "timed_out_waiting": true}
+```
+
+`dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
+
+Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, atomic writes — safe to read or `ls` while jobs are in flight.
+
+| When to use async | When to use `dispatch` |
+|-------------------|------------------------|
+| Long task (minutes) — you want to keep working | Short task — you need the answer right now |
+| Several long tasks you'll collect later | Several short tasks → `dispatch_parallel` |
+| Don't care about caching (each call is a fresh job) | Cached by default — identical requests are free |
+
 ### Error Responses
 
 All tools return errors as:
@@ -278,6 +309,8 @@ All tools return errors as:
 | Long task, want to see progress | `dispatch_stream` |
 | Two agents need to collaborate | `dispatch_dialogue` |
 | Need a combined summary from multiple agents | `dispatch_parallel` with `aggregate` |
+| Long task — don't block your tool slot | `dispatch_async` + `dispatch_wait` |
+| Check progress without blocking | `dispatch_status` |
 
 ## Configuration
 

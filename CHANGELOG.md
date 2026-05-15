@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Async dispatch with a `job_id` pattern — five new MCP tools let calling
+  agents fire-and-forget long-running tasks without blocking their own tool
+  slot:
+  - `dispatch_async(agent, task, ...)` — start a dispatch in the background,
+    returns `{job_id, status: "pending", agent}` immediately.
+  - `dispatch_status(job_id)` — read the current state of a job without
+    blocking (pending / running / done / failed) including the
+    `DispatchResult` once complete.
+  - `dispatch_wait(job_id, timeout_seconds=60)` — block until terminal or
+    until the timeout fires (capped at 3600s). Returns the same shape as
+    `dispatch_status` plus `timed_out_waiting: true` on timeout — the job
+    keeps running and the caller can poll/wait again.
+  - `dispatch_jobs(status?, limit=50)` — list recent jobs as summaries,
+    optionally filtered by status (most recent first).
+  - `dispatch_gc(max_age_days=7)` — purge terminal jobs older than the
+    threshold. Pending and running jobs are never touched.
+- Job state persists to disk as one JSON file per job under
+  `~/.config/agent-dispatch/jobs/` (override via `AGENT_DISPATCH_JOBS_DIR`).
+  Atomic writes via `os.replace()` so partial files never appear, and jobs
+  survive across server restarts (existing terminal jobs remain queryable,
+  in-flight jobs are abandoned on restart — to be addressed in a future
+  iteration with PID tracking).
+
 ## [0.3.0] - 2026-05-08
 
 ### Added
