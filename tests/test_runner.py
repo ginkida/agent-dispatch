@@ -562,3 +562,153 @@ class TestDispatchStream:
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert not result.success
         assert result.error_type == "cli_error"
+
+
+class TestStructuredResponse:
+    """response_format='json' behavior — prompt footer + post-parse."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    def test_build_prompt_no_footer_by_default(self):
+        prompt = _build_prompt("do thing", caller="api", goal="audit")
+        assert "Respond with a single valid JSON" not in prompt
+
+    def test_build_prompt_appends_json_footer_simple(self):
+        prompt = _build_prompt("do thing", response_format="json")
+        assert "do thing" in prompt
+        assert "Respond with a single valid JSON" in prompt
+
+    def test_build_prompt_appends_json_footer_structured(self):
+        prompt = _build_prompt(
+            "do thing", caller="api", goal="audit", response_format="json"
+        )
+        assert "## Goal" in prompt
+        assert prompt.rstrip().endswith(
+            '{"error": "<reason>"}.'
+        )
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_parses_clean_json_object(self, mock_run, _which):
+        from agent_dispatch.runner import dispatch
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": '{"count": 3, "errors": ["a", "b"]}',
+                "is_error": False,
+            }),
+            stderr="",
+        )
+        result = dispatch(
+            "test", "find errors", self.agent, self.settings,
+            response_format="json",
+        )
+        assert result.success
+        assert result.parsed_result == {"count": 3, "errors": ["a", "b"]}
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_parses_fenced_json(self, mock_run, _which):
+        from agent_dispatch.runner import dispatch
+        fenced = "```json\n{\"ok\": true}\n```"
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": fenced, "is_error": False}),
+            stderr="",
+        )
+        result = dispatch(
+            "test", "task", self.agent, self.settings, response_format="json",
+        )
+        assert result.success
+        assert result.parsed_result == {"ok": True}
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_parses_fenced_without_lang(self, mock_run, _which):
+        from agent_dispatch.runner import dispatch
+        fenced = "```\n[1, 2, 3]\n```"
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": fenced, "is_error": False}),
+            stderr="",
+        )
+        result = dispatch(
+            "test", "task", self.agent, self.settings, response_format="json",
+        )
+        assert result.parsed_result == [1, 2, 3]
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_unparseable_keeps_success_with_none_parsed(self, mock_run, _which):
+        """Soft-mode: bad JSON doesn't fail the dispatch, just leaves parsed_result=None."""
+        from agent_dispatch.runner import dispatch
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": "Sure! Here is what I found: 3 errors.",
+                "is_error": False,
+            }),
+            stderr="",
+        )
+        result = dispatch(
+            "test", "task", self.agent, self.settings, response_format="json",
+        )
+        assert result.success is True
+        assert result.parsed_result is None
+        assert "3 errors" in result.result
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_without_response_format_does_not_parse(self, mock_run, _which):
+        from agent_dispatch.runner import dispatch
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": '{"data": "yes"}',
+                "is_error": False,
+            }),
+            stderr="",
+        )
+        # No response_format → parsed_result stays None even though result is valid JSON
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.success
+        assert result.parsed_result is None
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_plaintext_fallback_with_json_format(self, mock_run, _which):
+        """Non-claude-wrapper stdout → plain text branch still records None
+        for parsed_result when content isn't valid JSON."""
+        from agent_dispatch.runner import dispatch
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Plain agent reply, not JSON-wrapped.",
+            stderr="",
+        )
+        result = dispatch(
+            "test", "task", self.agent, self.settings, response_format="json",
+        )
+        assert result.success
+        assert result.parsed_result is None
+        assert "Plain agent reply" in result.result
+
+    def test_parse_helper_handles_scalars(self):
+        from agent_dispatch.runner import _parse_structured_response
+        assert _parse_structured_response("42") == 42
+        assert _parse_structured_response('"hello"') == "hello"
+        assert _parse_structured_response("true") is True
+        assert _parse_structured_response("null") is None
+
+    def test_parse_helper_returns_none_on_garbage(self):
+        from agent_dispatch.runner import _parse_structured_response
+        assert _parse_structured_response("") is None
+        assert _parse_structured_response("not json at all") is None
+        assert _parse_structured_response("```python\nprint(1)\n```") is None

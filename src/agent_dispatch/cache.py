@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 class DispatchCache:
     """Thread-safe TTL cache for dispatch results.
 
-    Keyed on (agent, task, context, caller, goal) — identical requests within
-    the TTL window return the cached result without spawning a new subprocess.
-    `caller` and `goal` affect the prompt sent to the agent, so they must be
-    part of the key: otherwise two requests with different framing would
-    collide and return the wrong response.
+    Keyed on (agent, task, context, caller, goal, response_format) — identical
+    requests within the TTL window return the cached result without spawning a
+    new subprocess. ``caller``/``goal``/``response_format`` all affect the
+    prompt sent to the agent, so they must be part of the key: otherwise two
+    requests with different framing would collide and return the wrong response.
     """
 
     def __init__(self, ttl: int = 300) -> None:
@@ -37,6 +37,7 @@ class DispatchCache:
         context: str | None,
         caller: str | None = None,
         goal: str | None = None,
+        response_format: str | None = None,
     ) -> str:
         canonical = json.dumps(
             {
@@ -45,6 +46,7 @@ class DispatchCache:
                 "context": context or "",
                 "caller": caller or "",
                 "goal": goal or "",
+                "response_format": response_format or "",
             },
             sort_keys=True,
         )
@@ -57,8 +59,9 @@ class DispatchCache:
         context: str | None = None,
         caller: str | None = None,
         goal: str | None = None,
+        response_format: str | None = None,
     ) -> DispatchResult | None:
-        key = self._make_key(agent, task, context, caller, goal)
+        key = self._make_key(agent, task, context, caller, goal, response_format)
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -80,10 +83,11 @@ class DispatchCache:
         context: str | None = None,
         caller: str | None = None,
         goal: str | None = None,
+        response_format: str | None = None,
     ) -> None:
         if not result.success:
             return  # don't cache failures
-        key = self._make_key(agent, task, context, caller, goal)
+        key = self._make_key(agent, task, context, caller, goal, response_format)
         with self._lock:
             self._store[key] = (time.monotonic(), result)
 

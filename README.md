@@ -97,6 +97,7 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `context` | string | no | Extra context: error messages, code snippets, stack traces |
 | `caller` | string | no | Your project/role — helps the agent understand who's asking |
 | `goal` | string | no | Broader objective — helps the agent make better trade-offs |
+| `response_format` | string | no | `"json"` to request a single JSON value; the parsed result lands in `parsed_result`. Empty = free-form text. |
 
 ```json
 // Response (success)
@@ -121,6 +122,18 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 ```
 
 **`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `cli_error` (other failures). Permission errors include an actionable hint.
+
+**Structured JSON output:** pass `response_format="json"` to ask the agent for a single JSON value. The runner appends an instruction footer ("respond with a single valid JSON value, no fences, no prose") and on success parses the response — the parsed value lands in `parsed_result`. The raw text is always in `result`. Parse failures leave `parsed_result=None` but don't fail the dispatch (soft mode).
+
+```json
+// Response with response_format="json"
+{
+  "agent": "infra",
+  "success": true,
+  "result": "{\"errors\": 3, \"first_at\": \"14:02\"}",
+  "parsed_result": {"errors": 3, "first_at": "14:02"}
+}
+```
 
 **Always pass `caller` and `goal`** — the dispatched agent sees a structured prompt:
 

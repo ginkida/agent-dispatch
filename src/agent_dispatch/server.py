@@ -319,6 +319,7 @@ async def dispatch(
     context: str = "",
     caller: str = "",
     goal: str = "",
+    response_format: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Delegate a task to an agent in another project directory.
@@ -334,16 +335,23 @@ async def dispatch(
             understand the request.
         goal: The broader objective this task serves — the agent can make
             better trade-offs when it knows *why*.
+        response_format: ``"json"`` to ask the agent for a single JSON value.
+            On success the parsed value is returned in ``parsed_result``.
+            Leave empty for free-form text (default).
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
 
-    # Check cache. caller/goal are part of the key because they change the
-    # prompt sent to Claude and therefore the response.
+    rf = response_format or None
+
+    # Check cache. caller/goal/response_format are part of the key because
+    # they change the prompt sent to Claude and therefore the response.
     cache = _get_cache(config)
     if cache:
-        cached = cache.get(agent, task, context or None, caller or None, goal or None)
+        cached = cache.get(
+            agent, task, context or None, caller or None, goal or None, rf,
+        )
         if cached:
             if ctx:
                 await ctx.info(f"Cache hit for {agent} — returning cached result")
@@ -365,11 +373,14 @@ async def dispatch(
             context or None,
             caller=caller or None,
             goal=goal or None,
+            response_format=rf,
         )
 
     # Populate cache
     if cache:
-        cache.put(agent, task, result, context or None, caller or None, goal or None)
+        cache.put(
+            agent, task, result, context or None, caller or None, goal or None, rf,
+        )
 
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -382,6 +393,7 @@ async def dispatch_session(
     context: str = "",
     caller: str = "",
     goal: str = "",
+    response_format: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Multi-turn dispatch: continue a conversation with an agent.
@@ -420,6 +432,7 @@ async def dispatch_session(
             session_id or None,
             caller=caller or None,
             goal=goal or None,
+            response_format=response_format or None,
         )
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -479,10 +492,13 @@ async def dispatch_parallel(
         item_context = item.get("context") or None
         item_caller = item.get("caller") or None
         item_goal = item.get("goal") or None
+        item_rf = item.get("response_format") or None
 
-        # Check cache (caller/goal are part of the key — see dispatch())
+        # Check cache (caller/goal/response_format are part of the key — see dispatch())
         if cache:
-            cached = cache.get(name, task, item_context, item_caller, item_goal)
+            cached = cache.get(
+                name, task, item_context, item_caller, item_goal, item_rf,
+            )
             if cached:
                 d = json.loads(cached.model_dump_json(exclude_none=True))
                 d["cached"] = True
@@ -499,10 +515,13 @@ async def dispatch_parallel(
                 item_context,
                 caller=item_caller,
                 goal=item_goal,
+                response_format=item_rf,
             )
 
         if cache:
-            cache.put(name, task, result, item_context, item_caller, item_goal)
+            cache.put(
+                name, task, result, item_context, item_caller, item_goal, item_rf,
+            )
 
         return json.loads(result.model_dump_json(exclude_none=True))
 
@@ -565,6 +584,7 @@ async def dispatch_stream(
     context: str = "",
     caller: str = "",
     goal: str = "",
+    response_format: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Dispatch with streaming progress — see live updates as the agent works.
@@ -579,6 +599,7 @@ async def dispatch_stream(
         context: Optional extra context.
         caller: Who is dispatching.
         goal: The broader objective.
+        response_format: ``"json"`` to request structured output. Empty = text.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
@@ -606,6 +627,7 @@ async def dispatch_stream(
                 on_progress,
                 caller=caller or None,
                 goal=goal or None,
+                response_format=response_format or None,
             ),
         )
 
@@ -1023,6 +1045,7 @@ def _run_job(
     context: str | None,
     caller: str | None,
     goal: str | None,
+    response_format: str | None,
     sem: threading.BoundedSemaphore,
 ) -> None:
     """Worker thread body: runs the dispatch and persists the result."""
@@ -1038,6 +1061,7 @@ def _run_job(
                 context,
                 caller=caller,
                 goal=goal,
+                response_format=response_format,
             )
             store.finish(job_id, result)
         except Exception as e:  # noqa: BLE001 — must not crash worker thread
@@ -1052,6 +1076,7 @@ async def dispatch_async(
     context: str = "",
     caller: str = "",
     goal: str = "",
+    response_format: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Start a dispatch in the background and return immediately with a job_id.
@@ -1067,6 +1092,8 @@ async def dispatch_async(
         context: Optional extra context.
         caller: Who is dispatching.
         goal: The broader objective.
+        response_format: ``"json"`` to request a single JSON value
+            (parsed into ``parsed_result`` on completion). Empty = free-form.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
@@ -1094,6 +1121,7 @@ async def dispatch_async(
             context or None,
             caller or None,
             goal or None,
+            response_format or None,
             sem,
         ),
         daemon=True,

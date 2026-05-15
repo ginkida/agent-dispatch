@@ -16,6 +16,41 @@ logger = logging.getLogger(__name__)
 
 _DEPTH_ENV_VAR = "AGENT_DISPATCH_DEPTH"
 
+_JSON_RESPONSE_FOOTER = (
+    "\n\n## Response format\n"
+    "Respond with a single valid JSON value (object, array, or scalar) and "
+    "nothing else. Do not wrap the JSON in markdown code fences. Do not add "
+    "any explanatory text before or after. If you cannot satisfy this, "
+    'respond with {"error": "<reason>"}.'
+)
+
+
+def _parse_structured_response(text: str) -> object | None:
+    """Attempt to parse *text* as JSON, tolerating common wrappers.
+
+    Strips a leading/trailing ```json or ``` code fence if present, then
+    tries json.loads. Returns the parsed value (dict/list/scalar) or None
+    on parse failure. Used when response_format="json" was requested.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    # Strip markdown code fences if present
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if lines:
+            # Drop leading fence line (```json / ```)
+            lines = lines[1:]
+            # Drop trailing fence if present
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            candidate = "\n".join(lines).strip()
+    try:
+        return json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 _PERMISSION_PATTERNS = [
     "permission denied",
     "not allowed",
@@ -129,6 +164,7 @@ def _build_prompt(
     context: str | None = None,
     caller: str | None = None,
     goal: str | None = None,
+    response_format: str | None = None,
 ) -> str:
     """Build a structured prompt for the dispatched agent.
 
@@ -136,11 +172,18 @@ def _build_prompt(
     multi-section format so the dispatched agent understands who asked,
     why, and what broader objective it serves.  Without metadata the
     output is identical to the original simple format (backward compat).
+
+    When *response_format* is ``"json"`` a footer is appended instructing
+    the agent to return a single JSON value with no extra prose.
     """
     if not caller and not goal:
         if context:
-            return f"Context:\n{context}\n\nTask:\n{task}"
-        return task
+            base = f"Context:\n{context}\n\nTask:\n{task}"
+        else:
+            base = task
+        if response_format == "json":
+            base = base + _JSON_RESPONSE_FOOTER
+        return base
 
     parts: list[str] = []
     if goal:
@@ -150,7 +193,10 @@ def _build_prompt(
     if context:
         parts.append(f"## Context\n{context}")
     parts.append(f"## Task\n{task}")
-    return "\n\n".join(parts)
+    body = "\n\n".join(parts)
+    if response_format == "json":
+        body = body + _JSON_RESPONSE_FOOTER
+    return body
 
 
 def dispatch(
@@ -163,8 +209,13 @@ def dispatch(
     *,
     caller: str | None = None,
     goal: str | None = None,
+    response_format: str | None = None,
 ) -> DispatchResult:
-    """Run a task via claude -p in the agent's directory."""
+    """Run a task via claude -p in the agent's directory.
+
+    Pass ``response_format="json"`` to ask the agent for a single JSON value;
+    on success the parsed value lands in ``DispatchResult.parsed_result``.
+    """
     try:
         _check_recursion(settings.max_dispatch_depth)
     except RecursionError as e:
@@ -190,7 +241,7 @@ def dispatch(
             error_type="not_found",
         )
 
-    full_task = _build_prompt(task, context, caller, goal)
+    full_task = _build_prompt(task, context, caller, goal, response_format)
 
     cmd = _build_command(claude_path, full_task, agent, settings, session_id)
     timeout = agent.timeout or settings.default_timeout
@@ -242,7 +293,13 @@ def dispatch(
         success = proc.returncode == 0
         text = proc.stdout.strip()
         if success:
-            return DispatchResult(agent=agent_name, success=True, result=text)
+            parsed = (
+                _parse_structured_response(text)
+                if response_format == "json" else None
+            )
+            return DispatchResult(
+                agent=agent_name, success=True, result=text, parsed_result=parsed,
+            )
         error_text = text or f"claude exited with code {proc.returncode} (non-JSON output)"
         error_type = _classify_error(error_text)
         if error_type == "permission":
@@ -277,14 +334,19 @@ def dispatch(
             error_type=error_type,
         )
 
+    result_text = data.get("result", "")
+    parsed: object | None = None
+    if response_format == "json":
+        parsed = _parse_structured_response(result_text)
     return DispatchResult(
         agent=agent_name,
         success=True,
-        result=data.get("result", ""),
+        result=result_text,
         session_id=data.get("session_id"),
         cost_usd=data.get("total_cost_usd"),
         duration_ms=data.get("duration_ms"),
         num_turns=data.get("num_turns"),
+        parsed_result=parsed,
     )
 
 
@@ -298,6 +360,7 @@ def dispatch_stream(
     *,
     caller: str | None = None,
     goal: str | None = None,
+    response_format: str | None = None,
 ) -> DispatchResult:
     """Run a task via claude -p with streaming output and progress callbacks.
 
@@ -330,7 +393,7 @@ def dispatch_stream(
             error_type="not_found",
         )
 
-    full_task = _build_prompt(task, context, caller, goal)
+    full_task = _build_prompt(task, context, caller, goal, response_format)
 
     cmd = _build_command(claude_path, full_task, agent, settings)
     # Switch from json to stream-json
@@ -441,14 +504,20 @@ def dispatch_stream(
                 error=error_text,
                 error_type=error_type,
             )
+        result_text = result_data.get("result", "")
+        parsed = (
+            _parse_structured_response(result_text)
+            if response_format == "json" else None
+        )
         return DispatchResult(
             agent=agent_name,
             success=True,
-            result=result_data.get("result", ""),
+            result=result_text,
             session_id=result_data.get("session_id"),
             cost_usd=result_data.get("total_cost_usd"),
             duration_ms=result_data.get("duration_ms"),
             num_turns=result_data.get("num_turns"),
+            parsed_result=parsed,
         )
 
     # Fallback: no result line received

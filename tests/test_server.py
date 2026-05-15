@@ -1409,3 +1409,121 @@ class TestInspectAgent:
             raw = await server.inspect_agent("bad")
         info = json.loads(raw)
         assert info["healthy"] == "UNREADABLE"
+
+
+# ---------------------------------------------------------------------------
+# Structured response (response_format="json")
+# ---------------------------------------------------------------------------
+
+
+class TestStructuredResponseMCP:
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_parsed_result(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            # The runner is mocked, so it doesn't actually parse. Simulate
+            # what would happen if claude returned JSON and parsing succeeded.
+            assert kw.get("response_format") == "json"
+            return DispatchResult(
+                agent=name, success=True, result='{"k": "v"}',
+                parsed_result={"k": "v"},
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch(
+                "infra", "task", response_format="json",
+            )
+        data = json.loads(raw)
+        assert data["success"]
+        assert data["parsed_result"] == {"k": "v"}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_passes_response_format_to_runner(self, tmp_path: Path):
+        """response_format propagation through the server layer."""
+        config = _make_config(tmp_path)
+        seen: dict = {}
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            seen["response_format"] = kw.get("response_format")
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "task", response_format="json")
+            assert seen["response_format"] == "json"
+            await server.dispatch("db", "task")  # default = ""
+            assert seen["response_format"] is None
+
+    @pytest.mark.asyncio
+    async def test_cache_differentiates_response_format(self, tmp_path: Path):
+        """Two requests differing only by response_format must NOT collide."""
+        config = _make_config(tmp_path)
+        call_count = 0
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            nonlocal call_count
+            call_count += 1
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "check", response_format="")
+            await server.dispatch("infra", "check", response_format="json")
+            assert call_count == 2  # both went through to runner
+            # Re-issue the json one — hits cache
+            raw = await server.dispatch("infra", "check", response_format="json")
+            assert call_count == 2
+            assert json.loads(raw).get("cached") is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_propagates_response_format(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        seen: list = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            seen.append(kw.get("response_format"))
+            return DispatchResult(
+                agent=name, success=True, result='{"a": 1}',
+                parsed_result={"a": 1},
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch_async(
+                "infra", "task", response_format="json"
+            )
+            job_id = json.loads(raw)["job_id"]
+            job = await _wait_terminal(job_id)
+        assert seen == ["json"]
+        assert job.result is not None
+        assert job.result.parsed_result == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_per_item_response_format(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        seen: list = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            seen.append((name, kw.get("response_format")))
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch_parallel(json.dumps([
+                {"agent": "infra", "task": "t1"},
+                {"agent": "db", "task": "t2", "response_format": "json"},
+            ]))
+        assert ("infra", None) in seen
+        assert ("db", "json") in seen

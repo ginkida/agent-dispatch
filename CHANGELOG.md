@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Structured JSON response support — `dispatch`, `dispatch_session`,
+  `dispatch_async`, `dispatch_stream`, and per-item in `dispatch_parallel`
+  now accept `response_format="json"`. When set, the runner appends a clear
+  "respond with a single JSON value, no prose, no fences" footer to the
+  prompt and attempts to parse the agent's response (tolerating ```json
+  fences). The parsed value lands in a new `DispatchResult.parsed_result`
+  field — `None` when not requested or unparseable (soft mode: parse
+  failure does NOT mark the dispatch as failed). Cache key now includes
+  `response_format` so JSON and text requests for the same task don't
+  collide.
 - `list_agents` MCP tool now surfaces `mcp_servers`, `stacks`, and `dbs`
   per agent (when present) — the same structured data `auto_describe`
   already collects from `.mcp.json`, `Dockerfile`, `pyproject.toml`,
