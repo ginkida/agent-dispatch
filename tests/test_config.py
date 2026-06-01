@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import stat
+import sys
 from pathlib import Path
+
+import pytest
 
 from agent_dispatch.config import auto_describe, load_config, save_config
 from agent_dispatch.models import AgentConfig, DispatchConfig, Settings
@@ -12,6 +16,14 @@ from agent_dispatch.models import AgentConfig, DispatchConfig, Settings
 def test_load_missing_file(tmp_path: Path):
     config = load_config(tmp_path / "nonexistent.yaml")
     assert config.agents == {}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_save_config_is_owner_only(tmp_path: Path):
+    f = tmp_path / "cfg" / "agents.yaml"
+    save_config(DispatchConfig(agents={"a": AgentConfig(directory="/tmp")}), f)
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert stat.S_IMODE(f.parent.stat().st_mode) == 0o700
 
 
 def test_load_empty_file(tmp_path: Path):

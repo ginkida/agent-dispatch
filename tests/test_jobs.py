@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import stat
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_dispatch.jobs import Job, JobStore
+from agent_dispatch.jobs import Job, JobStore, is_valid_job_id
 from agent_dispatch.models import DispatchResult
 
 
@@ -177,6 +179,137 @@ class TestJobModel:
             assert Job(id="x", agent="a", task="t", status=s).is_terminal()
         for s in ("pending", "running"):
             assert not Job(id="x", agent="a", task="t", status=s).is_terminal()
+
+
+class TestJobIdValidation:
+    def test_valid_uuid_hex_accepted(self):
+        assert is_valid_job_id("a" * 32)
+        assert is_valid_job_id("0123456789abcdef0123456789abcdef")
+
+    def test_real_create_id_is_valid(self, store: JobStore):
+        job = store.create("infra", "t")
+        assert is_valid_job_id(job.id)
+        assert len(job.id) == 32
+
+    def test_invalid_ids_rejected(self):
+        for bad in (
+            "",
+            "short",
+            "../secret",
+            "../../etc/passwd",
+            "ABCDEF0123456789abcdef0123456789",  # uppercase
+            "g" * 32,  # non-hex
+            "a" * 31,  # too short
+            "a" * 33,  # too long
+            "0123456789abcdef0123456789abcde/",
+        ):
+            assert not is_valid_job_id(bad), bad
+
+    def test_get_rejects_traversal_outside_dir(self, store: JobStore, tmp_path: Path):
+        """A crafted ref must not read a Job-shaped file outside the jobs dir."""
+        # Plant a valid Job JSON one level above the jobs directory.
+        secret = store.directory.parent / "secret_target.json"
+        planted = Job(id="a" * 32, agent="leak", task="SENSITIVE")
+        secret.write_text(planted.model_dump_json(), encoding="utf-8")
+
+        # The traversal ref that, naively joined, would resolve to `secret`.
+        assert store.get("../secret_target") is None
+        assert store.get("../../etc/passwd") is None
+
+    def test_path_raises_on_invalid_id(self, store: JobStore):
+        with pytest.raises(ValueError, match="Invalid job_id"):
+            store._path("../escape")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+class TestJobFilePermissions:
+    def test_job_file_is_owner_only(self, store: JobStore):
+        job = store.create("infra", "task with maybe SECRET")
+        path = store.directory / f"{job.id}.json"
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600, oct(mode)
+
+    def test_jobs_dir_is_owner_only(self, store: JobStore):
+        mode = stat.S_IMODE(store.directory.stat().st_mode)
+        assert mode == 0o700, oct(mode)
+        assert not (store.directory.stat().st_mode & stat.S_IROTH)
+
+
+class TestJobCancel:
+    def test_cancel_pending_marks_cancelled(self, store: JobStore):
+        job = store.create("infra", "task")
+        result, outcome = store.cancel(job.id)
+        assert outcome == "cancelled"
+        assert result is not None
+        assert result.status == "cancelled"
+        assert result.completed_at is not None
+        # Persisted
+        assert store.get(job.id).status == "cancelled"
+
+    def test_cancel_running_is_refused(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        result, outcome = store.cancel(job.id)
+        assert outcome == "running"
+        assert result is not None
+        assert result.status == "running"  # untouched
+
+    def test_cancel_terminal_is_noop(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        result, outcome = store.cancel(job.id)
+        assert outcome == "already_terminal"
+        assert result.status == "done"
+
+    def test_cancel_missing_returns_not_found(self, store: JobStore):
+        result, outcome = store.cancel("f" * 32)
+        assert result is None
+        assert outcome == "not_found"
+
+    def test_mark_running_refuses_cancelled_job(self, store: JobStore):
+        """The cancel/run race is closed: a cancelled job never starts."""
+        job = store.create("infra", "task")
+        store.cancel(job.id)
+        assert store.mark_running(job.id) is None
+        assert store.get(job.id).status == "cancelled"
+
+
+class TestRecoverStale:
+    def test_recovers_old_running_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        # Backdate started_at well past the threshold.
+        updated = store.get(job.id)
+        updated.started_at = time.time() - 7200
+        store._write(updated)
+
+        recovered = store.recover_stale(stale_threshold_seconds=3600)
+        assert recovered == 1
+        after = store.get(job.id)
+        assert after.status == "failed"
+        assert "Abandoned" in (after.error or "")
+
+    def test_leaves_recent_running_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        recovered = store.recover_stale(stale_threshold_seconds=3600)
+        assert recovered == 0
+        assert store.get(job.id).status == "running"
+
+    def test_ignores_terminal_jobs(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        assert store.recover_stale(stale_threshold_seconds=0) == 0
+
+    def test_planted_malformed_id_file_not_counted(self, store: JobStore):
+        """A hand-planted running file with a bad id must not crash or be counted."""
+        planted = Job(id="../evil", agent="x", task="t", status="running",
+                      started_at=time.time() - 7200)
+        (store.directory / "planted.json").write_text(
+            planted.model_dump_json(), encoding="utf-8"
+        )
+        # Does not raise; the malformed id can't be transitioned, so it's not counted.
+        assert store.recover_stale(stale_threshold_seconds=3600) == 0
 
 
 class TestCreateCompleted:

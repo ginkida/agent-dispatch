@@ -309,7 +309,7 @@ fetch_result(ref="8f3a...e1", max_chars=2000)  -> truncated, plus {"truncated": 
 
 Refs reuse the same storage as `dispatch_async` jobs (under `~/.config/agent-dispatch/jobs/`), so any `job_id` returned by `dispatch_async` is also a valid `ref` for `fetch_result`. `parsed_result` (when `response_format="json"` is set) is small and is always inlined directly in the ref response — no second fetch needed.
 
-### Async dispatch — `dispatch_async`, `dispatch_status`, `dispatch_wait`, `dispatch_jobs`, `dispatch_gc`
+### Async dispatch — `dispatch_async`, `dispatch_status`, `dispatch_wait`, `dispatch_cancel`, `dispatch_jobs`, `dispatch_gc`
 
 When a dispatched task is going to take a while, you don't want to block your own tool slot for minutes. Async dispatch returns a `job_id` immediately and lets you check back when you're ready.
 
@@ -330,9 +330,11 @@ dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
   -> {"id": "...", "status": "running", "timed_out_waiting": true}
 ```
 
+`dispatch_cancel(job_id)` cancels a job that is still **pending** (before its subprocess starts) — a running job is left to finish, since its `claude` subprocess can't be safely interrupted. The response carries an `outcome` of `cancelled`, `running`, `already_terminal`, or `not_found`.
+
 `dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
 
-Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, atomic writes — safe to read or `ls` while jobs are in flight.
+Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server marks jobs abandoned in `running` by a prior crashed instance as `failed`.
 
 | When to use async | When to use `dispatch` |
 |-------------------|------------------------|
@@ -388,10 +390,11 @@ settings:
   #   - Read
   #   - Edit
   max_dispatch_depth: 3     # recursion protection
-  max_concurrency: 5        # max parallel claude -p processes
+  max_concurrency: 5        # max parallel claude -p processes (per dispatch path)
   cache:
     enabled: true
     ttl: 300                # seconds
+    max_size: 1000          # max cached entries; oldest evicted first (FIFO)
 ```
 
 Config is reloaded on every tool call — add agents without restarting.
@@ -429,11 +432,16 @@ agent-dispatch MCP server
 
 ## Safety
 
-- **Recursion protection** — `AGENT_DISPATCH_DEPTH` env var tracks nesting. Default limit: 3.
+- **Recursion protection** — `AGENT_DISPATCH_DEPTH` env var tracks nesting. Default limit: 3. Best-effort across the subprocess boundary (see [SECURITY.md](SECURITY.md)).
+- **Argument-injection guard** — structured CLI fields (`session_id`, `model`, `permission_mode`, tool names) that start with `-` are rejected so they can't smuggle extra `claude` flags.
+- **Path-traversal guard** — caller-supplied `job_id`/`ref` values are validated as 32-char hex before any filesystem access.
+- **Owner-only state** — job files (`0o600`) and `agents.yaml` (`0o600`) are written for the owner only; their directories are `0o700`.
 - **Cost control** — `max_budget_usd` per agent or globally.
-- **Concurrency** — `max_concurrency` (default: 5) limits parallel `claude -p` processes.
+- **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). Orphaned processes are cleaned up.
-- **Caching** — identical `(agent, task, context)` requests return cached results. Only successes are cached. Sessions and dialogues are never cached.
+- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only successes are cached. Sessions and dialogues are never cached.
+
+See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
 
 ## CLI
 

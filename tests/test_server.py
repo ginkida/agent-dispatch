@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from unittest.mock import AsyncMock
-
-from agent_dispatch.models import AgentConfig, CacheSettings, DispatchConfig, DispatchResult, Settings
 from agent_dispatch import server
+from agent_dispatch.models import (
+    AgentConfig,
+    CacheSettings,
+    DispatchConfig,
+    DispatchResult,
+    Settings,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +58,9 @@ def _make_config(tmp_path: Path, cache_enabled: bool = True) -> DispatchConfig:
     )
 
 
-def _ok_dispatch_result(agent: str, text: str = "ok", session_id: str | None = None) -> DispatchResult:
+def _ok_dispatch_result(
+    agent: str, text: str = "ok", session_id: str | None = None,
+) -> DispatchResult:
     return DispatchResult(
         agent=agent, success=True, result=text, cost_usd=0.01, duration_ms=1000, num_turns=1,
         session_id=session_id,
@@ -138,7 +144,9 @@ class TestDispatchParallel:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             if name == "db":
-                return DispatchResult(agent=name, success=False, result="", error="connection refused")
+                return DispatchResult(
+                    agent=name, success=False, result="", error="connection refused",
+                )
             return _ok_dispatch_result(name)
 
         with (
@@ -745,6 +753,7 @@ class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_add_agent(self, tmp_path: Path):
         import os
+
         from agent_dispatch.config import load_config
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
@@ -782,6 +791,7 @@ class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_add_agent_with_permissions(self, tmp_path: Path):
         import os
+
         from agent_dispatch.config import load_config
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
@@ -866,6 +876,7 @@ class TestUpdateAgent:
     @pytest.mark.asyncio
     async def test_update_permissions(self, tmp_path: Path):
         import os
+
         from agent_dispatch.config import load_config
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
@@ -895,6 +906,7 @@ class TestUpdateAgent:
     @pytest.mark.asyncio
     async def test_update_clear_fields(self, tmp_path: Path):
         import os
+
         from agent_dispatch.config import load_config
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
@@ -938,6 +950,7 @@ class TestUpdateAgent:
     @pytest.mark.asyncio
     async def test_update_description_and_timeout(self, tmp_path: Path):
         import os
+
         from agent_dispatch.config import load_config
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
@@ -1154,8 +1167,15 @@ class TestDispatchStatusWait:
 
     @pytest.mark.asyncio
     async def test_dispatch_status_unknown(self, tmp_path: Path):
+        # Valid-format id that simply doesn't exist -> the "not found" branch.
+        raw = await server.dispatch_status("a" * 32)
+        assert "not found" in json.loads(raw)["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_status_malformed_id_rejected(self, tmp_path: Path):
+        # Malformed id -> the "invalid format" guard (path-traversal defense).
         raw = await server.dispatch_status("does-not-exist")
-        assert "error" in json.loads(raw)
+        assert "Invalid ref" in json.loads(raw)["error"]
 
     @pytest.mark.asyncio
     async def test_dispatch_wait_returns_when_done(self, tmp_path: Path):
@@ -1672,3 +1692,102 @@ class TestReturnRef:
         assert "ref" in results[1]
         assert results[1]["summary"] == "big"
         assert results[1]["size"] == len("big-db")
+
+
+class TestHardening:
+    """Bounds-checking, ref validation, and the dispatch_cancel tool."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_pending_job(self, tmp_path: Path):
+        store = server._get_job_store()
+        job = store.create("infra", "task")  # pending, no worker started
+        raw = await server.dispatch_cancel(job.id)
+        data = json.loads(raw)
+        assert data["outcome"] == "cancelled"
+        assert data["status"] == "cancelled"
+        assert store.get(job.id).status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_job_refused(self, tmp_path: Path):
+        store = server._get_job_store()
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        raw = await server.dispatch_cancel(job.id)
+        data = json.loads(raw)
+        assert data["outcome"] == "running"
+        assert "message" in data
+
+    @pytest.mark.asyncio
+    async def test_cancel_invalid_ref(self, tmp_path: Path):
+        raw = await server.dispatch_cancel("../../etc/passwd")
+        assert "Invalid ref" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_unknown_job(self, tmp_path: Path):
+        raw = await server.dispatch_cancel("f" * 32)
+        assert "not found" in json.loads(raw)["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_rejects_traversal_ref(self, tmp_path: Path):
+        raw = await server.fetch_result("../secret")
+        assert "Invalid ref" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_status_rejects_traversal_ref(self, tmp_path: Path):
+        raw = await server.dispatch_status("../../config")
+        assert "Invalid ref" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_wait_rejects_traversal_ref(self, tmp_path: Path):
+        raw = await server.dispatch_wait("..%2f..%2fetc", timeout_seconds=1)
+        assert "Invalid ref" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_limit_clamped_negative(self, tmp_path: Path):
+        store = server._get_job_store()
+        for _ in range(3):
+            store.create("infra", "t")
+        raw = await server.dispatch_jobs(limit=-10)
+        summaries = json.loads(raw)
+        assert len(summaries) == 1  # max(1, min(-10, 1000)) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_gc_rejects_zero(self, tmp_path: Path):
+        raw = await server.dispatch_gc(max_age_days=0)
+        assert "error" in json.loads(raw)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_gc_rejects_nonfinite(self, tmp_path: Path):
+        raw = await server.dispatch_gc(max_age_days=1e308)
+        assert "non-finite" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_parallel_caps_item_count(self, tmp_path: Path):
+        config = _make_config(tmp_path)  # max_concurrency default 5 -> cap 100
+        items = json.dumps([{"agent": "infra", "task": f"t{i}"} for i in range(101)])
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.dispatch_parallel(items)
+        assert "Too many dispatches" in json.loads(raw)["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_return_ref_clamps_negative_summary(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, "hello world")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            raw = await server.dispatch("infra", "t", return_ref=True, summary_chars=-99)
+        data = json.loads(raw)
+        assert "ref" in data
+        assert data["summary"] == ""  # negative clamped to 0
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_reports_max_size(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.cache_stats()
+        assert json.loads(raw)["max_size"] == 1000

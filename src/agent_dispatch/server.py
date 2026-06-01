@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import queue
 import sys
 import threading
 import time
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -24,8 +26,15 @@ from .config import (
     load_config,
     save_config,
 )
-from .jobs import JobStore
-from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
+from .jobs import JobStore, is_valid_job_id
+from .models import (
+    AgentConfig,
+    DispatchConfig,
+    DispatchResult,
+    Settings,
+    check_permission_mode,
+    validate_agent_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +59,7 @@ mcp = FastMCP(
         "- dispatch_async(agent, task) — fire-and-forget, returns job_id\n"
         "- dispatch_status(job_id) — check progress without blocking\n"
         "- dispatch_wait(job_id, timeout?) — block until done (or timeout)\n"
+        "- dispatch_cancel(job_id) — cancel a pending job before it runs\n"
         "- dispatch_jobs(status?) — list recent async jobs\n\n"
         "SAVING CONTEXT for big results:\n"
         "- dispatch(..., return_ref=True) — returns just ref+summary, not full text\n"
@@ -72,6 +82,9 @@ _job_semaphore_limit: int = 0
 _RESOLVED_MARKER = "[RESOLVED]"
 _JOB_GC_MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 _DEFAULT_SUMMARY_CHARS = 500
+_MAX_SUMMARY_CHARS = 100_000  # upper bound for return_ref summaries
+_MAX_JOBS_LIMIT = 1000  # upper bound for dispatch_jobs pagination
+_STALE_RUNNING_SECONDS = 3600  # recover jobs stuck 'running' longer than this
 
 
 def _get_config() -> DispatchConfig:
@@ -82,10 +95,15 @@ def _get_config() -> DispatchConfig:
 def _get_cache(config: DispatchConfig) -> DispatchCache | None:
     """Return the global cache instance, creating it on first call."""
     global _cache  # noqa: PLW0603
-    if not config.settings.cache.enabled:
+    cache_cfg = config.settings.cache
+    if not cache_cfg.enabled:
         return None
-    if _cache is None or _cache._ttl != config.settings.cache.ttl:
-        _cache = DispatchCache(ttl=config.settings.cache.ttl)
+    if (
+        _cache is None
+        or _cache._ttl != cache_cfg.ttl
+        or _cache._max_size != cache_cfg.max_size
+    ):
+        _cache = DispatchCache(ttl=cache_cfg.ttl, max_size=cache_cfg.max_size)
     return _cache
 
 
@@ -99,13 +117,15 @@ def _get_semaphore(config: DispatchConfig) -> asyncio.Semaphore:
     return _semaphore
 
 
-def _ref_payload(job_id: str, result, summary_chars: int = _DEFAULT_SUMMARY_CHARS) -> dict:
+def _ref_payload(
+    job_id: str, result: DispatchResult, summary_chars: int = _DEFAULT_SUMMARY_CHARS,
+) -> dict:
     """Build the compact reference response for return_ref=True dispatches.
 
     Caller gets just enough to know what happened; fetch_result(ref) reads
     the full text on demand. Keeps the calling agent's context small.
     """
-    chars = max(0, int(summary_chars))
+    chars = max(0, min(int(summary_chars), _MAX_SUMMARY_CHARS))
     text = result.result or ""
     size = len(text)
     summary = text[:chars] if chars else ""
@@ -141,6 +161,20 @@ def _validate_agent(config: DispatchConfig, name: str) -> str | None:
     if name not in config.agents:
         available = ", ".join(config.agents.keys()) or "(none configured)"
         return json.dumps({"error": f"Unknown agent: {name!r}. Available: {available}"})
+    return None
+
+
+def _validate_ref(ref: str) -> str | None:
+    """Return an error JSON string if *ref* is not a valid job id, else None.
+
+    Job ids/refs are uuid4 hex (32 hex chars). Rejecting anything else at the
+    tool boundary blocks path-traversal attempts (``../../secret``) before they
+    reach the JobStore.
+    """
+    if not is_valid_job_id(ref):
+        return json.dumps(
+            {"error": f"Invalid ref/job_id format: {ref!r} (expected a 32-char hex id)"}
+        )
     return None
 
 
@@ -527,12 +561,24 @@ async def dispatch_parallel(
         return json.dumps({"error": "dispatches must be a non-empty JSON array"})
 
     config = _get_config()
+
+    # Cap fan-out: each item spawns a claude subprocess. Without a bound a
+    # caller could submit thousands of items and pile up coroutines/processes.
+    max_items = max(100, config.settings.max_concurrency * 20)
+    if len(items) > max_items:
+        return json.dumps({
+            "error": f"Too many dispatches: {len(items)} > {max_items}. "
+                     "Split into multiple calls or raise settings.max_concurrency.",
+        })
+
     cache = _get_cache(config)
 
     # Validate structure and agents up front (including aggregator)
     for i, item in enumerate(items):
         if not isinstance(item, dict):
-            return json.dumps({"error": f"dispatches[{i}] must be an object, got {type(item).__name__}"})
+            return json.dumps(
+                {"error": f"dispatches[{i}] must be an object, got {type(item).__name__}"}
+            )
         if "agent" not in item or "task" not in item:
             return json.dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
         if err := _validate_agent(config, item["agent"]):
@@ -545,7 +591,7 @@ async def dispatch_parallel(
         names = ", ".join(item["agent"] for item in items)
         await ctx.info(f"Dispatching in parallel to: {names}")
 
-    async def _run_one(item: dict) -> dict:
+    async def _run_one(item: dict[str, Any]) -> dict[str, Any]:
         name = item["agent"]
         task = item["task"]
         item_context = item.get("context") or None
@@ -553,7 +599,9 @@ async def dispatch_parallel(
         item_goal = item.get("goal") or None
         item_rf = item.get("response_format") or None
         item_return_ref = bool(item.get("return_ref"))
-        item_summary_chars = int(item.get("summary_chars", _DEFAULT_SUMMARY_CHARS))
+        item_summary_chars = max(
+            0, min(int(item.get("summary_chars", _DEFAULT_SUMMARY_CHARS)), _MAX_SUMMARY_CHARS)
+        )
 
         # Check cache (caller/goal/response_format are part of the key — see dispatch())
         if cache:
@@ -610,7 +658,7 @@ async def dispatch_parallel(
     results = await asyncio.gather(*[_run_one(item) for item in items], return_exceptions=True)
 
     output = []
-    for item, res in zip(items, results):
+    for item, res in zip(items, results, strict=True):
         if isinstance(res, Exception):
             output.append({
                 "agent": item["agent"],
@@ -628,15 +676,19 @@ async def dispatch_parallel(
 
     # Build a summary for the aggregator agent
     parts = []
-    for item, res in zip(items, output):
+    for item, res in zip(items, output, strict=True):
         status = "OK" if res.get("success") else "FAILED"
-        parts.append(f"## Agent: {item['agent']} [{status}]\n{res.get('result') or res.get('error', '')}")
+        body = res.get("result") or res.get("error", "")
+        parts.append(f"## Agent: {item['agent']} [{status}]\n{body}")
     summary = "\n\n".join(parts)
 
     if ctx:
         await ctx.info(f"Aggregating results via {aggregate}...")
 
-    agg_task = "Synthesize the results below into a single coherent answer. Highlight key findings, note any conflicts between agents, and provide actionable conclusions."
+    agg_task = (
+        "Synthesize the results below into a single coherent answer. Highlight key "
+        "findings, note any conflicts between agents, and provide actionable conclusions."
+    )
     agg_config = config.agents[aggregate]
     async with _get_semaphore(config):
         agg_result = await asyncio.to_thread(
@@ -1123,7 +1175,7 @@ def _run_job(
     agent: str,
     task: str,
     agent_config: AgentConfig,
-    settings,
+    settings: Settings,
     context: str | None,
     caller: str | None,
     goal: str | None,
@@ -1133,7 +1185,12 @@ def _run_job(
     """Worker thread body: runs the dispatch and persists the result."""
     store = _get_job_store()
     with sem:
-        store.mark_running(job_id)
+        # mark_running refuses (returns None) if the job was cancelled while
+        # queued — honor that and skip the dispatch entirely.
+        if store.mark_running(job_id) is None:
+            logger.info("Async job %s skipped (cancelled or missing)", job_id)
+            return
+        logger.info("Async job %s running (agent=%s)", job_id, agent)
         try:
             result = runner.dispatch(
                 agent,
@@ -1146,6 +1203,10 @@ def _run_job(
                 response_format=response_format,
             )
             store.finish(job_id, result)
+            logger.info(
+                "Async job %s finished: success=%s cost=%s",
+                job_id, result.success, result.cost_usd,
+            )
         except Exception as e:  # noqa: BLE001 — must not crash worker thread
             logger.exception("Async job %s crashed: %s", job_id, e)
             store.fail(job_id, f"Worker crashed: {e}")
@@ -1233,6 +1294,8 @@ async def dispatch_status(
     Args:
         job_id: ID returned by dispatch_async.
     """
+    if err := _validate_ref(job_id):
+        return err
     store = _get_job_store()
     job = store.get(job_id)
     if job is None:
@@ -1256,6 +1319,8 @@ async def dispatch_wait(
         job_id: ID returned by dispatch_async.
         timeout_seconds: Max seconds to wait (default 60, capped at 3600).
     """
+    if err := _validate_ref(job_id):
+        return err
     timeout = max(1, min(int(timeout_seconds), 3600))
     store = _get_job_store()
     deadline = time.monotonic() + timeout
@@ -1276,6 +1341,41 @@ async def dispatch_wait(
                 )
             return json.dumps(d, indent=2)
         await asyncio.sleep(0.25)
+
+
+@mcp.tool()
+async def dispatch_cancel(
+    job_id: str,
+    ctx: Context | None = None,
+) -> str:
+    """Cancel a *pending* async job before it starts running.
+
+    Only jobs that have not yet begun executing can be cancelled — a running
+    job's claude subprocess is already in flight and is left to finish (poll
+    it with dispatch_status). Returns the job's new state plus an ``outcome``
+    field: ``cancelled``, ``running`` (could not cancel), ``already_terminal``,
+    or ``not_found``.
+
+    Args:
+        job_id: ID returned by dispatch_async.
+    """
+    if err := _validate_ref(job_id):
+        return err
+    store = _get_job_store()
+    job, outcome = store.cancel(job_id)
+    if outcome == "not_found":
+        return json.dumps({"error": f"Job not found: {job_id}"})
+    if ctx:
+        await ctx.info(f"Cancel {job_id}: {outcome}")
+    payload: dict = {"job_id": job_id, "outcome": outcome}
+    if job is not None:
+        payload["status"] = job.status
+    if outcome == "running":
+        payload["message"] = (
+            "Job is already running; its subprocess cannot be safely "
+            "interrupted. Poll dispatch_status until it finishes."
+        )
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -1304,7 +1404,7 @@ async def dispatch_jobs(
                      f"Use one of: {', '.join(sorted(valid_statuses))} or empty.",
         })
     jobs = store.list(status=filt)  # type: ignore[arg-type]
-    jobs = jobs[: max(1, int(limit))]
+    jobs = jobs[: max(1, min(int(limit), _MAX_JOBS_LIMIT))]
     summaries: list[dict] = []
     for j in jobs:
         entry: dict = {
@@ -1347,6 +1447,8 @@ async def fetch_result(
             Useful when probing a very large result before deciding to load
             it fully.
     """
+    if err := _validate_ref(ref):
+        return err
     store = _get_job_store()
     job = store.get(ref)
     if job is None:
@@ -1381,8 +1483,11 @@ async def dispatch_gc(
     """
     if max_age_days <= 0:
         return json.dumps({"error": "max_age_days must be > 0"})
+    max_age_seconds = float(max_age_days) * 86400
+    if not math.isfinite(max_age_seconds):
+        return json.dumps({"error": "max_age_days is too large (non-finite)"})
     store = _get_job_store()
-    purged = store.gc(max_age_seconds=float(max_age_days) * 86400)
+    purged = store.gc(max_age_seconds=max_age_seconds)
     if ctx:
         await ctx.info(f"Purged {purged} terminal jobs older than {max_age_days}d")
     return json.dumps({"purged": purged, "max_age_days": max_age_days})
@@ -1424,4 +1529,12 @@ def main() -> None:
         stream=sys.stderr,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Recover jobs abandoned in 'running' by a previous crashed/killed server
+    # so callers don't poll them forever.
+    try:
+        recovered = _get_job_store().recover_stale(_STALE_RUNNING_SECONDS)
+        if recovered:
+            logger.info("Recovered %d stale 'running' job(s) from a prior run", recovered)
+    except OSError as e:
+        logger.warning("Stale-job recovery skipped: %s", e)
     mcp.run(transport="stdio")

@@ -23,12 +23,14 @@ class DispatchCache:
     requests with different framing would collide and return the wrong response.
     """
 
-    def __init__(self, ttl: int = 300) -> None:
+    def __init__(self, ttl: int = 300, max_size: int = 1000) -> None:
         self._ttl = ttl
+        self._max_size = max_size
         self._store: dict[str, tuple[float, DispatchResult]] = {}
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
+        self._evictions = 0
 
     @staticmethod
     def _make_key(
@@ -89,6 +91,15 @@ class DispatchCache:
             return  # don't cache failures
         key = self._make_key(agent, task, context, caller, goal, response_format)
         with self._lock:
+            # Bound memory: when at capacity and inserting a new key, evict the
+            # oldest entry by insertion time (FIFO). We intentionally do NOT
+            # refresh timestamps on read — the timestamp also drives TTL expiry,
+            # so touching it on access would turn TTL into idle-time. Refreshing
+            # an existing key never triggers eviction.
+            if key not in self._store and len(self._store) >= self._max_size:
+                oldest = min(self._store, key=lambda k: self._store[k][0])
+                del self._store[oldest]
+                self._evictions += 1
             self._store[key] = (time.monotonic(), result)
 
     def clear(self) -> int:
@@ -97,6 +108,7 @@ class DispatchCache:
             self._store.clear()
             self._hits = 0
             self._misses = 0
+            self._evictions = 0
             return count
 
     def evict_expired(self) -> int:
@@ -112,8 +124,10 @@ class DispatchCache:
             total = self._hits + self._misses
             return {
                 "size": len(self._store),
+                "max_size": self._max_size,
                 "hits": self._hits,
                 "misses": self._misses,
+                "evictions": self._evictions,
                 "hit_rate": round(self._hits / total, 3) if total else 0.0,
                 "ttl": self._ttl,
             }

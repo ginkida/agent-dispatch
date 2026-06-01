@@ -4,12 +4,16 @@ on:
   release:
     types: [published]
 
+# Default to no privileges; the publish job opts into exactly what it needs.
+permissions: {}
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write   # OIDC token for PyPI Trusted Publisher
+      contents: read    # checkout the tagged source
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 

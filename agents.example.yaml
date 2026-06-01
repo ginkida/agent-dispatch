@@ -45,3 +45,4 @@ settings:
   cache:
     enabled: true
     ttl: 300                       # seconds; identical (agent, task, context) requests are cached
+    max_size: 1000                 # max cached entries; oldest is evicted first (FIFO)

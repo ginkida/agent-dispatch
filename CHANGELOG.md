@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-01
+
+Security-hardening release. A multi-agent audit of the codebase surfaced
+several issues; the confirmed ones are fixed here, plus job cancellation,
+cache bounding, and stale-job recovery.
+
+### Security
+- **Path traversal in async jobs (fixed).** `dispatch_status`, `dispatch_wait`,
+  and `fetch_result` accept a caller-supplied `job_id`/`ref` that flowed
+  straight into `JobStore`'s file-path construction. A crafted value such as
+  `../../secret` could read any Job-shaped `.json` file outside the jobs
+  directory. Job ids are now validated against `^[0-9a-f]{32}$` at the tool
+  boundary (`_validate_ref`), in `JobStore.get`, and in `JobStore._path`
+  (defense in depth). Malformed ids are rejected without touching the
+  filesystem. New helper `jobs.is_valid_job_id`.
+- **Argument/flag injection via structured CLI fields (fixed).** A
+  `session_id` (caller-controlled in `dispatch_session`) — or a misconfigured
+  `model`, `permission_mode`, or tool name — that started with `-` was placed
+  in the argument position after a flag (e.g. `--resume <session_id>`) and the
+  `claude` CLI parsed it as a *new* flag, allowing options like
+  `--permission-mode bypassPermissions` to be smuggled in. `_build_command`
+  now rejects any such value via `_reject_flaglike` (raising
+  `runner.ArgInjectionError`); `dispatch`/`dispatch_stream` surface it as a
+  clean failed result, never spawning a subprocess.
+- **Tightened file permissions.** Job files are written `0o600` and the jobs
+  directory is created `0o700` (they hold full task/context/result payloads
+  that may contain secrets). `save_config` now writes `agents.yaml` `0o600`
+  and its parent directory `0o700`. All `chmod`s are best-effort (skipped on
+  platforms without POSIX modes).
+
+### Added
+- `dispatch_cancel(job_id)` MCP tool — cancel a *pending* async job before it
+  starts. Running jobs are left to finish (their subprocess can't be safely
+  interrupted); the tool reports an `outcome` of `cancelled`, `running`,
+  `already_terminal`, or `not_found`. Makes the previously-unreachable
+  `cancelled` job status real. Backed by `JobStore.cancel`, and the
+  cancel/start race is closed by `mark_running` refusing a cancelled job.
+- Cache size bound — `CacheSettings.max_size` (default 1000) caps the
+  in-memory dispatch cache, evicting the oldest entry first (FIFO by insertion
+  time; read access does not refresh, since the timestamp also drives TTL),
+  preventing unbounded memory growth from many unique requests. `cache_stats`
+  now reports `max_size` and `evictions`.
+- Stale-job recovery — on startup the server marks jobs abandoned in
+  `running` (older than 1h, e.g. from a crashed prior run) as `failed` so
+  callers don't poll them forever (`JobStore.recover_stale`).
+
+### Changed
+- Input bounds hardened across MCP tools: `dispatch_jobs(limit)` clamped to
+  `[1, 1000]`; `dispatch_gc(max_age_days)` rejects non-finite values;
+  `summary_chars` (in `dispatch` and per-item `dispatch_parallel`) clamped to
+  `[0, 100000]`; `dispatch_parallel` rejects more than
+  `max(100, max_concurrency * 20)` items to bound subprocess fan-out.
+- Async job worker now logs lifecycle transitions (running / finished) with
+  the job id for easier production debugging.
+- Type hints filled in (`_ref_payload`, `_run_job`, `_run_one`).
+- Lint surface expanded — ruff now enforces bugbear (`B`), bandit security
+  (`S`), import order (`I`), and pyupgrade (`UP`) in addition to the defaults,
+  with documented ignores for the trusted `claude` subprocess calls.
+- `SECURITY.md` rewritten: accurate supported-versions table and an expanded
+  threat model (bypassPermissions, on-disk job files, env inheritance,
+  best-effort recursion depth, argument-injection mitigation).
+
 ## [0.4.0] - 2026-05-15
 
 ### Added
@@ -152,7 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ginkida/agent-dispatch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/agent-dispatch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ginkida/agent-dispatch/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ginkida/agent-dispatch/compare/v0.2.1...v0.2.2

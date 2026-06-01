@@ -1,6 +1,6 @@
 [project]
 name = "agent-dispatch"
-version = "0.4.0"
+version = "0.5.0"
 description = "MCP server that lets Claude Code agents delegate tasks to agents in other project directories"
 readme = "README.md"
 license = "MIT"
@@ -46,6 +46,28 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "B",       # flake8-bugbear (likely bugs)
+    "I",       # isort (import order)
+    "UP",      # pyupgrade (modern syntax)
+    "S",       # flake8-bandit (security)
+]
+ignore = [
+    # The dispatch family shells out to the trusted `claude` CLI with argument
+    # lists (never shell=True); see runner._build_command and the arg-injection
+    # guard (_reject_flaglike). Partial path is intentional — `claude` is
+    # resolved from PATH.
+    "S603",  # subprocess call with possibly-untrusted input
+    "S607",  # starting a process with a partial executable path
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately assert and use throwaway /tmp paths.
+"tests/**" = ["S101", "S108"]
 
 [project.optional-dependencies]
 dev = [

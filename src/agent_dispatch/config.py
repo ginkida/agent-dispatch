@@ -33,15 +33,25 @@ def load_config(path: Path | None = None) -> DispatchConfig:
     return DispatchConfig.model_validate(raw)
 
 
+def _chmod_quiet(path: Path, mode: int) -> None:
+    """Best-effort chmod. Silently ignores platforms/filesystems without it."""
+    try:
+        os.chmod(path, mode)
+    except OSError as e:  # pragma: no cover - platform dependent
+        logger.debug("chmod %s to %o failed: %s", path, mode, e)
+
+
 def save_config(config: DispatchConfig, path: Path | None = None) -> None:
-    """Save config to YAML file."""
+    """Save config to YAML file (owner-only perms — it records project paths)."""
     p = path or config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _chmod_quiet(p.parent, 0o700)
     data = config.model_dump(mode="json", exclude_none=True)
     p.write_text(
         yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
+    _chmod_quiet(p, 0o600)
 
 
 def _collect_mcp_servers(directory: Path) -> list[str]:

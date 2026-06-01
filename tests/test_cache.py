@@ -14,6 +14,34 @@ def _fail_result(agent: str = "test") -> DispatchResult:
     return DispatchResult(agent=agent, success=False, result="", error="boom")
 
 
+class TestCacheMaxSize:
+    def test_evicts_oldest_when_full(self):
+        cache = DispatchCache(ttl=60, max_size=3)
+        for i in range(3):
+            cache.put("a", f"task{i}", _ok_result(text=str(i)))
+        assert cache.stats()["size"] == 3
+        # Inserting a 4th unique key evicts the oldest (task0).
+        cache.put("a", "task3", _ok_result(text="3"))
+        assert cache.stats()["size"] == 3
+        assert cache.get("a", "task0") is None  # evicted
+        assert cache.get("a", "task3") is not None
+        assert cache.stats()["evictions"] == 1
+
+    def test_refreshing_existing_key_does_not_evict(self):
+        cache = DispatchCache(ttl=60, max_size=2)
+        cache.put("a", "task0", _ok_result(text="0"))
+        cache.put("a", "task1", _ok_result(text="1"))
+        # Re-put an existing key — should not evict anything.
+        cache.put("a", "task0", _ok_result(text="0-new"))
+        assert cache.stats()["size"] == 2
+        assert cache.stats()["evictions"] == 0
+        assert cache.get("a", "task1") is not None
+
+    def test_stats_reports_max_size(self):
+        cache = DispatchCache(ttl=60, max_size=42)
+        assert cache.stats()["max_size"] == 42
+
+
 class TestCacheBasics:
     def test_miss_on_empty(self):
         cache = DispatchCache(ttl=60)
@@ -140,9 +168,12 @@ class TestCacheClear:
 
 class TestCacheStats:
     def test_initial_stats(self):
-        cache = DispatchCache(ttl=120)
+        cache = DispatchCache(ttl=120, max_size=500)
         stats = cache.stats()
-        assert stats == {"size": 0, "hits": 0, "misses": 0, "hit_rate": 0.0, "ttl": 120}
+        assert stats == {
+            "size": 0, "max_size": 500, "hits": 0, "misses": 0,
+            "evictions": 0, "hit_rate": 0.0, "ttl": 120,
+        }
 
     def test_stats_after_operations(self):
         cache = DispatchCache(ttl=60)

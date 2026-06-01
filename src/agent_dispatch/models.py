@@ -55,6 +55,7 @@ class CacheSettings(BaseModel):
 
     enabled: bool = True
     ttl: int = Field(default=300, ge=0)  # seconds; 0 effectively disables
+    max_size: int = Field(default=1000, ge=1)  # entries before oldest-first eviction
 
     @field_validator("ttl", mode="after")
     @classmethod

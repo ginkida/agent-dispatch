@@ -118,6 +118,32 @@ def _find_claude() -> str:
     return path
 
 
+class ArgInjectionError(ValueError):
+    """Raised when a structured field would smuggle an extra CLI flag.
+
+    Values like ``session_id="--permission-mode"`` are passed in the argument
+    position right after a flag (``--resume``).  The ``claude`` CLI parses a
+    token starting with ``-`` as a *new* flag rather than the preceding flag's
+    value, so an attacker controlling such a field could inject arbitrary
+    options (e.g. flip ``--permission-mode bypassPermissions``).  Every
+    structured value we place on the command line is checked against this.
+    """
+
+
+def _reject_flaglike(label: str, value: str) -> None:
+    """Reject a value that would be parsed as a CLI flag (option smuggling).
+
+    The dispatched task itself (the ``-p`` prompt) is exempt — it is intended
+    free-form content. This guard is only for *structured* fields that should
+    never look like flags: session_id, model, permission_mode, tool names.
+    """
+    if value.startswith("-"):
+        raise ArgInjectionError(
+            f"Refusing to dispatch: {label} {value!r} starts with '-' and "
+            "would be interpreted as a command-line flag by the claude CLI."
+        )
+
+
 def _build_command(
     claude_path: str,
     task: str,
@@ -128,6 +154,7 @@ def _build_command(
     cmd = [claude_path, "-p", task, "--output-format", "json"]
 
     if session_id:
+        _reject_flaglike("session_id", session_id)
         cmd.extend(["--resume", session_id])
 
     budget = agent.max_budget_usd or settings.default_max_budget_usd
@@ -135,10 +162,12 @@ def _build_command(
         cmd.extend(["--max-budget-usd", str(budget)])
 
     if agent.model:
+        _reject_flaglike("model", agent.model)
         cmd.extend(["--model", agent.model])
 
     permission_mode = agent.permission_mode or settings.default_permission_mode
     if permission_mode:
+        _reject_flaglike("permission_mode", permission_mode)
         cmd.extend(["--permission-mode", permission_mode])
 
     # None = inherit from settings; [] = explicitly empty (no inheritance)
@@ -147,6 +176,7 @@ def _build_command(
         else settings.default_allowed_tools
     )
     for tool in allowed:
+        _reject_flaglike("allowed tool", tool)
         cmd.extend(["--allowedTools", tool])
 
     disallowed = (
@@ -154,6 +184,7 @@ def _build_command(
         else settings.default_disallowed_tools
     )
     for tool in disallowed:
+        _reject_flaglike("disallowed tool", tool)
         cmd.extend(["--disallowedTools", tool])
 
     return cmd
@@ -243,7 +274,13 @@ def dispatch(
 
     full_task = _build_prompt(task, context, caller, goal, response_format)
 
-    cmd = _build_command(claude_path, full_task, agent, settings, session_id)
+    try:
+        cmd = _build_command(claude_path, full_task, agent, settings, session_id)
+    except ArgInjectionError as e:
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="cli_error",
+        )
     timeout = agent.timeout or settings.default_timeout
 
     # Propagate depth for recursion protection
@@ -395,7 +432,13 @@ def dispatch_stream(
 
     full_task = _build_prompt(task, context, caller, goal, response_format)
 
-    cmd = _build_command(claude_path, full_task, agent, settings)
+    try:
+        cmd = _build_command(claude_path, full_task, agent, settings)
+    except ArgInjectionError as e:
+        return DispatchResult(
+            agent=agent_name, success=False, result="", error=str(e),
+            error_type="cli_error",
+        )
     # Switch from json to stream-json
     fmt_idx = cmd.index("--output-format")
     cmd[fmt_idx + 1] = "stream-json"

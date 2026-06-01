@@ -25,13 +25,13 @@ def _load_or_exit() -> DispatchConfig:
             f"Error: config at {config_path()} has an invalid schema:", fg="red"
         ))
         click.echo(str(e))
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     except yaml.YAMLError as e:
         click.echo(click.style(
             f"Error: config at {config_path()} is not valid YAML:", fg="red"
         ))
         click.echo(str(e))
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
 
 @click.group()
@@ -94,7 +94,10 @@ def init() -> None:
 @cli.command()
 @click.argument("name")
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, resolve_path=True))
-@click.option("-d", "--description", default=None, help="Agent description. Auto-generated if omitted.")
+@click.option(
+    "-d", "--description", default=None,
+    help="Agent description. Auto-generated if omitted.",
+)
 @click.option("--timeout", default=300, help="Timeout in seconds (default: 300).")
 @click.option("--model", default=None, help="Model override for this agent.")
 @click.option("--max-budget", default=None, type=float, help="Max cost in USD per dispatch.")
@@ -126,7 +129,7 @@ def add(
         validate_agent_name(name)
     except ValueError as e:
         click.echo(f"Error: {e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     config = _load_or_exit()
     dir_path = Path(directory).resolve()

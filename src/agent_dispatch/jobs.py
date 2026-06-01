@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -23,6 +24,24 @@ logger = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "failed", "cancelled"})
+
+# Job IDs are uuid4().hex — 32 lowercase hex chars. Anything else (notably
+# values containing "/" or "..") is rejected so a caller-supplied ref/job_id
+# can never escape the jobs directory via path traversal.
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def is_valid_job_id(job_id: str) -> bool:
+    """Return True if *job_id* is a well-formed uuid4 hex string."""
+    return isinstance(job_id, str) and bool(_JOB_ID_RE.match(job_id))
+
+
+def _chmod_quiet(path: Path, mode: int) -> None:
+    """Best-effort chmod. Silently ignores platforms/filesystems without it."""
+    try:
+        os.chmod(path, mode)
+    except OSError as e:  # pragma: no cover - platform dependent
+        logger.debug("chmod %s to %o failed: %s", path, mode, e)
 
 
 class Job(BaseModel):
@@ -50,16 +69,24 @@ class JobStore:
 
     def __init__(self, directory: Path):
         self.directory = Path(directory).expanduser()
-        self.directory.mkdir(parents=True, exist_ok=True)
+        # Owner-only (0o700): job files hold full task/context/result payloads
+        # that may contain secrets — keep them off other local users' radar.
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _chmod_quiet(self.directory, 0o700)
         self._lock = threading.RLock()
 
     def _path(self, job_id: str) -> Path:
+        # Defense-in-depth: validate before building any path so a crafted
+        # job_id ("../../etc/foo") can never resolve outside self.directory.
+        if not is_valid_job_id(job_id):
+            raise ValueError(f"Invalid job_id: {job_id!r}")
         return self.directory / f"{job_id}.json"
 
     def _write(self, job: Job) -> None:
         path = self._path(job.id)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(job.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
+        _chmod_quiet(tmp, 0o600)  # owner-only before it becomes visible
         os.replace(tmp, path)
 
     def create(
@@ -118,7 +145,12 @@ class JobStore:
         return job
 
     def get(self, job_id: str) -> Job | None:
-        """Read a job by id. Returns None if not found or unreadable."""
+        """Read a job by id. Returns None if not found, invalid, or unreadable."""
+        if not is_valid_job_id(job_id):
+            # Malformed/hostile id (e.g. path traversal attempt) — treat as
+            # "not found" without touching the filesystem.
+            logger.debug("Rejecting malformed job_id: %r", job_id)
+            return None
         path = self._path(job_id)
         if not path.exists():
             return None
@@ -143,15 +175,72 @@ class JobStore:
         return jobs
 
     def mark_running(self, job_id: str) -> Job | None:
-        """Mark job as running. Returns updated job or None if not found."""
+        """Mark a pending job as running.
+
+        Returns the updated job, or None if the job is missing OR has already
+        been cancelled. Refusing to run a cancelled job closes the race with
+        ``cancel()``: both take ``self._lock``, so whichever wins, the worker
+        either sees ``cancelled`` (and skips) or sets ``running`` first (and
+        cancel then refuses).
+        """
         with self._lock:
             job = self.get(job_id)
             if job is None:
+                return None
+            if job.status == "cancelled":
                 return None
             job.status = "running"
             job.started_at = time.time()
             self._write(job)
             return job
+
+    def cancel(self, job_id: str) -> tuple[Job | None, str]:
+        """Attempt to cancel a job.
+
+        Only *pending* jobs can be cancelled — a running job's subprocess is
+        already in flight and is left to finish. Returns ``(job, outcome)``
+        where outcome is one of: ``cancelled`` (was pending, now cancelled),
+        ``running`` (in flight, untouched), ``already_terminal`` (done/failed/
+        already cancelled), or ``not_found``.
+        """
+        with self._lock:
+            job = self.get(job_id)
+            if job is None:
+                return None, "not_found"
+            if job.is_terminal():
+                return job, "already_terminal"
+            if job.status == "running":
+                return job, "running"
+            # pending -> cancelled
+            job.status = "cancelled"
+            job.completed_at = time.time()
+            job.error = "Cancelled before execution"
+            self._write(job)
+            return job, "cancelled"
+
+    def recover_stale(self, stale_threshold_seconds: float = 3600) -> int:
+        """Mark jobs stuck in 'running' beyond the threshold as failed.
+
+        Async workers are daemon threads — if the server dies mid-dispatch the
+        job file is left in ``running`` forever. Call this on startup to flip
+        such orphans to ``failed`` so callers don't poll them indefinitely.
+        Returns the count recovered.
+        """
+        now = time.time()
+        recovered = 0
+        with self._lock:
+            for job in self.list(status="running"):
+                age = now - (job.started_at or job.created_at)
+                if age > stale_threshold_seconds:
+                    # Count only jobs we actually transitioned (fail() returns
+                    # None for a missing/malformed id, e.g. a planted file).
+                    if self.fail(
+                        job.id,
+                        f"Abandoned in 'running' for {age:.0f}s — likely a "
+                        "server restart. Re-dispatch if still needed.",
+                    ) is not None:
+                        recovered += 1
+        return recovered
 
     def finish(
         self,

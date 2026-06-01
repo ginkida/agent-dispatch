@@ -151,6 +151,7 @@ class TestList:
         agent_dir.mkdir()
         # Write config directly with explicit empty list
         import yaml
+
         from agent_dispatch.config import config_path
         cfg_path = config_path()
         cfg_path.parent.mkdir(parents=True, exist_ok=True)

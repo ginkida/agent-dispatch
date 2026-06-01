@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from agent_dispatch.models import (
     AgentConfig,
@@ -153,11 +154,11 @@ class TestSettingsValidation:
         assert s.max_concurrency == 5
 
     def test_max_concurrency_zero_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             Settings(max_concurrency=0)
 
     def test_max_concurrency_negative_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             Settings(max_concurrency=-1)
 
     def test_max_concurrency_one_ok(self):
@@ -165,7 +166,7 @@ class TestSettingsValidation:
         assert s.max_concurrency == 1
 
     def test_max_dispatch_depth_zero_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             Settings(max_dispatch_depth=0)
 
     def test_cache_ttl_zero_allowed(self):
@@ -175,5 +176,5 @@ class TestSettingsValidation:
 
     def test_cache_ttl_negative_rejected(self):
         from agent_dispatch.models import CacheSettings
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             CacheSettings(ttl=-1)

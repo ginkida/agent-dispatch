@@ -12,6 +12,7 @@ import pytest
 
 from agent_dispatch.models import AgentConfig, Settings
 from agent_dispatch.runner import (
+    ArgInjectionError,
     _build_command,
     _build_prompt,
     _check_recursion,
@@ -195,6 +196,61 @@ class TestBuildCommand:
         cmd = _build_command("claude", "hello", agent, settings)
         assert "--disallowedTools" in cmd
         assert "Write" in cmd
+
+
+class TestArgInjection:
+    """Structured CLI fields must not smuggle extra flags (option injection)."""
+
+    def setup_method(self):
+        self.settings = Settings()
+
+    def test_flaglike_session_id_rejected(self):
+        agent = AgentConfig(directory="/tmp")
+        with pytest.raises(ArgInjectionError, match="session_id"):
+            _build_command("claude", "hi", agent, self.settings, session_id="--permission-mode")
+
+    def test_flaglike_model_rejected(self):
+        agent = AgentConfig(directory="/tmp", model="--dangerously-skip")
+        with pytest.raises(ArgInjectionError, match="model"):
+            _build_command("claude", "hi", agent, self.settings)
+
+    def test_flaglike_permission_mode_rejected(self):
+        agent = AgentConfig(directory="/tmp", permission_mode="-x")
+        with pytest.raises(ArgInjectionError, match="permission_mode"):
+            _build_command("claude", "hi", agent, self.settings)
+
+    def test_flaglike_tool_rejected(self):
+        agent = AgentConfig(directory="/tmp", allowed_tools=["--resume"])
+        with pytest.raises(ArgInjectionError, match="tool"):
+            _build_command("claude", "hi", agent, self.settings)
+
+    def test_normal_values_still_build(self):
+        agent = AgentConfig(
+            directory="/tmp", model="sonnet", permission_mode="bypassPermissions",
+            allowed_tools=["Bash(git diff)", "Read"],
+        )
+        cmd = _build_command("claude", "hi", agent, self.settings, session_id="abc-123-def")
+        assert "sonnet" in cmd and "Bash(git diff)" in cmd and "abc-123-def" in cmd
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_returns_error_not_raise(self, mock_run, _which):
+        """dispatch() must surface injection as a clean failure, never spawn claude."""
+        agent = AgentConfig(directory="/tmp", description="t", timeout=10)
+        result = dispatch("test", "hi", agent, self.settings, session_id="--model")
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert "flag" in result.error.lower()
+        mock_run.assert_not_called()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_dispatch_stream_returns_error_not_raise(self, mock_popen, _which):
+        agent = AgentConfig(directory="/tmp", description="t", timeout=10, model="--evil")
+        result = dispatch_stream("test", "hi", agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        mock_popen.assert_not_called()
 
 
 class TestDispatch:
