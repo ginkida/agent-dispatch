@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable
 
 from .models import AgentConfig, DispatchResult, Settings
@@ -89,6 +90,87 @@ def _permission_hint(agent_name: str) -> str:
     )
 
 
+# permission_denials comes from the dispatched subprocess, which runs untrusted
+# project instructions — bound what we keep so a hostile/buggy agent can't
+# inflate DispatchResult/job files/ref payloads (mirrors the progress caps).
+_MAX_DENIED_TOOLS = 10
+_MAX_TOOL_NAME_CHARS = 100
+
+
+def _extract_denied_tools(data: dict) -> list[str] | None:
+    """Pull tool names out of the claude CLI's `permission_denials` field.
+
+    Recent claude CLI versions report which tool calls were auto-denied in
+    non-interactive (`-p`) mode. This is the deterministic signal that a
+    "successful" dispatch actually ran with its hands tied — the agent often
+    replies "I need permission for X" instead of failing. Returns a
+    deduplicated, order-preserving list of tool names (capped at
+    _MAX_DENIED_TOOLS entries of _MAX_TOOL_NAME_CHARS chars each), or None
+    when the field is absent/empty/unrecognized (older CLIs).
+    """
+    denials = data.get("permission_denials")
+    if not isinstance(denials, list) or not denials:
+        return None
+    names: list[str] = []
+    for entry in denials:
+        if isinstance(entry, dict):
+            name = str(entry.get("tool_name") or entry.get("tool") or "unknown")
+        else:
+            name = str(entry)
+        name = name[:_MAX_TOOL_NAME_CHARS]
+        if name not in names:
+            names.append(name)
+            if len(names) >= _MAX_DENIED_TOOLS:
+                break
+    return names or None
+
+
+def _denial_hint(agent_name: str, denied_tools: list[str]) -> str:
+    """Advisory hint for a dispatch that succeeded but had tools denied."""
+    tools = ", ".join(denied_tools)
+    return (
+        f"{len(denied_tools)} tool call(s) were denied by permissions: {tools}. "
+        "The result may be incomplete — the agent could not use these tools. "
+        f"To grant access: update_agent(name='{agent_name}', "
+        f"allowed_tools='{','.join(denied_tools)}') or "
+        f"permission_mode='bypassPermissions' "
+        f"(CLI: agent-dispatch update {agent_name} --allowed-tools ...)."
+    )
+
+
+def _session_flag_unsupported(stderr_text: str) -> bool:
+    """True when the installed claude CLI predates --session-id support.
+
+    Old CLIs reject the flag with an option-parsing error before doing any
+    work. Detecting it lets dispatch retry once without the flag instead of
+    failing 100% of dispatches with a cryptic "unknown option" error.
+    """
+    lower = (stderr_text or "").lower()
+    if "--session-id" not in lower:
+        return False
+    return any(
+        marker in lower
+        for marker in ("unknown option", "unrecognized option", "unknown argument",
+                       "unexpected argument")
+    )
+
+
+def _timeout_error(agent_name: str, timeout: int, session_uuid: str | None) -> str:
+    """Actionable timeout message: how to retry, extend, or resume."""
+    msg = (
+        f"Agent '{agent_name}' timed out after {timeout}s. "
+        "Options: pass timeout_seconds= for a longer one-off run, use "
+        "dispatch_async for fire-and-forget, or raise the agent default "
+        f"(agent-dispatch update {agent_name} --timeout {timeout * 2})."
+    )
+    if session_uuid:
+        msg += (
+            f" Partial work may be resumable: dispatch_session(agent='{agent_name}', "
+            f"task='Continue where you left off', session_id='{session_uuid}')."
+        )
+    return msg
+
+
 def _current_depth() -> int:
     raw = os.environ.get(_DEPTH_ENV_VAR, "0")
     try:
@@ -150,12 +232,19 @@ def _build_command(
     agent: AgentConfig,
     settings: Settings,
     session_id: str | None = None,
+    *,
+    new_session_id: str | None = None,
 ) -> list[str]:
     cmd = [claude_path, "-p", task, "--output-format", "json"]
 
     if session_id:
         _reject_flaglike("session_id", session_id)
         cmd.extend(["--resume", session_id])
+    elif new_session_id:
+        # Pre-chosen UUID for a fresh session. Knowing the id up front means
+        # a timed-out dispatch can still hand back a resumable session_id —
+        # the partial transcript survives the kill.
+        cmd.extend(["--session-id", new_session_id])
 
     budget = agent.max_budget_usd or settings.default_max_budget_usd
     if budget:
@@ -274,8 +363,16 @@ def dispatch(
 
     full_task = _build_prompt(task, context, caller, goal, response_format)
 
+    # Pre-generate the session id for fresh sessions so a timeout can still
+    # return something resumable. When resuming, the caller's id is the one.
+    new_session = None if session_id else str(uuid.uuid4())
+    session_uuid = session_id or new_session
+
     try:
-        cmd = _build_command(claude_path, full_task, agent, settings, session_id)
+        cmd = _build_command(
+            claude_path, full_task, agent, settings, session_id,
+            new_session_id=new_session,
+        )
     except ArgInjectionError as e:
         return DispatchResult(
             agent=agent_name, success=False, result="", error=str(e),
@@ -290,24 +387,45 @@ def dispatch(
     logger.info("Dispatching to %s (timeout=%ds)", agent_name, timeout)
     logger.debug("Task: %s", task[:200])
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(agent.directory),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return DispatchResult(
-            agent=agent_name,
-            success=False,
-            result="",
-            error=f"Agent '{agent_name}' timed out after {timeout}s. "
-            "Increase timeout in agents.yaml if the task needs more time.",
-            error_type="timeout",
-        )
+    for attempt in (0, 1):
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(agent.directory),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return DispatchResult(
+                agent=agent_name,
+                success=False,
+                result="",
+                session_id=session_uuid,
+                error=_timeout_error(agent_name, timeout, session_uuid),
+                error_type="timeout",
+            )
+        # Self-heal on old claude CLIs that don't know --session-id: strip the
+        # flag and retry once. Timed-out dispatches lose resumability, but
+        # every dispatch working beats 100% failing with "unknown option".
+        if (
+            attempt == 0
+            and new_session
+            and proc.returncode != 0
+            and not proc.stdout.strip()
+            and _session_flag_unsupported(proc.stderr or "")
+        ):
+            logger.warning(
+                "claude CLI does not support --session-id; retrying without it "
+                "(timed-out dispatches will not be resumable — upgrade claude)"
+            )
+            idx = cmd.index("--session-id")
+            del cmd[idx : idx + 2]
+            new_session = None
+            session_uuid = session_id
+            continue
+        break
 
     if proc.returncode != 0 and not proc.stdout.strip():
         error_text = proc.stderr.strip() or f"claude exited with code {proc.returncode}"
@@ -336,6 +454,7 @@ def dispatch(
             )
             return DispatchResult(
                 agent=agent_name, success=True, result=text, parsed_result=parsed,
+                session_id=session_uuid,
             )
         error_text = text or f"claude exited with code {proc.returncode} (non-JSON output)"
         error_type = _classify_error(error_text)
@@ -349,6 +468,8 @@ def dispatch(
             error_type=error_type,
         )
 
+    denied = _extract_denied_tools(data)
+
     is_error = data.get("is_error", False)
     if is_error:
         raw_result = data.get("result", "")
@@ -357,18 +478,22 @@ def dispatch(
             f"(exit code {proc.returncode})"
         )
         error_type = _classify_error(error_text)
+        if denied and error_type != "permission":
+            # Denied tools are a stronger signal than substring matching.
+            error_type = "permission"
         if error_type == "permission":
             error_text += _permission_hint(agent_name)
         return DispatchResult(
             agent=agent_name,
             success=False,
             result=str(raw_result) if raw_result else "",
-            session_id=data.get("session_id"),
+            session_id=data.get("session_id") or session_uuid,
             cost_usd=data.get("total_cost_usd"),
             duration_ms=data.get("duration_ms"),
             num_turns=data.get("num_turns"),
             error=error_text,
             error_type=error_type,
+            denied_tools=denied,
         )
 
     result_text = data.get("result", "")
@@ -379,11 +504,13 @@ def dispatch(
         agent=agent_name,
         success=True,
         result=result_text,
-        session_id=data.get("session_id"),
+        session_id=data.get("session_id") or session_uuid,
         cost_usd=data.get("total_cost_usd"),
         duration_ms=data.get("duration_ms"),
         num_turns=data.get("num_turns"),
         parsed_result=parsed,
+        denied_tools=denied,
+        hint=_denial_hint(agent_name, denied) if denied else None,
     )
 
 
@@ -398,12 +525,16 @@ def dispatch_stream(
     caller: str | None = None,
     goal: str | None = None,
     response_format: str | None = None,
+    _use_session_flag: bool = True,
 ) -> DispatchResult:
     """Run a task via claude -p with streaming output and progress callbacks.
 
     Uses --output-format stream-json to read intermediate results while the
     agent works.  Each assistant message and tool-use event is forwarded to
     *on_progress* so callers can surface live updates.
+
+    ``_use_session_flag`` is internal: set to False on the one-shot retry when
+    the installed claude CLI rejects ``--session-id`` (old version).
     """
     try:
         _check_recursion(settings.max_dispatch_depth)
@@ -432,16 +563,24 @@ def dispatch_stream(
 
     full_task = _build_prompt(task, context, caller, goal, response_format)
 
+    # Pre-generate session id so a timed-out stream is resumable (see dispatch()).
+    new_session = str(uuid.uuid4()) if _use_session_flag else None
+
     try:
-        cmd = _build_command(claude_path, full_task, agent, settings)
+        cmd = _build_command(
+            claude_path, full_task, agent, settings, new_session_id=new_session,
+        )
     except ArgInjectionError as e:
         return DispatchResult(
             agent=agent_name, success=False, result="", error=str(e),
             error_type="cli_error",
         )
-    # Switch from json to stream-json
+    # Switch from json to stream-json. Current claude CLIs refuse
+    # `--print --output-format stream-json` without --verbose (non-verbose
+    # print mode only emits the final result, which defeats streaming).
     fmt_idx = cmd.index("--output-format")
     cmd[fmt_idx + 1] = "stream-json"
+    cmd.append("--verbose")
 
     timeout = agent.timeout or settings.default_timeout
     env = os.environ.copy()
@@ -521,12 +660,13 @@ def dispatch_stream(
             agent=agent_name,
             success=False,
             result="",
-            error=f"Agent '{agent_name}' timed out after {timeout}s. "
-            "Increase timeout in agents.yaml if the task needs more time.",
+            session_id=new_session,
+            error=_timeout_error(agent_name, timeout, new_session),
             error_type="timeout",
         )
 
     if result_data:
+        denied = _extract_denied_tools(result_data)
         is_error = result_data.get("is_error", False)
         if is_error:
             raw_result = result_data.get("result", "")
@@ -534,18 +674,21 @@ def dispatch_stream(
                 f"Agent '{agent_name}' reported an error with no details"
             )
             error_type = _classify_error(error_text)
+            if denied and error_type != "permission":
+                error_type = "permission"
             if error_type == "permission":
                 error_text += _permission_hint(agent_name)
             return DispatchResult(
                 agent=agent_name,
                 success=False,
                 result=str(raw_result) if raw_result else "",
-                session_id=result_data.get("session_id"),
+                session_id=result_data.get("session_id") or new_session,
                 cost_usd=result_data.get("total_cost_usd"),
                 duration_ms=result_data.get("duration_ms"),
                 num_turns=result_data.get("num_turns"),
                 error=error_text,
                 error_type=error_type,
+                denied_tools=denied,
             )
         result_text = result_data.get("result", "")
         parsed = (
@@ -556,15 +699,30 @@ def dispatch_stream(
             agent=agent_name,
             success=True,
             result=result_text,
-            session_id=result_data.get("session_id"),
+            session_id=result_data.get("session_id") or new_session,
             cost_usd=result_data.get("total_cost_usd"),
             duration_ms=result_data.get("duration_ms"),
             num_turns=result_data.get("num_turns"),
             parsed_result=parsed,
+            denied_tools=denied,
+            hint=_denial_hint(agent_name, denied) if denied else None,
         )
 
     # Fallback: no result line received
     stderr = proc.stderr.read() if proc.stderr else ""
+    if new_session and _session_flag_unsupported(stderr):
+        # Old claude CLI rejected --session-id before doing any work —
+        # retry once without the flag (bounded: the retry passes
+        # _use_session_flag=False so it can never recurse again).
+        logger.warning(
+            "claude CLI does not support --session-id; retrying stream "
+            "without it (timed-out dispatches will not be resumable)"
+        )
+        return dispatch_stream(
+            agent_name, task, agent, settings, context, on_progress,
+            caller=caller, goal=goal, response_format=response_format,
+            _use_session_flag=False,
+        )
     error_text = stderr.strip() or f"No result received (exit code {proc.returncode})"
     error_type = _classify_error(error_text)
     if error_type == "permission":
@@ -573,6 +731,7 @@ def dispatch_stream(
         agent=agent_name,
         success=False,
         result="",
+        session_id=new_session,
         error=error_text,
         error_type=error_type,
     )

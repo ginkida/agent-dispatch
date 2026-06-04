@@ -749,3 +749,37 @@ class TestTestCommand:
             runner.invoke(cli, ["test", "proj"])
         mock_dispatch.assert_called_once()
         mock_stream.assert_not_called()
+
+    def test_timeout_flag_overrides_agent_config(self, tmp_path: Path):
+        """--timeout applies a one-off override without touching the config."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        seen: dict = {}
+
+        def _fake_dispatch(name, task, agent, settings, **_kw):
+            seen["timeout"] = agent.timeout
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        with patch("agent_dispatch.runner.dispatch", side_effect=_fake_dispatch):
+            result = runner.invoke(cli, ["test", "proj", "--timeout", "900"])
+        assert result.exit_code == 0
+        assert seen["timeout"] == 900
+        # Persisted config keeps the original timeout
+        from agent_dispatch.config import load_config
+        assert load_config().agents["proj"].timeout == 300
+
+    def test_success_with_hint_prints_note(self, tmp_path: Path):
+        """A successful-but-degraded result (denied tools) surfaces the hint."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj", success=True, result="partial",
+                denied_tools=["Bash"], hint="1 tool call(s) were denied: Bash.",
+            )
+            result = runner.invoke(cli, ["test", "proj"])
+        assert result.exit_code == 0
+        assert "Note:" in result.output
+        assert "denied" in result.output

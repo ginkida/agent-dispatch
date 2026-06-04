@@ -59,6 +59,11 @@ class Job(BaseModel):
     completed_at: float | None = None
     result: DispatchResult | None = None
     error: str | None = None
+    # Rolling tail of progress lines (assistant text / tool-use events) from
+    # the worker's streaming dispatch. None until the first event arrives.
+    # Kept after completion as a post-mortem trace of what the agent did.
+    progress: list[str] | None = None
+    progress_updated_at: float | None = None
 
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
@@ -191,6 +196,22 @@ class JobStore:
                 return None
             job.status = "running"
             job.started_at = time.time()
+            self._write(job)
+            return job
+
+    def update_progress(self, job_id: str, lines: list[str]) -> Job | None:
+        """Replace a running job's progress tail. No-op for terminal jobs.
+
+        Returns the updated job, or None if missing/terminal (a worker's
+        trailing progress write can race a concurrent cancel/finish — refusing
+        to touch terminal jobs keeps their final state authoritative).
+        """
+        with self._lock:
+            job = self.get(job_id)
+            if job is None or job.is_terminal():
+                return None
+            job.progress = lines
+            job.progress_updated_at = time.time()
             self._write(job)
             return job
 

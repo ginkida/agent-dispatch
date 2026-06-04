@@ -113,3 +113,10 @@ class DispatchResult(BaseModel):
     # Set when response_format="json" was requested AND the agent's result
     # parsed cleanly. None means: not requested, or requested but unparseable.
     parsed_result: Any | None = None
+    # Tools the claude CLI refused to run (from `permission_denials` in its
+    # JSON output). Non-empty even on success=True — the agent may have
+    # completed with an incomplete answer because a tool was blocked.
+    denied_tools: list[str] | None = None
+    # Advisory, non-fatal guidance (e.g. "result may be incomplete, grant X").
+    # Errors stay in `error`; hint is for successful-but-degraded results.
+    hint: str | None = None

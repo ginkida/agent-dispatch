@@ -18,6 +18,7 @@ from agent_dispatch.runner import (
     _check_recursion,
     _classify_error,
     _current_depth,
+    _extract_denied_tools,
     _permission_hint,
     dispatch,
     dispatch_stream,
@@ -196,6 +197,25 @@ class TestBuildCommand:
         cmd = _build_command("claude", "hello", agent, settings)
         assert "--disallowedTools" in cmd
         assert "Write" in cmd
+
+    def test_new_session_id_flag(self):
+        cmd = _build_command(
+            "claude", "hello", self.agent, self.settings,
+            new_session_id="11111111-2222-3333-4444-555555555555",
+        )
+        idx = cmd.index("--session-id")
+        assert cmd[idx + 1] == "11111111-2222-3333-4444-555555555555"
+        assert "--resume" not in cmd
+
+    def test_resume_wins_over_new_session_id(self):
+        """When resuming, --session-id must NOT be passed (they conflict)."""
+        cmd = _build_command(
+            "claude", "hello", self.agent, self.settings,
+            session_id="abc-123", new_session_id="should-be-ignored",
+        )
+        assert "--resume" in cmd
+        assert "--session-id" not in cmd
+        assert "should-be-ignored" not in cmd
 
 
 class TestArgInjection:
@@ -463,6 +483,342 @@ class TestDispatch:
         assert "check logs" in prompt
 
 
+class TestResumableTimeout:
+    """Timed-out dispatches return a resumable session_id + actionable hint."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_fresh_dispatch_passes_session_id_flag(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+        )
+        dispatch("test", "hello", self.agent, self.settings)
+        cmd = mock_run.call_args[0][0]
+        idx = cmd.index("--session-id")
+        # Must be a well-formed UUID (claude requires it)
+        import uuid as _uuid
+        _uuid.UUID(cmd[idx + 1])
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_resume_does_not_pass_session_id_flag(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+        )
+        dispatch("test", "hello", self.agent, self.settings, session_id="prior-sess")
+        cmd = mock_run.call_args[0][0]
+        assert "--session-id" not in cmd
+        assert "--resume" in cmd
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_timeout_returns_resumable_session_id(self, mock_run, _which):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
+        result = dispatch("test", "slow task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "timeout"
+        assert result.session_id  # pre-generated uuid survives the kill
+        assert result.session_id in result.error  # mentioned in the hint
+        assert "dispatch_session" in result.error
+        assert "timeout_seconds" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_timeout_on_resume_keeps_original_session(self, mock_run, _which):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
+        result = dispatch(
+            "test", "slow", self.agent, self.settings, session_id="orig-sess",
+        )
+        assert result.error_type == "timeout"
+        assert result.session_id == "orig-sess"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_json_session_id_wins_over_generated(self, mock_run, _which):
+        """claude's reported session_id is authoritative when present."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps(
+                {"result": "ok", "is_error": False, "session_id": "from-cli"}
+            ),
+            stderr="",
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.session_id == "from-cli"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_generated_session_id_fallback_when_missing(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        cmd = mock_run.call_args[0][0]
+        generated = cmd[cmd.index("--session-id") + 1]
+        assert result.session_id == generated
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_plain_text_success_carries_session_id(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Just plain text\n", stderr=""
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert result.session_id  # session exists — claude ran to completion
+
+
+class TestDeniedTools:
+    """permission_denials in CLI output surfaces as denied_tools + hint."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    def test_extract_dedupes_and_preserves_order(self):
+        data = {"permission_denials": [
+            {"tool_name": "Bash", "tool_input": {}},
+            {"tool_name": "WebFetch"},
+            {"tool_name": "Bash"},
+        ]}
+        assert _extract_denied_tools(data) == ["Bash", "WebFetch"]
+
+    def test_extract_handles_missing_or_empty(self):
+        assert _extract_denied_tools({}) is None
+        assert _extract_denied_tools({"permission_denials": []}) is None
+        assert _extract_denied_tools({"permission_denials": "weird"}) is None
+
+    def test_extract_handles_non_dict_entries(self):
+        data = {"permission_denials": ["Bash", {"tool": "Read"}, {"junk": 1}]}
+        assert _extract_denied_tools(data) == ["Bash", "Read", "unknown"]
+
+    def test_extract_caps_entry_count(self):
+        """Untrusted subprocess output must not inflate results/job files."""
+        data = {"permission_denials": [{"tool_name": f"Tool{i}"} for i in range(500)]}
+        names = _extract_denied_tools(data)
+        assert len(names) == 10
+        assert names[0] == "Tool0"
+
+    def test_extract_truncates_long_names(self):
+        data = {"permission_denials": [{"tool_name": "X" * 5000}]}
+        names = _extract_denied_tools(data)
+        assert len(names[0]) == 100
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_success_with_denials_gets_hint(self, mock_run, _which):
+        """The user-reported case: agent 'succeeds' but asks for permission."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({
+                "result": "I need your permission for one read-only query.",
+                "is_error": False,
+                "permission_denials": [{"tool_name": "Bash", "tool_input": {}}],
+            }),
+            stderr="",
+        )
+        result = dispatch("analysis", "map the data", self.agent, self.settings)
+        assert result.success  # stays a success — soft signal
+        assert result.denied_tools == ["Bash"]
+        assert result.hint is not None
+        assert "incomplete" in result.hint
+        assert "analysis" in result.hint
+        assert "Bash" in result.hint
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_success_without_denials_no_hint(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"result": "all done", "is_error": False}),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.denied_tools is None
+        assert result.hint is None
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_is_error_with_denials_classified_as_permission(self, mock_run, _which):
+        """Denials are a stronger signal than substring matching on the text."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({
+                "result": "could not finish the task",  # no permission keywords
+                "is_error": True,
+                "permission_denials": [{"tool_name": "Edit"}],
+            }),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "permission"
+        assert result.denied_tools == ["Edit"]
+        assert "Hint" in result.error
+
+
+class _InstantTimer:
+    """threading.Timer stand-in that fires synchronously on start()."""
+
+    def __init__(self, interval, func):
+        self.func = func
+
+    def start(self):
+        self.func()
+
+    def cancel(self):
+        pass
+
+
+class TestStreamResumableTimeout:
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_passes_session_id_flag(self, mock_popen, _which):
+        result_line = json.dumps({"type": "result", "result": "ok", "is_error": False})
+        mock_popen.return_value = _FakePopen([result_line])
+        dispatch_stream("test", "hello", self.agent, self.settings)
+        cmd = mock_popen.call_args[0][0]
+        assert "--session-id" in cmd
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_success_with_denials(self, mock_popen, _which):
+        result_line = json.dumps({
+            "type": "result",
+            "result": "partial answer",
+            "is_error": False,
+            "permission_denials": [{"tool_name": "WebFetch"}],
+        })
+        mock_popen.return_value = _FakePopen([result_line])
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert result.denied_tools == ["WebFetch"]
+        assert result.hint and "WebFetch" in result.hint
+
+    @patch("agent_dispatch.runner.threading.Timer", _InstantTimer)
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_timeout_returns_resumable_session_id(self, mock_popen, _which):
+        """The Timer-kill path must carry the pre-generated session id."""
+        mock_popen.return_value = _FakePopen([])  # killed before any output
+        result = dispatch_stream("test", "slow", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "timeout"
+        assert result.session_id
+        assert result.session_id in result.error
+        assert "dispatch_session" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_no_result_fallback_carries_session_id(self, mock_popen, _which):
+        """Crash mid-stream (no result line) must stay resumable."""
+        assistant_line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "working..."}]},
+        })
+        mock_popen.return_value = _FakePopen([assistant_line], returncode=1)
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert result.session_id  # partial transcript may exist on disk
+
+
+class _FakePopenWithStderr:
+    """Like _FakePopen (defined below) but with configurable stderr text."""
+
+    def __init__(self, stdout_lines, returncode=0, stderr_text=""):
+        self.returncode = returncode
+        self.stdout = iter(line + "\n" for line in stdout_lines)
+        self.stderr = type(
+            "FakeStderr", (), {"read": lambda _self: stderr_text}
+        )()
+
+    def wait(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return self.returncode
+
+
+class TestOldCliSessionFlagFallback:
+    """Old claude CLIs reject --session-id — dispatch retries once without it."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_retries_without_session_flag(self, mock_run, _which):
+        ok = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps(
+                {"result": "ok", "is_error": False, "session_id": "from-cli"}
+            ),
+            stderr="",
+        )
+        rejected = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="error: unknown option '--session-id'",
+        )
+        mock_run.side_effect = [rejected, ok]
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert result.result == "ok"
+        assert mock_run.call_count == 2
+        retry_cmd = mock_run.call_args_list[1][0][0]
+        assert "--session-id" not in retry_cmd
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_no_retry_on_other_errors(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="connection refused",
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert mock_run.call_count == 1  # no pointless retry
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_retry_failure_does_not_loop(self, mock_run, _which):
+        rejected = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="error: unknown option '--session-id'",
+        )
+        mock_run.side_effect = [rejected, rejected]
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert mock_run.call_count == 2  # exactly one retry, never more
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_retries_without_session_flag(self, mock_popen, _which):
+        result_line = json.dumps({"type": "result", "result": "ok", "is_error": False})
+        rejected = _FakePopenWithStderr(
+            [], returncode=1, stderr_text="error: unknown option '--session-id'",
+        )
+        mock_popen.side_effect = [rejected, _FakePopen([result_line])]
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert mock_popen.call_count == 2
+        retry_cmd = mock_popen.call_args_list[1][0][0]
+        assert "--session-id" not in retry_cmd
+
+
 class _FakePopen:
     """Minimal Popen mock that yields stdout lines and supports wait/kill."""
 
@@ -578,6 +934,8 @@ class TestDispatchStream:
         cmd = mock_popen.call_args[0][0]
         fmt_idx = cmd.index("--output-format")
         assert cmd[fmt_idx + 1] == "stream-json"
+        # claude refuses `--print --output-format stream-json` without --verbose
+        assert "--verbose" in cmd
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")

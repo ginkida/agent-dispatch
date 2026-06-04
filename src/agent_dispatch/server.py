@@ -55,9 +55,17 @@ mcp = FastMCP(
         "6. dispatch_stream(agent, task) — live progress updates\n"
         "7. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
         "8. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "TIMEOUTS: pass timeout_seconds= per call for known-long tasks (no config "
+        "edit needed). If a dispatch times out anyway, the error includes a "
+        "session_id — resume the partial work via dispatch_session(agent, "
+        "'Continue where you left off', session_id=...) instead of restarting.\n\n"
+        "PERMISSIONS: a result may include denied_tools + hint — the agent "
+        "finished but some tool calls were blocked, so the answer may be "
+        "incomplete. Grant access via update_agent(allowed_tools=...) or "
+        "permission_mode='bypassPermissions', then re-dispatch.\n\n"
         "ASYNC DISPATCH (don't block on long tasks):\n"
         "- dispatch_async(agent, task) — fire-and-forget, returns job_id\n"
-        "- dispatch_status(job_id) — check progress without blocking\n"
+        "- dispatch_status(job_id) — check state + live progress tail, non-blocking\n"
         "- dispatch_wait(job_id, timeout?) — block until done (or timeout)\n"
         "- dispatch_cancel(job_id) — cancel a pending job before it runs\n"
         "- dispatch_jobs(status?) — list recent async jobs\n\n"
@@ -85,6 +93,10 @@ _DEFAULT_SUMMARY_CHARS = 500
 _MAX_SUMMARY_CHARS = 100_000  # upper bound for return_ref summaries
 _MAX_JOBS_LIMIT = 1000  # upper bound for dispatch_jobs pagination
 _STALE_RUNNING_SECONDS = 3600  # recover jobs stuck 'running' longer than this
+_MIN_TIMEOUT_OVERRIDE = 10  # seconds; floor for per-call timeout_seconds
+_MAX_TIMEOUT_OVERRIDE = 7200  # seconds; ceiling for per-call timeout_seconds
+_JOB_PROGRESS_MAX_LINES = 20  # rolling tail kept in the job file
+_JOB_PROGRESS_WRITE_INTERVAL = 1.0  # seconds between progress file writes
 
 
 def _get_config() -> DispatchConfig:
@@ -115,6 +127,21 @@ def _get_semaphore(config: DispatchConfig) -> asyncio.Semaphore:
         _semaphore = asyncio.Semaphore(limit)
         _semaphore_limit = limit
     return _semaphore
+
+
+def _apply_timeout(agent_config: AgentConfig, timeout_seconds: int) -> AgentConfig:
+    """Return the agent config with a per-call timeout override applied.
+
+    ``timeout_seconds <= 0`` means "use the agent's configured timeout" —
+    the config is returned untouched. Positive values are clamped to
+    [_MIN_TIMEOUT_OVERRIDE, _MAX_TIMEOUT_OVERRIDE] and applied via a copy so
+    the shared config object is never mutated. Not part of the cache key:
+    a result computed under one timeout is just as valid under another.
+    """
+    if timeout_seconds <= 0:
+        return agent_config
+    clamped = max(_MIN_TIMEOUT_OVERRIDE, min(int(timeout_seconds), _MAX_TIMEOUT_OVERRIDE))
+    return agent_config.model_copy(update={"timeout": clamped})
 
 
 def _ref_payload(
@@ -149,6 +176,10 @@ def _ref_payload(
         payload["error"] = result.error
     if result.error_type:
         payload["error_type"] = result.error_type
+    if result.denied_tools:
+        payload["denied_tools"] = result.denied_tools
+    if result.hint:
+        payload["hint"] = result.hint
     if result.parsed_result is not None:
         # Parsed JSON is structured and typically small — include it inline so
         # the caller can use it without a fetch round-trip.
@@ -397,6 +428,7 @@ async def dispatch(
     response_format: str = "",
     return_ref: bool = False,
     summary_chars: int = _DEFAULT_SUMMARY_CHARS,
+    timeout_seconds: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Delegate a task to an agent in another project directory.
@@ -421,6 +453,11 @@ async def dispatch(
             context when the result is large.
         summary_chars: Max chars of the result text to include in the ref
             response (default 500; only relevant when return_ref=True).
+        timeout_seconds: One-off timeout override for this call (0 = use the
+            agent's configured timeout). Clamped to [10, 7200]. Use for tasks
+            you know are long instead of editing the agent config. If a
+            dispatch still times out, the error includes a session_id you can
+            resume via dispatch_session.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
@@ -442,7 +479,7 @@ async def dispatch(
             cached_dict["cached"] = True
             return json.dumps(cached_dict, indent=2)
 
-    agent_config = config.agents[agent]
+    agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     if ctx:
         await ctx.info(f"Dispatching to {agent}: {task[:80]}...")
 
@@ -487,6 +524,7 @@ async def dispatch_session(
     caller: str = "",
     goal: str = "",
     response_format: str = "",
+    timeout_seconds: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Multi-turn dispatch: continue a conversation with an agent.
@@ -494,6 +532,10 @@ async def dispatch_session(
     First call without session_id starts a new session. Use the returned
     session_id in subsequent calls to continue the conversation — the agent
     retains full context from previous turns.
+
+    Also the recovery path for timeouts: when a dispatch times out, its error
+    includes a session_id — pass it here with task="Continue where you left
+    off" to salvage the partial work instead of restarting from scratch.
 
     Session dispatches are never cached because each turn builds on the prior.
 
@@ -504,12 +546,14 @@ async def dispatch_session(
         context: Optional extra context.
         caller: Who is dispatching.
         goal: The broader objective.
+        timeout_seconds: One-off timeout override (0 = agent default;
+            clamped to [10, 7200]).
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
 
-    agent_config = config.agents[agent]
+    agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     if ctx:
         turn = "new session" if not session_id else f"resuming {session_id[:12]}..."
         await ctx.info(f"Dispatching to {agent} ({turn}): {task[:80]}...")
@@ -543,10 +587,11 @@ async def dispatch_parallel(
 
     Args:
         dispatches: JSON array of requests, each with "agent", "task", and
-            optional "context", "caller", "goal".  Example:
+            optional "context", "caller", "goal", "response_format",
+            "return_ref", "summary_chars", "timeout_seconds".  Example:
             [
               {"agent": "infra", "task": "check pod logs for errors"},
-              {"agent": "db", "task": "are all migrations applied?"}
+              {"agent": "db", "task": "are all migrations applied?", "timeout_seconds": 900}
             ]
         aggregate: Optional agent name. When set, after all dispatches
             complete their results are sent to this agent for synthesis
@@ -583,6 +628,18 @@ async def dispatch_parallel(
             return json.dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
         if err := _validate_agent(config, item["agent"]):
             return err
+        # Numeric fields are coerced inside _run_one — validate here so a bad
+        # value rejects the whole call before any dispatch runs (per contract),
+        # instead of surfacing as a cryptic per-item int() error.
+        for field in ("timeout_seconds", "summary_chars"):
+            if item.get(field) is not None:  # JSON null = "not set"
+                try:
+                    int(item[field])
+                except (TypeError, ValueError):
+                    return json.dumps({
+                        "error": f"dispatches[{i}].{field} must be a number, "
+                                 f"got {item[field]!r}",
+                    })
     if aggregate:
         if err := _validate_agent(config, aggregate):
             return err
@@ -599,9 +656,11 @@ async def dispatch_parallel(
         item_goal = item.get("goal") or None
         item_rf = item.get("response_format") or None
         item_return_ref = bool(item.get("return_ref"))
-        item_summary_chars = max(
-            0, min(int(item.get("summary_chars", _DEFAULT_SUMMARY_CHARS)), _MAX_SUMMARY_CHARS)
-        )
+        raw_summary = item.get("summary_chars")
+        if raw_summary is None:  # absent or JSON null — use the default; 0 stays 0
+            raw_summary = _DEFAULT_SUMMARY_CHARS
+        item_summary_chars = max(0, min(int(raw_summary), _MAX_SUMMARY_CHARS))
+        item_timeout = int(item.get("timeout_seconds") or 0)
 
         # Check cache (caller/goal/response_format are part of the key — see dispatch())
         if cache:
@@ -624,7 +683,7 @@ async def dispatch_parallel(
                 d["cached"] = True
                 return d
 
-        agent_config = config.agents[name]
+        agent_config = _apply_timeout(config.agents[name], item_timeout)
         async with _get_semaphore(config):
             result = await asyncio.to_thread(
                 runner.dispatch,
@@ -719,6 +778,7 @@ async def dispatch_stream(
     caller: str = "",
     goal: str = "",
     response_format: str = "",
+    timeout_seconds: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Dispatch with streaming progress — see live updates as the agent works.
@@ -734,12 +794,14 @@ async def dispatch_stream(
         caller: Who is dispatching.
         goal: The broader objective.
         response_format: ``"json"`` to request structured output. Empty = text.
+        timeout_seconds: One-off timeout override (0 = agent default;
+            clamped to [10, 7200]).
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
 
-    agent_config = config.agents[agent]
+    agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     if ctx:
         await ctx.info(f"Dispatching (stream) to {agent}: {task[:80]}...")
 
@@ -1182,7 +1244,13 @@ def _run_job(
     response_format: str | None,
     sem: threading.BoundedSemaphore,
 ) -> None:
-    """Worker thread body: runs the dispatch and persists the result."""
+    """Worker thread body: runs the dispatch and persists the result.
+
+    Uses the streaming runner so the job file accumulates a rolling tail of
+    progress lines — dispatch_status shows what the agent is *doing*, not
+    just "running". Writes are throttled to one per
+    _JOB_PROGRESS_WRITE_INTERVAL to keep disk churn negligible.
+    """
     store = _get_job_store()
     with sem:
         # mark_running refuses (returns None) if the job was cancelled while
@@ -1191,17 +1259,37 @@ def _run_job(
             logger.info("Async job %s skipped (cancelled or missing)", job_id)
             return
         logger.info("Async job %s running (agent=%s)", job_id, agent)
+
+        progress_lines: list[str] = []
+        last_write = 0.0
+
+        def on_progress(msg: str) -> None:
+            # Called synchronously from the worker thread's stdout loop —
+            # no locking needed around progress_lines.
+            nonlocal last_write
+            progress_lines.append(msg[:300])
+            del progress_lines[:-_JOB_PROGRESS_MAX_LINES]
+            now = time.monotonic()
+            if now - last_write >= _JOB_PROGRESS_WRITE_INTERVAL:
+                last_write = now
+                store.update_progress(job_id, list(progress_lines))
+
         try:
-            result = runner.dispatch(
+            result = runner.dispatch_stream(
                 agent,
                 task,
                 agent_config,
                 settings,
                 context,
+                on_progress,
                 caller=caller,
                 goal=goal,
                 response_format=response_format,
             )
+            # Flush trailing progress lines the throttle skipped, so the
+            # finished job's trace is complete.
+            if progress_lines:
+                store.update_progress(job_id, list(progress_lines))
             store.finish(job_id, result)
             logger.info(
                 "Async job %s finished: success=%s cost=%s",
@@ -1220,13 +1308,15 @@ async def dispatch_async(
     caller: str = "",
     goal: str = "",
     response_format: str = "",
+    timeout_seconds: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Start a dispatch in the background and return immediately with a job_id.
 
     Use this for long-running tasks where you don't want to block your own
-    tool slot. Poll dispatch_status(job_id) or block on dispatch_wait(job_id)
-    to retrieve the result. Job state persists to disk so it survives across
+    tool slot. Poll dispatch_status(job_id) — it shows a rolling tail of the
+    agent's progress while running — or block on dispatch_wait(job_id) to
+    retrieve the result. Job state persists to disk so it survives across
     polling sessions.
 
     Args:
@@ -1237,6 +1327,9 @@ async def dispatch_async(
         goal: The broader objective.
         response_format: ``"json"`` to request a single JSON value
             (parsed into ``parsed_result`` on completion). Empty = free-form.
+        timeout_seconds: One-off timeout override (0 = agent default;
+            clamped to [10, 7200]). Prefer this over editing the agent
+            config for known-long tasks.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
@@ -1252,7 +1345,7 @@ async def dispatch_async(
     )
 
     sem = _get_job_semaphore(config)
-    agent_config = config.agents[agent]
+    agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     thread = threading.Thread(
         target=_run_job,
         args=(
@@ -1289,7 +1382,8 @@ async def dispatch_status(
     """Check the current state of an async job without blocking.
 
     Returns the job record including status (pending/running/done/failed),
-    timestamps, and the DispatchResult once complete.
+    timestamps, a rolling tail of the agent's recent activity (``progress``)
+    while running, and the DispatchResult once complete.
 
     Args:
         job_id: ID returned by dispatch_async.
@@ -1422,6 +1516,8 @@ async def dispatch_jobs(
             entry["success"] = j.result.success
             if j.result.cost_usd is not None:
                 entry["cost_usd"] = j.result.cost_usd
+        if j.status == "running" and j.progress:
+            entry["last_progress"] = j.progress[-1]
         if j.error:
             entry["error_type"] = (
                 j.result.error_type if j.result and j.result.error_type else "cli_error"

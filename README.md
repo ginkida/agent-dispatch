@@ -100,6 +100,7 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `response_format` | string | no | `"json"` to request a single JSON value; the parsed result lands in `parsed_result`. Empty = free-form text. |
 | `return_ref` | bool | no | When `true`, returns just a `ref` + summary preview instead of the full result text. Use `fetch_result(ref)` to load the full text on demand. |
 | `summary_chars` | int | no | Max chars of result text to include in the ref response (default 500). |
+| `timeout_seconds` | int | no | One-off timeout override for this call (0 = agent's configured timeout; clamped to 10–7200). No config edit needed for known-long tasks. |
 
 ```json
 // Response (success)
@@ -124,6 +125,21 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 ```
 
 **`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `cli_error` (other failures). Permission errors include an actionable hint.
+
+**Resumable timeouts:** every fresh dispatch pre-assigns a session UUID (`--session-id`), so a timed-out dispatch still returns a `session_id` — the partial transcript survives the kill. The timeout error spells out the recovery: resume with `dispatch_session(agent, "Continue where you left off", session_id=...)`, retry with a bigger `timeout_seconds`, or use `dispatch_async`.
+
+**Denied-tools visibility:** in non-interactive mode the claude CLI auto-denies tools the agent isn't allowed to use — the agent then often "succeeds" with an answer like *"I need your permission for one read-only query"*. When that happens the response carries the deterministic signal: `denied_tools` (parsed from the CLI's `permission_denials`) plus a `hint` explaining the result may be incomplete and how to grant access. `success` stays `true` — it's a soft signal, not a failure.
+
+```json
+// Response (success, but a tool was blocked)
+{
+  "agent": "analysis",
+  "success": true,
+  "result": "Here is the offline mapping. To finish I'd need to run one read-only query...",
+  "denied_tools": ["Bash"],
+  "hint": "1 tool call(s) were denied by permissions: Bash. The result may be incomplete..."
+}
+```
 
 **Structured JSON output:** pass `response_format="json"` to ask the agent for a single JSON value. The runner appends an instruction footer ("respond with a single valid JSON value, no fences, no prose") and on success parses the response — the parsed value lands in `parsed_result`. The raw text is always in `result`. Parse failures leave `parsed_result=None` but don't fail the dispatch (soft mode).
 
@@ -165,6 +181,9 @@ Multi-turn: continue a conversation with an agent. First call starts a session, 
 | `context` | string | no | Extra context |
 | `caller` | string | no | Who is dispatching |
 | `goal` | string | no | Broader objective |
+| `timeout_seconds` | int | no | One-off timeout override (0 = agent default; clamped to 10–7200) |
+
+`dispatch_session` is also the **timeout recovery path**: a timed-out `dispatch` returns a `session_id` — pass it here with `task="Continue where you left off"` to salvage the partial work instead of restarting.
 
 ```
 Turn 1: dispatch_session("infra", "List running containers")
@@ -180,7 +199,7 @@ Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `dispatches` | string (JSON) | yes | JSON array of `{"agent", "task", "context?", "caller?", "goal?"}` |
+| `dispatches` | string (JSON) | yes | JSON array of `{"agent", "task", "context?", "caller?", "goal?", "response_format?", "return_ref?", "summary_chars?", "timeout_seconds?"}` |
 | `aggregate` | string | no | Agent name to synthesize all results into one answer |
 
 **Important:** `dispatches` is a JSON string, not a list.
@@ -220,7 +239,7 @@ Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
 Same as `dispatch` but shows live progress while the agent works. Use for long-running tasks. Not cached.
 
-Parameters are identical to `dispatch`.
+Parameters are the same as `dispatch` except `return_ref`/`summary_chars` (streaming is incompatible with ref-mode).
 
 ### `dispatch_dialogue`
 
@@ -314,13 +333,15 @@ Refs reuse the same storage as `dispatch_async` jobs (under `~/.config/agent-dis
 When a dispatched task is going to take a while, you don't want to block your own tool slot for minutes. Async dispatch returns a `job_id` immediately and lets you check back when you're ready.
 
 ```
-// 1. fire and forget
+// 1. fire and forget (timeout_seconds= works here too for known-long tasks)
 dispatch_async(agent="infra", task="audit every container log for OOM kills today")
   -> {"job_id": "8f3a...e1", "status": "pending", "agent": "infra"}
 
 // 2. do other work, then check progress (non-blocking)
+//    `progress` is a rolling tail of what the agent is doing right now
 dispatch_status(job_id="8f3a...e1")
-  -> {"id": "8f3a...e1", "status": "running", "started_at": 1730000123.4, ...}
+  -> {"id": "8f3a...e1", "status": "running", "started_at": 1730000123.4,
+      "progress": ["Using tool: Bash", "Scanning container logs for OOM events..."], ...}
 
 // 3. or block until done (with a timeout cap)
 dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
@@ -331,6 +352,8 @@ dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
 ```
 
 `dispatch_cancel(job_id)` cancels a job that is still **pending** (before its subprocess starts) — a running job is left to finish, since its `claude` subprocess can't be safely interrupted. The response carries an `outcome` of `cancelled`, `running`, `already_terminal`, or `not_found`.
+
+Async workers run with streaming under the hood: the job file keeps a rolling tail (last 20 lines, ~1 write/sec) of assistant text and tool-use events. `dispatch_status` shows it as `progress` while the job runs and keeps it afterwards as a post-mortem trace; `dispatch_jobs` shows `last_progress` for running jobs.
 
 `dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
 
@@ -362,6 +385,8 @@ All tools return errors as:
 | Need a combined summary from multiple agents | `dispatch_parallel` with `aggregate` |
 | Long task — don't block your tool slot | `dispatch_async` + `dispatch_wait` |
 | Check progress without blocking | `dispatch_status` |
+| Known-long task, one-off | any dispatch tool with `timeout_seconds=...` |
+| A dispatch timed out | `dispatch_session` with the `session_id` from the error |
 
 ## Configuration
 

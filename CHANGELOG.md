@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-04
+
+Reliability release: timeouts stop being fatal, permission-blocked "successes"
+become visible, async jobs show live progress.
+
+### Fixed
+- **`dispatch_stream` was broken on current claude CLIs** — they reject
+  `--print --output-format stream-json` without `--verbose` ("requires
+  --verbose"), so every stream dispatch (and CLI `test --stream`) failed
+  immediately. The runner now passes `--verbose`. Caught by live verification
+  against the real CLI before this release; without it the async-worker
+  switch to streaming (below) would have broken all `dispatch_async` jobs.
+
+### Added
+- **Per-call timeout override.** `dispatch`, `dispatch_session`,
+  `dispatch_stream`, and `dispatch_async` accept `timeout_seconds` (0 = agent
+  default, clamped to 10–7200); `dispatch_parallel` accepts it per item. Use
+  it for known-long tasks instead of editing the agent config. CLI:
+  `agent-dispatch test <name> --timeout N`.
+- **Resumable timeouts.** Fresh dispatches pre-assign a session UUID via
+  `--session-id`, so a timed-out dispatch still returns a `session_id` — the
+  partial transcript survives the kill. The timeout error now spells out the
+  recovery options: resume via `dispatch_session(..., session_id=...)`, retry
+  with `timeout_seconds`, or go async.
+- **Denied-tools visibility.** The claude CLI's `permission_denials` output is
+  parsed into `DispatchResult.denied_tools`. A dispatch that "succeeds" while
+  tools were blocked (the agent answers "I need permission for X") now carries
+  `denied_tools` + a `hint` that the result may be incomplete and how to grant
+  access. On `is_error` results, non-empty denials force
+  `error_type="permission"` even when the error text has no permission
+  keywords. CLI `test` prints the hint as a yellow note.
+- **Async job progress.** Async workers now run with streaming: the job file
+  keeps a rolling tail (last 20 lines, throttled to ~1 write/sec) of assistant
+  text and tool-use events. `dispatch_status` returns it as `progress` while
+  running (kept afterwards as a post-mortem trace); `dispatch_jobs` shows
+  `last_progress` for running jobs. New `JobStore.update_progress` (refuses
+  terminal jobs, so a trailing write can't resurrect a finished job).
+
+### Changed
+- Timeout error messages are actionable (mention `timeout_seconds`,
+  `dispatch_async`, `agent-dispatch update --timeout`, and the resumable
+  session) instead of just "increase timeout in agents.yaml".
+- Plain-text fallback successes now carry the generated `session_id`; the
+  stream "no result line" fallback does too (a crash mid-stream stays
+  resumable).
+- **Old-CLI self-healing**: if the installed claude CLI predates
+  `--session-id`, dispatch detects the "unknown option" rejection and retries
+  once without the flag (logged warning; timed-out dispatches lose
+  resumability) instead of failing every dispatch.
+- `dispatch_parallel` validates per-item `timeout_seconds` / `summary_chars`
+  numerically **up front** — a bad value rejects the whole call before any
+  dispatch runs, consistent with the structural validation contract.
+- `denied_tools` parsing is bounded (10 entries, 100 chars per name) — the
+  field comes from the dispatched subprocess's output, which is untrusted;
+  unbounded lists could inflate job files and `return_ref` payloads.
+
 ## [0.5.0] - 2026-06-01
 
 Security-hardening release. A multi-agent audit of the codebase surfaced
@@ -214,7 +270,8 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ginkida/agent-dispatch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ginkida/agent-dispatch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/agent-dispatch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ginkida/agent-dispatch/compare/v0.2.2...v0.3.0

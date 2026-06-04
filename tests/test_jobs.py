@@ -98,6 +98,48 @@ class TestJobStoreLifecycle:
         assert store.finish("nope", result) is None
 
 
+class TestJobProgress:
+    def test_update_progress_on_running_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        before = time.time()
+        updated = store.update_progress(job.id, ["Using tool: Bash", "Reading logs..."])
+        assert updated is not None
+        assert updated.progress == ["Using tool: Bash", "Reading logs..."]
+        assert updated.progress_updated_at is not None
+        assert updated.progress_updated_at >= before
+        # Persisted, not just in-memory
+        reread = store.get(job.id)
+        assert reread.progress == ["Using tool: Bash", "Reading logs..."]
+
+    def test_update_progress_replaces_tail(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.update_progress(job.id, ["a", "b"])
+        store.update_progress(job.id, ["b", "c"])
+        assert store.get(job.id).progress == ["b", "c"]
+
+    def test_update_progress_refuses_terminal_job(self, store: JobStore):
+        """A worker's trailing write must not resurrect a finished job."""
+        job = store.create("infra", "task")
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        assert store.update_progress(job.id, ["late line"]) is None
+        assert store.get(job.id).progress is None
+
+    def test_update_progress_unknown_returns_none(self, store: JobStore):
+        assert store.update_progress("nope", ["x"]) is None
+
+    def test_progress_survives_finish(self, store: JobStore):
+        """finish() re-reads from disk, so the last progress tail is kept."""
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.update_progress(job.id, ["step 1", "step 2"])
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        reread = store.get(job.id)
+        assert reread.status == "done"
+        assert reread.progress == ["step 1", "step 2"]
+
+
 class TestJobStoreList:
     def test_list_empty(self, store: JobStore):
         assert store.list() == []

@@ -303,7 +303,11 @@ def update(
     "--stream", "stream", is_flag=True,
     help="Show live progress (assistant text + tool use) while the agent works.",
 )
-def test(name: str, task: str, stream: bool) -> None:
+@click.option(
+    "--timeout", "timeout", default=None, type=int,
+    help="One-off timeout override in seconds (does not change the agent config).",
+)
+def test(name: str, task: str, stream: bool, timeout: int | None) -> None:
     """Test an agent by dispatching a task."""
     config = _load_or_exit()
     if name not in config.agents:
@@ -311,6 +315,8 @@ def test(name: str, task: str, stream: bool) -> None:
         raise SystemExit(1)
 
     agent = config.agents[name]
+    if timeout is not None and timeout > 0:
+        agent = agent.model_copy(update={"timeout": timeout})
     click.echo(f"Dispatching to '{name}' ({agent.directory})...")
     click.echo(f"Task: {task}")
     click.echo("---")
@@ -330,6 +336,9 @@ def test(name: str, task: str, stream: bool) -> None:
 
     if result.success:
         click.echo(result.result)
+        if result.hint:
+            click.echo()
+            click.echo(click.style(f"Note: {result.hint}", fg="yellow"))
         if result.cost_usd is not None:
             click.echo(f"\n--- Cost: ${result.cost_usd:.4f} | Turns: {result.num_turns}")
     else:
@@ -343,7 +352,8 @@ def test(name: str, task: str, stream: bool) -> None:
         elif result.error_type == "timeout":
             click.echo()
             click.echo(click.style("Diagnosis: timeout", fg="yellow"))
-            click.echo(f"  agent-dispatch update {name} --timeout 600")
+            click.echo(f"  agent-dispatch test {name} --timeout 600    # one-off")
+            click.echo(f"  agent-dispatch update {name} --timeout 600  # permanent")
         raise SystemExit(1)
 
 
