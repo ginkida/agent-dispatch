@@ -15,29 +15,61 @@ Each agent runs as a separate `claude -p` session in its own project directory �
 
 Works with OAuth, API key, and Claude subscription authentication.
 
+> **AI agents:** this README is the canonical doc for *using* the tool — setup: [Quick Start](#quick-start) (every step has a deterministic verify), first call: [`dispatch`](#dispatch), tool selection: [Which Tool to Use](#which-tool-to-use), failure handling: [Error Recovery](#error-recovery). Working *on* this repo instead? See [AGENTS.md](AGENTS.md).
+
 ## Quick Start
 
-```bash
-pip install agent-dispatch
+**Prerequisite:** the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and authenticated. Check first:
 
-# Initialize: creates config + registers MCP server with Claude Code
+```bash
+claude --version   # must print a version — if it fails, install Claude Code before continuing
+```
+
+Then:
+
+```bash
+pip install agent-dispatch   # or: pipx install agent-dispatch
+
+# 1. Create config + register the MCP server with Claude Code (user scope)
 agent-dispatch init
 
-# Add agents (description auto-generated from project files)
+# 2. Register project directories as agents — REPLACE the example paths with
+#    real directories on your machine; they must exist (~ is expanded, relative
+#    paths are resolved). Descriptions are auto-generated from project files.
+#    No second project handy? Use the zero-setup block below instead.
 agent-dispatch add infra ~/projects/infra
 agent-dispatch add backend ~/projects/backend
 
-# Test it works
+# 3. Smoke test — dispatches a real task to the agent added in step 2 and prints
+#    the answer; exit 0 on success. Default task when none given:
+#    "What project is this? Describe in one sentence."
 agent-dispatch test infra
 
-# If agents hit permission errors, grant tool access:
-agent-dispatch update infra --permission-mode bypassPermissions
-
-# If something doesn't work, run the diagnostic:
+# 4. Verify the whole install — prints "All checks passed." and exits 0 on success
 agent-dispatch doctor
 ```
 
-Done. Every Claude Code session now has access to all dispatch tools.
+**Zero-setup alternative** for steps 2–3 (no second project needed — registers the current directory):
+
+```bash
+agent-dispatch add self . && agent-dispatch test self "Say hello"
+```
+
+Every Claude Code session now has the dispatch tools. Independent check: `claude mcp list` must print a line starting with `agent-dispatch:`. From inside a Claude Code session, the first MCP calls are `list_agents()`, then [`dispatch(...)`](#dispatch).
+
+**If `init` fails to register the MCP server** (prints a warning instead of `Registered MCP server`), register manually:
+
+```bash
+claude mcp add-json agent-dispatch "{\"type\":\"stdio\",\"command\":\"$(which agent-dispatch)\",\"args\":[\"serve\"]}" --scope user
+```
+
+**If `test` fails with a permission error** (`error_type: "permission"`), grant tool access and re-test:
+
+```bash
+agent-dispatch update infra --allowed-tools "Bash,Read,Grep"      # least privilege
+# or, if the agent needs everything (see SECURITY.md for the trade-off):
+agent-dispatch update infra --permission-mode bypassPermissions
+```
 
 ## When to Dispatch
 
@@ -101,6 +133,17 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `return_ref` | bool | no | When `true`, returns just a `ref` + summary preview instead of the full result text. Use `fetch_result(ref)` to load the full text on demand. |
 | `summary_chars` | int | no | Max chars of result text to include in the ref response (default 500). |
 | `timeout_seconds` | int | no | One-off timeout override for this call (0 = agent's configured timeout; clamped to 10–7200). No config edit needed for known-long tasks. |
+
+```python
+# Call — recommended form (always include caller and goal)
+dispatch(
+    agent="infra",                # must exist in list_agents()
+    task="Check container logs for errors related to the scheduler service",
+    context="Error: TypeError at scheduler.py:42",
+    caller="backend",             # your project/role
+    goal="debug production crash" # the broader objective
+)
+```
 
 ```json
 // Response (success)
@@ -277,9 +320,10 @@ Register a new project directory as an agent. Description is auto-generated from
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Agent name (letters, digits, hyphens, underscores) |
-| `directory` | string | yes | Absolute path to project directory |
+| `directory` | string | yes | Path to an existing project directory (`~` is expanded, relative paths resolved) |
 | `description` | string | no | What this agent can do — auto-generated if empty |
 | `timeout` | int | no | Timeout in seconds (0 = use global default) |
+| `max_budget_usd` | float | no | Max cost in USD per dispatch (0 = no limit) |
 | `permission_mode` | string | no | Permission mode (e.g. `default`, `plan`, `bypassPermissions`) |
 | `allowed_tools` | string | no | Comma-separated allowed tools (e.g. `"Bash,Read,Edit"`) |
 | `disallowed_tools` | string | no | Comma-separated disallowed tools |
@@ -293,6 +337,7 @@ Update an existing agent's configuration. Only non-empty fields are changed. Pas
 | `name` | string | yes | Agent name to update |
 | `description` | string | no | New description |
 | `timeout` | int | no | New timeout (0 = don't change) |
+| `max_budget_usd` | float | no | New budget limit (0 = don't change, negative = clear the limit) |
 | `model` | string | no | Model override. `"none"` to clear |
 | `permission_mode` | string | no | Permission mode. `"none"` to clear |
 | `allowed_tools` | string | no | Comma-separated. `"none"` to clear |
@@ -343,7 +388,7 @@ dispatch_status(job_id="8f3a...e1")
   -> {"id": "8f3a...e1", "status": "running", "started_at": 1730000123.4,
       "progress": ["Using tool: Bash", "Scanning container logs for OOM events..."], ...}
 
-// 3. or block until done (with a timeout cap)
+// 3. or block until done (timeout_seconds default: 60, capped at 3600)
 dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
   -> {"id": "8f3a...e1", "status": "done", "result": {"agent": "infra", "success": true, ...}}
 
@@ -357,21 +402,13 @@ Async workers run with streaming under the hood: the job file keeps a rolling ta
 
 `dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
 
-Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server marks jobs abandoned in `running` by a prior crashed instance as `failed`.
+Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server marks jobs left in `running` by a crashed instance as `failed` once they are stale (stuck for over an hour).
 
 | When to use async | When to use `dispatch` |
 |-------------------|------------------------|
 | Long task (minutes) — you want to keep working | Short task — you need the answer right now |
 | Several long tasks you'll collect later | Several short tasks → `dispatch_parallel` |
 | Don't care about caching (each call is a fresh job) | Cached by default — identical requests are free |
-
-### Error Responses
-
-All tools return errors as:
-
-```json
-{"error": "Unknown agent: 'foo'. Available: infra, db, monitoring"}
-```
 
 ## Which Tool to Use
 
@@ -388,6 +425,29 @@ All tools return errors as:
 | Known-long task, one-off | any dispatch tool with `timeout_seconds=...` |
 | A dispatch timed out | `dispatch_session` with the `session_id` from the error |
 
+## Error Recovery
+
+Failures are deterministic: check `success`, then branch on `error_type`.
+
+| `error_type` | Meaning | Recovery |
+|--------------|---------|----------|
+| `permission` | A tool call was denied | `update_agent(name, allowed_tools="Bash,Read")` (least privilege) or `update_agent(name, permission_mode="bypassPermissions")`, then re-dispatch. The `error` text includes a hint with the exact fix. |
+| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=`, or use `dispatch_async`. |
+| `not_found` | Agent directory or `claude` CLI missing | `list_agents()` → check `healthy`. Re-add the agent with an existing path, or run `agent-dispatch doctor` to find what's missing. |
+| `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
+| `cli_error` | Anything else from the `claude` subprocess | Read the `error` text; run `agent-dispatch doctor` for environment issues; retry once if transient. |
+
+Two soft signals that arrive with `success: true`:
+
+- **`denied_tools` + `hint`** — the agent finished but some tool calls were blocked; the result may be incomplete. Grant access (see the `permission` row) and re-dispatch.
+- **`parsed_result: null` with `response_format="json"`** — the reply wasn't valid JSON; the raw text is still in `result`. Caveat: an agent that *can't* comply returns `{"error": "<reason>"}` — which parses successfully — so also check `parsed_result` for an `"error"` key.
+
+Tool-level errors (unknown agent, malformed input) return a plain envelope instead of a `DispatchResult`:
+
+```json
+{"error": "Unknown agent: 'foo'. Available: infra, db, monitoring"}
+```
+
 ## Configuration
 
 Config at `~/.config/agent-dispatch/agents.yaml` (override: `AGENT_DISPATCH_CONFIG` env var):
@@ -400,7 +460,7 @@ agents:
     timeout: 300            # seconds, default: 300
     # model: sonnet         # optional model override
     # max_budget_usd: 1.0   # cost limit per dispatch
-    # permission_mode: auto # permission mode for the agent
+    # permission_mode: bypassPermissions  # one of: default | plan | bypassPermissions
     # allowed_tools:        # restrict which tools the agent can use
     #   - Read
     #   - Grep
@@ -485,7 +545,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 ## Requirements
 
 - Python >= 3.10
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed, authenticated, and on `PATH` (verify: `claude --version`)
 
 ## License
 
