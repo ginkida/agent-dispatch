@@ -1126,3 +1126,163 @@ class TestStructuredResponse:
         assert _parse_structured_response("") is None
         assert _parse_structured_response("not json at all") is None
         assert _parse_structured_response("```python\nprint(1)\n```") is None
+
+
+class TestBudget:
+    """_apply_budget: post-hoc flagging when cost_usd exceeds the budget."""
+
+    def setup_method(self):
+        self.settings = Settings()
+
+    def _result(self, cost: float | None, success: bool = True, hint: str | None = None):
+        from agent_dispatch.models import DispatchResult
+        return DispatchResult(
+            agent="a", success=success, result="x", cost_usd=cost, hint=hint,
+        )
+
+    def _agent(self, budget: float | None = None) -> AgentConfig:
+        return AgentConfig(directory="/tmp", description="t", max_budget_usd=budget)
+
+    def test_exceeded_sets_flag_and_hint(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(self._result(0.05), self._agent(0.01), self.settings)
+        assert result.budget_exceeded is True
+        assert "exceeded" in result.hint
+        assert "$0.0500" in result.hint
+        assert "$0.01" in result.hint
+
+    def test_within_budget_untouched(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(self._result(0.005), self._agent(0.01), self.settings)
+        assert result.budget_exceeded is None
+        assert result.hint is None
+
+    def test_no_budget_configured(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(self._result(99.0), self._agent(None), self.settings)
+        assert result.budget_exceeded is None
+
+    def test_no_cost_untouched(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(self._result(None), self._agent(0.01), self.settings)
+        assert result.budget_exceeded is None
+
+    def test_settings_default_fallback(self):
+        from agent_dispatch.runner import _apply_budget
+        settings = Settings(default_max_budget_usd=0.01)
+        result = _apply_budget(self._result(0.05), self._agent(None), settings)
+        assert result.budget_exceeded is True
+
+    def test_agent_budget_overrides_settings_default(self):
+        from agent_dispatch.runner import _apply_budget
+        settings = Settings(default_max_budget_usd=0.001)
+        result = _apply_budget(self._result(0.5), self._agent(1.0), settings)
+        assert result.budget_exceeded is None
+
+    def test_hint_appended_to_existing(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(
+            self._result(0.05, hint="tools were denied."),
+            self._agent(0.01),
+            self.settings,
+        )
+        assert result.hint.startswith("tools were denied.")
+        assert "exceeded" in result.hint
+
+    def test_applies_to_failed_result_too(self):
+        from agent_dispatch.runner import _apply_budget
+        result = _apply_budget(
+            self._result(0.05, success=False), self._agent(0.01), self.settings,
+        )
+        assert result.budget_exceeded is True
+        # success is NOT flipped — the flag is advisory
+        assert result.success is False
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_flags_over_budget(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": "done",
+                "session_id": "s1",
+                "total_cost_usd": 0.50,
+                "is_error": False,
+            }),
+            stderr="",
+        )
+        agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
+        result = dispatch("test", "task", agent, Settings())
+        assert result.success
+        assert result.budget_exceeded is True
+        assert "exceeded" in result.hint
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_within_budget_no_flag(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "result": "done",
+                "session_id": "s1",
+                "total_cost_usd": 0.05,
+                "is_error": False,
+            }),
+            stderr="",
+        )
+        agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
+        result = dispatch("test", "task", agent, Settings())
+        assert result.success
+        assert result.budget_exceeded is None
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_flags_over_budget(self, mock_popen, _which):
+        result_line = json.dumps({
+            "type": "result",
+            "result": "done",
+            "session_id": "s1",
+            "total_cost_usd": 0.50,
+            "is_error": False,
+        })
+        mock_popen.return_value = _FakePopen([result_line])
+        agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
+        result = dispatch_stream("test", "task", agent, Settings())
+        assert result.success
+        assert result.budget_exceeded is True
+
+
+class TestOnProc:
+    """dispatch_stream exposes its Popen handle via the on_proc callback."""
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_on_proc_receives_popen_handle(self, mock_popen, _which):
+        result_line = json.dumps({
+            "type": "result", "result": "ok", "session_id": "s", "is_error": False,
+        })
+        fake = _FakePopen([result_line])
+        mock_popen.return_value = fake
+        seen: list = []
+        result = dispatch_stream(
+            "test", "task",
+            AgentConfig(directory="/tmp", description="t"),
+            Settings(),
+            on_proc=seen.append,
+        )
+        assert result.success
+        assert seen == [fake]
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_no_on_proc_is_fine(self, mock_popen, _which):
+        result_line = json.dumps({
+            "type": "result", "result": "ok", "session_id": "s", "is_error": False,
+        })
+        mock_popen.return_value = _FakePopen([result_line])
+        result = dispatch_stream(
+            "test", "task", AgentConfig(directory="/tmp", description="t"), Settings(),
+        )
+        assert result.success

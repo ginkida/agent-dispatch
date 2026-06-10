@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-10
+
+Job control release: running jobs become cancellable, the budget field stops
+being decorative, and async jobs get a CLI.
+
+### Added
+- **Cancel running jobs.** `dispatch_cancel(job_id)` now kills a *running*
+  job's `claude` subprocess when the job was started by the same server
+  instance (in-memory process registry — no PID files, no risk of killing an
+  unrelated process after a restart). The job is marked `cancelled` *before*
+  the kill, and `JobStore.finish`/`fail` now refuse already-terminal jobs, so
+  the worker's trailing write can't resurrect it. New outcome:
+  `cancelled_running`. Jobs from a previous server run still report
+  `running` (cannot be killed safely).
+- **Budget visibility (post-hoc).** `max_budget_usd` was stored and displayed
+  but never checked. A dispatch whose `cost_usd` exceeds the agent's
+  `max_budget_usd` (or `settings.default_max_budget_usd`) now returns
+  `budget_exceeded: true` plus a `hint`. The dispatch is *not* failed — the
+  `claude` CLI has no spend cap, so by the time the cost is known the money is
+  spent; the flag makes runaway agents visible instead of silent.
+- **CLI for async jobs.** New commands: `agent-dispatch jobs [--status
+  --limit]` (list), `agent-dispatch job <id>` (detail with progress tail and
+  result preview), `agent-dispatch cancel <id>` (pending jobs; running jobs
+  belong to the MCP server process), `agent-dispatch gc [--days]` (purge old
+  terminal jobs).
+- **PyPI discoverability:** expanded package keywords (5 → 12).
+
+### Changed
+- `runner.dispatch_stream` accepts an `on_proc` callback (receives the Popen
+  handle right after spawn) — used by the async worker to register the
+  process for cancellation.
+- `JobStore.cancel` accepts `force=True` to cancel running jobs (callers must
+  kill the subprocess themselves); `finish`/`fail` return `None` for terminal
+  jobs instead of overwriting them.
+
 ## [0.6.0] - 2026-06-04
 
 Reliability release: timeouts stop being fatal, permission-blocked "successes"

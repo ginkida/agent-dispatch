@@ -12,7 +12,7 @@ MCP server + CLI that lets Claude Code agents delegate tasks to agents in other 
 |------|------|
 | `src/agent_dispatch/runner.py` | Sync subprocess wrapper around `claude -p` — the actual work |
 | `src/agent_dispatch/server.py` | Async FastMCP interface (19 MCP tools), wraps runner in `asyncio.to_thread` + semaphore |
-| `src/agent_dispatch/cli.py` | Click CLI: `init`, `add`, `update`, `remove`, `list`, `describe`, `test`, `doctor`, `serve` |
+| `src/agent_dispatch/cli.py` | Click CLI: `init`, `add`, `update`, `remove`, `list`, `describe`, `test`, `doctor`, `jobs`, `job`, `cancel`, `gc`, `serve` |
 | `src/agent_dispatch/models.py` | Pydantic v2 models (`AgentConfig`, `Settings`, `DispatchResult`) |
 | `src/agent_dispatch/config.py` | YAML config load/save + project auto-description |
 | `src/agent_dispatch/cache.py` | Thread-safe in-memory TTL cache |
@@ -28,7 +28,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 382 tests, ~2s — all subprocess calls are mocked
+python3 -m pytest tests/ -v   # 420 tests, ~2s — all subprocess calls are mocked
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`.
@@ -40,6 +40,9 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - On failure, callers read `DispatchResult.error` + `error_type` — `result` holds the raw agent output even on errors.
 - `--session-id` and `--resume` conflict — never pass both to `claude`.
 - Valid permission modes: `default`, `plan`, `bypassPermissions` (`models.py: KNOWN_PERMISSION_MODES`).
+- `JobStore.finish`/`fail` refuse already-terminal jobs (returns `None`) — this closes the race with force-cancel; never "fix" it by overwriting.
+- Cancelling a *running* job requires the in-memory `_running_procs` registry (server.py) — the job is marked `cancelled` **before** the subprocess is killed. Don't persist PIDs to disk (PID reuse after restart could kill an unrelated process).
+- `max_budget_usd` is **post-hoc**: `_apply_budget` (runner.py) sets `budget_exceeded` + `hint` after the cost is known; it never fails the dispatch.
 
 ## Conventions
 
@@ -51,4 +54,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 382 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 420 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

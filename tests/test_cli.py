@@ -783,3 +783,115 @@ class TestTestCommand:
         assert result.exit_code == 0
         assert "Note:" in result.output
         assert "denied" in result.output
+
+
+@pytest.fixture()
+def jobs_env(tmp_path: Path):
+    """Point job storage at a temp dir and return a JobStore on it."""
+    from agent_dispatch.jobs import JobStore
+
+    jobs_dir = tmp_path / "_jobs"
+    with patch.dict(os.environ, {"AGENT_DISPATCH_JOBS_DIR": str(jobs_dir)}):
+        yield JobStore(jobs_dir)
+
+
+class TestJobsCommands:
+    def test_jobs_empty(self, jobs_env):
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        assert "No jobs found" in result.output
+
+    def test_jobs_lists_recent(self, jobs_env):
+        job = jobs_env.create("infra", "check pods in the cluster")
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        assert job.id in result.output
+        assert "infra" in result.output
+        assert "check pods" in result.output
+
+    def test_jobs_status_filter(self, jobs_env):
+        pending = jobs_env.create("infra", "task one")
+        done = jobs_env.create("db", "task two")
+        jobs_env.mark_running(done.id)
+        jobs_env.finish(done.id, DispatchResult(agent="db", success=True, result="ok"))
+        result = runner.invoke(cli, ["jobs", "--status", "done"])
+        assert result.exit_code == 0
+        assert done.id in result.output
+        assert pending.id not in result.output
+
+    def test_job_show_detail(self, jobs_env):
+        job = jobs_env.create("infra", "inspect logs")
+        jobs_env.mark_running(job.id)
+        jobs_env.update_progress(job.id, ["reading logs", "found 3 errors"])
+        jobs_env.finish(
+            job.id,
+            DispatchResult(agent="infra", success=True, result="3 errors found", cost_usd=0.02),
+        )
+        result = runner.invoke(cli, ["job", job.id])
+        assert result.exit_code == 0
+        assert job.id in result.output
+        assert "3 errors found" in result.output
+        assert "$0.0200" in result.output
+        assert "found 3 errors" in result.output  # progress tail survives
+
+    def test_job_show_budget_exceeded(self, jobs_env):
+        job = jobs_env.create("infra", "expensive task")
+        jobs_env.mark_running(job.id)
+        jobs_env.finish(
+            job.id,
+            DispatchResult(
+                agent="infra", success=True, result="done",
+                cost_usd=5.0, budget_exceeded=True,
+            ),
+        )
+        result = runner.invoke(cli, ["job", job.id])
+        assert result.exit_code == 0
+        assert "EXCEEDED" in result.output
+
+    def test_job_show_invalid_id(self, jobs_env):
+        result = runner.invoke(cli, ["job", "../etc/passwd"])
+        assert result.exit_code == 1
+        assert "Invalid job id" in result.output
+
+    def test_job_show_not_found(self, jobs_env):
+        result = runner.invoke(cli, ["job", "f" * 32])
+        assert result.exit_code == 1
+        assert "not found" in result.output.lower()
+
+    def test_cancel_pending(self, jobs_env):
+        job = jobs_env.create("infra", "task")
+        result = runner.invoke(cli, ["cancel", job.id])
+        assert result.exit_code == 0
+        assert "Cancelled" in result.output
+        assert jobs_env.get(job.id).status == "cancelled"
+
+    def test_cancel_running_refused(self, jobs_env):
+        job = jobs_env.create("infra", "task")
+        jobs_env.mark_running(job.id)
+        result = runner.invoke(cli, ["cancel", job.id])
+        assert result.exit_code == 1
+        assert "dispatch_cancel" in result.output
+        assert jobs_env.get(job.id).status == "running"
+
+    def test_cancel_terminal_noop(self, jobs_env):
+        job = jobs_env.create("infra", "task")
+        jobs_env.mark_running(job.id)
+        jobs_env.finish(job.id, DispatchResult(agent="infra", success=True, result="ok"))
+        result = runner.invoke(cli, ["cancel", job.id])
+        assert result.exit_code == 0
+        assert "already done" in result.output
+
+    def test_gc_deletes_old_terminal(self, jobs_env):
+        import time as _time
+
+        job = jobs_env.create("infra", "old task")
+        jobs_env.mark_running(job.id)
+        jobs_env.finish(job.id, DispatchResult(agent="infra", success=True, result="ok"))
+        # Backdate completion far past the threshold
+        rec = jobs_env.get(job.id)
+        rec.completed_at = _time.time() - 100 * 86400
+        jobs_env._write(rec)
+        result = runner.invoke(cli, ["gc", "--days", "7"])
+        assert result.exit_code == 0
+        assert "Deleted 1 job(s)" in result.output
+        assert jobs_env.get(job.id) is None

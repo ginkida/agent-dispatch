@@ -9,9 +9,13 @@ from pydantic import BaseModel, Field, field_validator
 
 _AGENT_NAME_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$"
 
-KNOWN_PERMISSION_MODES = frozenset({
-    "default", "plan", "bypassPermissions",
-})
+KNOWN_PERMISSION_MODES = frozenset(
+    {
+        "default",
+        "plan",
+        "bypassPermissions",
+    }
+)
 
 
 def check_permission_mode(mode: str | None) -> str | None:
@@ -120,3 +124,7 @@ class DispatchResult(BaseModel):
     # Advisory, non-fatal guidance (e.g. "result may be incomplete, grant X").
     # Errors stay in `error`; hint is for successful-but-degraded results.
     hint: str | None = None
+    # True when cost_usd exceeded the agent's max_budget_usd (or the settings
+    # default). Post-hoc only — the money is already spent, the dispatch is
+    # NOT failed for it. None means: no budget configured, or within budget.
+    budget_exceeded: bool | None = None

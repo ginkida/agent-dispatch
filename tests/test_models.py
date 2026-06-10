@@ -178,3 +178,19 @@ class TestSettingsValidation:
         from agent_dispatch.models import CacheSettings
         with pytest.raises(ValidationError):
             CacheSettings(ttl=-1)
+
+
+class TestBudgetExceededField:
+    def test_default_none(self):
+        from agent_dispatch.models import DispatchResult
+
+        r = DispatchResult(agent="a", success=True, result="x")
+        assert r.budget_exceeded is None
+        # exclude_none keeps the wire format clean
+        assert "budget_exceeded" not in r.model_dump(exclude_none=True)
+
+    def test_set_true_serializes(self):
+        from agent_dispatch.models import DispatchResult
+
+        r = DispatchResult(agent="a", success=True, result="x", budget_exceeded=True)
+        assert r.model_dump(exclude_none=True)["budget_exceeded"] is True

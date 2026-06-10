@@ -138,6 +138,28 @@ def _denial_hint(agent_name: str, denied_tools: list[str]) -> str:
     )
 
 
+def _apply_budget(result: DispatchResult, agent: AgentConfig, settings: Settings) -> DispatchResult:
+    """Flag a result whose cost exceeded the configured budget (post-hoc).
+
+    ``claude -p`` has no spend-cap flag, so the budget cannot be enforced up
+    front — by the time the cost is known the money is already spent. The
+    result is therefore NOT failed; it gets ``budget_exceeded=True`` plus a
+    hint so callers notice runaway agents instead of the field being silently
+    ignored. Applied to error results too (a failed dispatch still costs).
+    """
+    budget = agent.max_budget_usd or settings.default_max_budget_usd
+    if not budget or not result.cost_usd or result.cost_usd <= budget:
+        return result
+    result.budget_exceeded = True
+    note = (
+        f"Cost ${result.cost_usd:.4f} exceeded the configured budget "
+        f"${budget:.2f} for this agent. Consider a cheaper model, a tighter "
+        f"task, or raising max_budget_usd."
+    )
+    result.hint = f"{result.hint} {note}" if result.hint else note
+    return result
+
+
 def _session_flag_unsupported(stderr_text: str) -> bool:
     """True when the installed claude CLI predates --session-id support.
 
@@ -150,8 +172,12 @@ def _session_flag_unsupported(stderr_text: str) -> bool:
         return False
     return any(
         marker in lower
-        for marker in ("unknown option", "unrecognized option", "unknown argument",
-                       "unexpected argument")
+        for marker in (
+            "unknown option",
+            "unrecognized option",
+            "unknown argument",
+            "unexpected argument",
+        )
     )
 
 
@@ -194,8 +220,7 @@ def _find_claude() -> str:
     path = shutil.which("claude")
     if path is None:
         raise FileNotFoundError(
-            "Claude CLI not found in PATH. "
-            "Install: https://docs.anthropic.com/en/docs/claude-code"
+            "Claude CLI not found in PATH. Install: https://docs.anthropic.com/en/docs/claude-code"
         )
     return path
 
@@ -261,15 +286,15 @@ def _build_command(
 
     # None = inherit from settings; [] = explicitly empty (no inheritance)
     allowed = (
-        agent.allowed_tools if agent.allowed_tools is not None
-        else settings.default_allowed_tools
+        agent.allowed_tools if agent.allowed_tools is not None else settings.default_allowed_tools
     )
     for tool in allowed:
         _reject_flaglike("allowed tool", tool)
         cmd.extend(["--allowedTools", tool])
 
     disallowed = (
-        agent.disallowed_tools if agent.disallowed_tools is not None
+        agent.disallowed_tools
+        if agent.disallowed_tools is not None
         else settings.default_disallowed_tools
     )
     for tool in disallowed:
@@ -340,7 +365,10 @@ def dispatch(
         _check_recursion(settings.max_dispatch_depth)
     except RecursionError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="recursion",
         )
 
@@ -348,7 +376,10 @@ def dispatch(
         claude_path = _find_claude()
     except FileNotFoundError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="not_found",
         )
 
@@ -370,12 +401,19 @@ def dispatch(
 
     try:
         cmd = _build_command(
-            claude_path, full_task, agent, settings, session_id,
+            claude_path,
+            full_task,
+            agent,
+            settings,
+            session_id,
             new_session_id=new_session,
         )
     except ArgInjectionError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="cli_error",
         )
     timeout = agent.timeout or settings.default_timeout
@@ -448,12 +486,12 @@ def dispatch(
         success = proc.returncode == 0
         text = proc.stdout.strip()
         if success:
-            parsed = (
-                _parse_structured_response(text)
-                if response_format == "json" else None
-            )
+            parsed = _parse_structured_response(text) if response_format == "json" else None
             return DispatchResult(
-                agent=agent_name, success=True, result=text, parsed_result=parsed,
+                agent=agent_name,
+                success=True,
+                result=text,
+                parsed_result=parsed,
                 session_id=session_uuid,
             )
         error_text = text or f"claude exited with code {proc.returncode} (non-JSON output)"
@@ -473,9 +511,13 @@ def dispatch(
     is_error = data.get("is_error", False)
     if is_error:
         raw_result = data.get("result", "")
-        error_text = str(raw_result) if raw_result else (
-            f"Agent '{agent_name}' reported an error with no details "
-            f"(exit code {proc.returncode})"
+        error_text = (
+            str(raw_result)
+            if raw_result
+            else (
+                f"Agent '{agent_name}' reported an error with no details "
+                f"(exit code {proc.returncode})"
+            )
         )
         error_type = _classify_error(error_text)
         if denied and error_type != "permission":
@@ -483,34 +525,42 @@ def dispatch(
             error_type = "permission"
         if error_type == "permission":
             error_text += _permission_hint(agent_name)
-        return DispatchResult(
-            agent=agent_name,
-            success=False,
-            result=str(raw_result) if raw_result else "",
-            session_id=data.get("session_id") or session_uuid,
-            cost_usd=data.get("total_cost_usd"),
-            duration_ms=data.get("duration_ms"),
-            num_turns=data.get("num_turns"),
-            error=error_text,
-            error_type=error_type,
-            denied_tools=denied,
+        return _apply_budget(
+            DispatchResult(
+                agent=agent_name,
+                success=False,
+                result=str(raw_result) if raw_result else "",
+                session_id=data.get("session_id") or session_uuid,
+                cost_usd=data.get("total_cost_usd"),
+                duration_ms=data.get("duration_ms"),
+                num_turns=data.get("num_turns"),
+                error=error_text,
+                error_type=error_type,
+                denied_tools=denied,
+            ),
+            agent,
+            settings,
         )
 
     result_text = data.get("result", "")
     parsed: object | None = None
     if response_format == "json":
         parsed = _parse_structured_response(result_text)
-    return DispatchResult(
-        agent=agent_name,
-        success=True,
-        result=result_text,
-        session_id=data.get("session_id") or session_uuid,
-        cost_usd=data.get("total_cost_usd"),
-        duration_ms=data.get("duration_ms"),
-        num_turns=data.get("num_turns"),
-        parsed_result=parsed,
-        denied_tools=denied,
-        hint=_denial_hint(agent_name, denied) if denied else None,
+    return _apply_budget(
+        DispatchResult(
+            agent=agent_name,
+            success=True,
+            result=result_text,
+            session_id=data.get("session_id") or session_uuid,
+            cost_usd=data.get("total_cost_usd"),
+            duration_ms=data.get("duration_ms"),
+            num_turns=data.get("num_turns"),
+            parsed_result=parsed,
+            denied_tools=denied,
+            hint=_denial_hint(agent_name, denied) if denied else None,
+        ),
+        agent,
+        settings,
     )
 
 
@@ -525,6 +575,7 @@ def dispatch_stream(
     caller: str | None = None,
     goal: str | None = None,
     response_format: str | None = None,
+    on_proc: Callable[[subprocess.Popen], None] | None = None,
     _use_session_flag: bool = True,
 ) -> DispatchResult:
     """Run a task via claude -p with streaming output and progress callbacks.
@@ -533,6 +584,10 @@ def dispatch_stream(
     agent works.  Each assistant message and tool-use event is forwarded to
     *on_progress* so callers can surface live updates.
 
+    *on_proc* is called with the Popen handle right after spawn — callers use
+    it to register the process for external cancellation (it may be called a
+    second time if the old-CLI retry respawns).
+
     ``_use_session_flag`` is internal: set to False on the one-shot retry when
     the installed claude CLI rejects ``--session-id`` (old version).
     """
@@ -540,7 +595,10 @@ def dispatch_stream(
         _check_recursion(settings.max_dispatch_depth)
     except RecursionError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="recursion",
         )
 
@@ -548,7 +606,10 @@ def dispatch_stream(
         claude_path = _find_claude()
     except FileNotFoundError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="not_found",
         )
 
@@ -568,11 +629,18 @@ def dispatch_stream(
 
     try:
         cmd = _build_command(
-            claude_path, full_task, agent, settings, new_session_id=new_session,
+            claude_path,
+            full_task,
+            agent,
+            settings,
+            new_session_id=new_session,
         )
     except ArgInjectionError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="cli_error",
         )
     # Switch from json to stream-json. Current claude CLIs refuse
@@ -599,19 +667,31 @@ def dispatch_stream(
         )
     except FileNotFoundError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="not_found",
         )
     except PermissionError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="permission",
         )
     except OSError as e:
         return DispatchResult(
-            agent=agent_name, success=False, result="", error=str(e),
+            agent=agent_name,
+            success=False,
+            result="",
+            error=str(e),
             error_type="cli_error",
         )
+
+    if on_proc is not None:
+        on_proc(proc)
 
     # Kill the process if it exceeds the timeout
     timed_out = threading.Event()
@@ -670,42 +750,49 @@ def dispatch_stream(
         is_error = result_data.get("is_error", False)
         if is_error:
             raw_result = result_data.get("result", "")
-            error_text = str(raw_result) if raw_result else (
-                f"Agent '{agent_name}' reported an error with no details"
+            error_text = (
+                str(raw_result)
+                if raw_result
+                else (f"Agent '{agent_name}' reported an error with no details")
             )
             error_type = _classify_error(error_text)
             if denied and error_type != "permission":
                 error_type = "permission"
             if error_type == "permission":
                 error_text += _permission_hint(agent_name)
-            return DispatchResult(
+            return _apply_budget(
+                DispatchResult(
+                    agent=agent_name,
+                    success=False,
+                    result=str(raw_result) if raw_result else "",
+                    session_id=result_data.get("session_id") or new_session,
+                    cost_usd=result_data.get("total_cost_usd"),
+                    duration_ms=result_data.get("duration_ms"),
+                    num_turns=result_data.get("num_turns"),
+                    error=error_text,
+                    error_type=error_type,
+                    denied_tools=denied,
+                ),
+                agent,
+                settings,
+            )
+        result_text = result_data.get("result", "")
+        parsed = _parse_structured_response(result_text) if response_format == "json" else None
+        return _apply_budget(
+            DispatchResult(
                 agent=agent_name,
-                success=False,
-                result=str(raw_result) if raw_result else "",
+                success=True,
+                result=result_text,
                 session_id=result_data.get("session_id") or new_session,
                 cost_usd=result_data.get("total_cost_usd"),
                 duration_ms=result_data.get("duration_ms"),
                 num_turns=result_data.get("num_turns"),
-                error=error_text,
-                error_type=error_type,
+                parsed_result=parsed,
                 denied_tools=denied,
-            )
-        result_text = result_data.get("result", "")
-        parsed = (
-            _parse_structured_response(result_text)
-            if response_format == "json" else None
-        )
-        return DispatchResult(
-            agent=agent_name,
-            success=True,
-            result=result_text,
-            session_id=result_data.get("session_id") or new_session,
-            cost_usd=result_data.get("total_cost_usd"),
-            duration_ms=result_data.get("duration_ms"),
-            num_turns=result_data.get("num_turns"),
-            parsed_result=parsed,
-            denied_tools=denied,
-            hint=_denial_hint(agent_name, denied) if denied else None,
+                hint=_denial_hint(agent_name, denied) if denied else None,
+            ),
+            agent,
+            settings,
         )
 
     # Fallback: no result line received
@@ -719,8 +806,16 @@ def dispatch_stream(
             "without it (timed-out dispatches will not be resumable)"
         )
         return dispatch_stream(
-            agent_name, task, agent, settings, context, on_progress,
-            caller=caller, goal=goal, response_format=response_format,
+            agent_name,
+            task,
+            agent,
+            settings,
+            context,
+            on_progress,
+            caller=caller,
+            goal=goal,
+            response_format=response_format,
+            on_proc=on_proc,
             _use_session_flag=False,
         )
     error_text = stderr.strip() or f"No result received (exit code {proc.returncode})"

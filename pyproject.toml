@@ -1,12 +1,25 @@
 [project]
 name = "agent-dispatch"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP server that lets Claude Code agents delegate tasks to agents in other project directories"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "ginkida" }]
-keywords = ["mcp", "claude", "agent", "dispatch", "multi-agent"]
+keywords = [
+    "mcp",
+    "mcp-server",
+    "claude",
+    "claude-code",
+    "agent",
+    "ai-agents",
+    "subagents",
+    "multi-agent",
+    "agent-orchestration",
+    "dispatch",
+    "delegation",
+    "anthropic",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

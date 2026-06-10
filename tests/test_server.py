@@ -29,6 +29,7 @@ def _reset_globals(tmp_path: Path, monkeypatch):
     server._job_store = None
     server._job_semaphore = None
     server._job_semaphore_limit = 0
+    server._running_procs.clear()
     # Isolate job storage per test
     monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "_jobs"))
     yield
@@ -38,6 +39,7 @@ def _reset_globals(tmp_path: Path, monkeypatch):
     server._job_store = None
     server._job_semaphore = None
     server._job_semaphore_limit = 0
+    server._running_procs.clear()
 
 
 def _make_config(tmp_path: Path, cache_enabled: bool = True) -> DispatchConfig:
@@ -51,19 +53,24 @@ def _make_config(tmp_path: Path, cache_enabled: bool = True) -> DispatchConfig:
             "monitoring": AgentConfig(
                 directory=tmp_path / "monitoring", description="Monitoring agent"
             ),
-            "backend": AgentConfig(
-                directory=tmp_path / "backend", description="Backend agent"
-            ),
+            "backend": AgentConfig(directory=tmp_path / "backend", description="Backend agent"),
         },
         settings=Settings(cache=CacheSettings(enabled=cache_enabled, ttl=300)),
     )
 
 
 def _ok_dispatch_result(
-    agent: str, text: str = "ok", session_id: str | None = None,
+    agent: str,
+    text: str = "ok",
+    session_id: str | None = None,
 ) -> DispatchResult:
     return DispatchResult(
-        agent=agent, success=True, result=text, cost_usd=0.01, duration_ms=1000, num_turns=1,
+        agent=agent,
+        success=True,
+        result=text,
+        cost_usd=0.01,
+        duration_ms=1000,
+        num_turns=1,
         session_id=session_id,
     )
 
@@ -80,11 +87,13 @@ class TestDispatchParallel:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check pods"},
-                {"agent": "db", "task": "check migrations"},
-                {"agent": "monitoring", "task": "check alerts"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check pods"},
+                    {"agent": "db", "task": "check migrations"},
+                    {"agent": "monitoring", "task": "check alerts"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches)
             results = json.loads(raw)
 
@@ -146,7 +155,10 @@ class TestDispatchParallel:
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             if name == "db":
                 return DispatchResult(
-                    agent=name, success=False, result="", error="connection refused",
+                    agent=name,
+                    success=False,
+                    result="",
+                    error="connection refused",
                 )
             return _ok_dispatch_result(name)
 
@@ -154,10 +166,12 @@ class TestDispatchParallel:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check"},
-                {"agent": "db", "task": "check"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check"},
+                    {"agent": "db", "task": "check"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches)
             results = json.loads(raw)
 
@@ -178,10 +192,12 @@ class TestDispatchParallel:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check"},
-                {"agent": "db", "task": "check"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check"},
+                    {"agent": "db", "task": "check"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches)
             results = json.loads(raw)
 
@@ -298,10 +314,12 @@ class TestDispatchCaching:
             assert call_count == 1
 
             # Parallel dispatch — infra should be cached, db should dispatch
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check pods"},
-                {"agent": "db", "task": "check pods"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check pods"},
+                    {"agent": "db", "task": "check pods"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches)
             results = json.loads(raw)
             assert call_count == 2  # only db dispatched
@@ -341,9 +359,7 @@ class TestDispatchSession:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            raw = await server.dispatch_session(
-                "infra", "follow up", session_id="sess-existing"
-            )
+            raw = await server.dispatch_session("infra", "follow up", session_id="sess-existing")
             result = json.loads(raw)
 
         assert result["success"]
@@ -362,9 +378,7 @@ class TestDispatchSession:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            await server.dispatch_session(
-                "infra", "check", caller="backend", goal="deploy"
-            )
+            await server.dispatch_session("infra", "check", caller="backend", goal="deploy")
 
         assert captured["caller"] == "backend"
         assert captured["goal"] == "deploy"
@@ -456,7 +470,8 @@ class TestDispatchDialogue:
                 return _ok_dispatch_result(name, "Staging cluster", session_id="sess-be")
             # Second responder turn: resolve
             return _ok_dispatch_result(
-                name, "Staging has 1 pending migration. Applied. [RESOLVED]",
+                name,
+                "Staging has 1 pending migration. Applied. [RESOLVED]",
                 session_id="sess-db",
             )
 
@@ -543,7 +558,6 @@ class TestDispatchDialogue:
         assert len(result["conversation"]) == 2  # responder + requester
         assert "confirmed" in result["final_answer"]
 
-
     @pytest.mark.asyncio
     async def test_dialogue_error_type_in_conversation(self, tmp_path: Path):
         config = _make_config(tmp_path)
@@ -551,7 +565,9 @@ class TestDispatchDialogue:
         def fake_dispatch(name, task, agent_config, settings, context=None, session_id=None, **kw):
             if name == "db":
                 return DispatchResult(
-                    agent=name, success=False, result="",
+                    agent=name,
+                    success=False,
+                    result="",
                     error="permission denied for tool Bash",
                     error_type="permission",
                 )
@@ -589,10 +605,12 @@ class TestAggregation:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check"},
-                {"agent": "db", "task": "check"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check"},
+                    {"agent": "db", "task": "check"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches, aggregate="monitoring")
             result = json.loads(raw)
 
@@ -658,9 +676,7 @@ class TestListAgentsPermissions:
         """allowed_tools=None (inherit) should NOT appear in response."""
         d = tmp_path / "proj"
         d.mkdir()
-        config = DispatchConfig(
-            agents={"proj": AgentConfig(directory=d, description="test")}
-        )
+        config = DispatchConfig(agents={"proj": AgentConfig(directory=d, description="test")})
         mock_ctx = AsyncMock()
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.list_agents(ctx=mock_ctx)
@@ -677,8 +693,10 @@ class TestListAgentsPermissions:
         config = DispatchConfig(
             agents={
                 "proj": AgentConfig(
-                    directory=d, description="test",
-                    allowed_tools=[], disallowed_tools=[],
+                    directory=d,
+                    description="test",
+                    allowed_tools=[],
+                    disallowed_tools=[],
                 ),
             }
         )
@@ -756,6 +774,7 @@ class TestAddRemoveAgent:
         import os
 
         from agent_dispatch.config import load_config
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -777,6 +796,7 @@ class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_add_agent_custom_description(self, tmp_path: Path):
         import os
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -794,6 +814,7 @@ class TestAddRemoveAgent:
         import os
 
         from agent_dispatch.config import load_config
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -801,7 +822,8 @@ class TestAddRemoveAgent:
             agent_dir.mkdir()
 
             raw = await server.add_agent(
-                "secured", str(agent_dir),
+                "secured",
+                str(agent_dir),
                 description="Secured agent",
                 permission_mode="bypassPermissions",
                 allowed_tools="Bash,Read,Edit",
@@ -835,6 +857,7 @@ class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_add_agent_duplicate(self, tmp_path: Path):
         import os
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -849,6 +872,7 @@ class TestAddRemoveAgent:
     @pytest.mark.asyncio
     async def test_remove_agent(self, tmp_path: Path):
         import os
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -879,6 +903,7 @@ class TestUpdateAgent:
         import os
 
         from agent_dispatch.config import load_config
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -909,18 +934,24 @@ class TestUpdateAgent:
         import os
 
         from agent_dispatch.config import load_config
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
             agent_dir = tmp_path / "proj"
             agent_dir.mkdir()
             await server.add_agent(
-                "proj", str(agent_dir), description="test",
-                permission_mode="bypassPermissions", allowed_tools="Bash",
+                "proj",
+                str(agent_dir),
+                description="test",
+                permission_mode="bypassPermissions",
+                allowed_tools="Bash",
             )
 
             raw = await server.update_agent(
-                "proj", permission_mode="none", allowed_tools="none",
+                "proj",
+                permission_mode="none",
+                allowed_tools="none",
             )
             result = json.loads(raw)
             assert result["updated"] == "proj"
@@ -953,6 +984,7 @@ class TestUpdateAgent:
         import os
 
         from agent_dispatch.config import load_config
+
         config_file = tmp_path / "agents.yaml"
         os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
         try:
@@ -998,6 +1030,7 @@ class TestConcurrencyLimit:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             import time
+
             time.sleep(0.05)  # simulate work
             return _ok_dispatch_result(name)
 
@@ -1006,12 +1039,14 @@ class TestConcurrencyLimit:
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
             patch("agent_dispatch.server.asyncio.to_thread", side_effect=tracked_to_thread),
         ):
-            dispatches = json.dumps([
-                {"agent": "infra", "task": "check"},
-                {"agent": "db", "task": "check"},
-                {"agent": "monitoring", "task": "check"},
-                {"agent": "backend", "task": "check"},
-            ])
+            dispatches = json.dumps(
+                [
+                    {"agent": "infra", "task": "check"},
+                    {"agent": "db", "task": "check"},
+                    {"agent": "monitoring", "task": "check"},
+                    {"agent": "backend", "task": "check"},
+                ]
+            )
             raw = await server.dispatch_parallel(dispatches)
             results = json.loads(raw)
 
@@ -1081,8 +1116,7 @@ class TestDispatchAsync:
     async def test_dispatch_async_returns_job_id(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             return _ok_dispatch_result(name, f"result-{name}")
 
         with (
@@ -1129,11 +1163,13 @@ class TestDispatchAsync:
         """A DispatchResult with success=False should land as status=failed."""
         config = _make_config(tmp_path)
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             return DispatchResult(
-                agent=name, success=False, result="",
-                error="permission denied", error_type="permission",
+                agent=name,
+                success=False,
+                result="",
+                error="permission denied",
+                error_type="permission",
             )
 
         with (
@@ -1153,8 +1189,7 @@ class TestDispatchStatusWait:
     async def test_dispatch_status_returns_job(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             return _ok_dispatch_result(name)
 
         with (
@@ -1185,9 +1220,9 @@ class TestDispatchStatusWait:
     async def test_dispatch_wait_returns_when_done(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def slow_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def slow_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             import time
+
             time.sleep(0.05)
             return _ok_dispatch_result(name)
 
@@ -1230,8 +1265,7 @@ class TestDispatchJobsList:
     async def test_dispatch_jobs_lists_and_filters(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             return _ok_dispatch_result(name)
 
         with (
@@ -1273,6 +1307,7 @@ class TestDispatchGC:
     @pytest.mark.asyncio
     async def test_dispatch_gc_purges_old(self, tmp_path: Path):
         import time as _time
+
         store = server._get_job_store()
         old = store.create("infra", "old")
         store.finish(old.id, DispatchResult(agent="infra", success=True, result=""))
@@ -1304,15 +1339,11 @@ class TestListAgentsEnriched:
     async def test_list_surfaces_mcp_stacks_dbs(self, tmp_path: Path):
         agent_dir = tmp_path / "infra"
         agent_dir.mkdir()
-        (agent_dir / ".mcp.json").write_text(
-            '{"mcpServers": {"portainer": {}, "postgres": {}}}'
-        )
+        (agent_dir / ".mcp.json").write_text('{"mcpServers": {"portainer": {}, "postgres": {}}}')
         (agent_dir / "pyproject.toml").write_text('description = "x"\n')
         (agent_dir / "Dockerfile").write_text("FROM python:3.11\n")
         (agent_dir / "alembic.ini").write_text("[alembic]\n")
-        config = DispatchConfig(
-            agents={"infra": AgentConfig(directory=agent_dir, description="d")}
-        )
+        config = DispatchConfig(agents={"infra": AgentConfig(directory=agent_dir, description="d")})
         mock_ctx = AsyncMock()
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.list_agents(ctx=mock_ctx)
@@ -1328,9 +1359,7 @@ class TestListAgentsEnriched:
         """Plain directory with no MCP/stack/DB markers should omit those keys."""
         agent_dir = tmp_path / "plain"
         agent_dir.mkdir()
-        config = DispatchConfig(
-            agents={"plain": AgentConfig(directory=agent_dir, description="d")}
-        )
+        config = DispatchConfig(agents={"plain": AgentConfig(directory=agent_dir, description="d")})
         mock_ctx = AsyncMock()
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.list_agents(ctx=mock_ctx)
@@ -1345,9 +1374,7 @@ class TestInspectAgent:
     async def test_inspect_returns_full_info(self, tmp_path: Path):
         agent_dir = tmp_path / "infra"
         agent_dir.mkdir()
-        (agent_dir / "CLAUDE.md").write_text(
-            "# Infra\nManages production infrastructure.\n"
-        )
+        (agent_dir / "CLAUDE.md").write_text("# Infra\nManages production infrastructure.\n")
         (agent_dir / "README.md").write_text("Infra README\n" * 50)
         (agent_dir / ".mcp.json").write_text('{"mcpServers": {"portainer": {}}}')
         (agent_dir / "pyproject.toml").write_text('description = "x"\n')
@@ -1355,7 +1382,9 @@ class TestInspectAgent:
         config = DispatchConfig(
             agents={
                 "infra": AgentConfig(
-                    directory=agent_dir, description="d", timeout=120,
+                    directory=agent_dir,
+                    description="d",
+                    timeout=120,
                     permission_mode="bypassPermissions",
                     allowed_tools=["Bash", "Read"],
                 ),
@@ -1382,9 +1411,7 @@ class TestInspectAgent:
         agent_dir = tmp_path / "p"
         agent_dir.mkdir()
         (agent_dir / "CLAUDE.md").write_text("content here\n")
-        config = DispatchConfig(
-            agents={"p": AgentConfig(directory=agent_dir, description="d")}
-        )
+        config = DispatchConfig(agents={"p": AgentConfig(directory=agent_dir, description="d")})
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.inspect_agent("p", preview_lines=0)
         info = json.loads(raw)
@@ -1402,9 +1429,7 @@ class TestInspectAgent:
     async def test_inspect_directory_missing(self, tmp_path: Path):
         # AgentConfig validates Path but doesn't require existence
         ghost = tmp_path / "ghost"
-        config = DispatchConfig(
-            agents={"ghost": AgentConfig(directory=ghost, description="d")}
-        )
+        config = DispatchConfig(agents={"ghost": AgentConfig(directory=ghost, description="d")})
         with patch.object(server, "_get_config", return_value=config):
             raw = await server.inspect_agent("ghost")
         info = json.loads(raw)
@@ -1417,9 +1442,7 @@ class TestInspectAgent:
     async def test_inspect_directory_unreadable(self, tmp_path: Path):
         agent_dir = tmp_path / "bad"
         agent_dir.mkdir()
-        config = DispatchConfig(
-            agents={"bad": AgentConfig(directory=agent_dir, description="d")}
-        )
+        config = DispatchConfig(agents={"bad": AgentConfig(directory=agent_dir, description="d")})
 
         original_is_dir = Path.is_dir
 
@@ -1452,7 +1475,9 @@ class TestStructuredResponseMCP:
             # what would happen if claude returned JSON and parsing succeeded.
             assert kw.get("response_format") == "json"
             return DispatchResult(
-                agent=name, success=True, result='{"k": "v"}',
+                agent=name,
+                success=True,
+                result='{"k": "v"}',
                 parsed_result={"k": "v"},
             )
 
@@ -1461,7 +1486,9 @@ class TestStructuredResponseMCP:
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
             raw = await server.dispatch(
-                "infra", "task", response_format="json",
+                "infra",
+                "task",
+                response_format="json",
             )
         data = json.loads(raw)
         assert data["success"]
@@ -1514,11 +1541,12 @@ class TestStructuredResponseMCP:
         config = _make_config(tmp_path)
         seen: list = []
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             seen.append(kw.get("response_format"))
             return DispatchResult(
-                agent=name, success=True, result='{"a": 1}',
+                agent=name,
+                success=True,
+                result='{"a": 1}',
                 parsed_result={"a": 1},
             )
 
@@ -1526,9 +1554,7 @@ class TestStructuredResponseMCP:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch_stream", side_effect=fake_dispatch),
         ):
-            raw = await server.dispatch_async(
-                "infra", "task", response_format="json"
-            )
+            raw = await server.dispatch_async("infra", "task", response_format="json")
             job_id = json.loads(raw)["job_id"]
             job = await _wait_terminal(job_id)
         assert seen == ["json"]
@@ -1548,10 +1574,14 @@ class TestStructuredResponseMCP:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            await server.dispatch_parallel(json.dumps([
-                {"agent": "infra", "task": "t1"},
-                {"agent": "db", "task": "t2", "response_format": "json"},
-            ]))
+            await server.dispatch_parallel(
+                json.dumps(
+                    [
+                        {"agent": "infra", "task": "t1"},
+                        {"agent": "db", "task": "t2", "response_format": "json"},
+                    ]
+                )
+            )
         assert ("infra", None) in seen
         assert ("db", "json") in seen
 
@@ -1569,8 +1599,13 @@ class TestReturnRef:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             return DispatchResult(
-                agent=name, success=True, result=big_text, cost_usd=0.05,
-                session_id="sid", duration_ms=2000, num_turns=3,
+                agent=name,
+                success=True,
+                result=big_text,
+                cost_usd=0.05,
+                session_id="sid",
+                duration_ms=2000,
+                num_turns=3,
             )
 
         with (
@@ -1578,7 +1613,10 @@ class TestReturnRef:
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
             raw = await server.dispatch(
-                "infra", "audit", return_ref=True, summary_chars=200,
+                "infra",
+                "audit",
+                return_ref=True,
+                summary_chars=200,
             )
         data = json.loads(raw)
         assert "ref" in data
@@ -1597,7 +1635,9 @@ class TestReturnRef:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             return DispatchResult(
-                agent=name, success=True, result='{"a": 1}',
+                agent=name,
+                success=True,
+                result='{"a": 1}',
                 parsed_result={"a": 1},
             )
 
@@ -1606,7 +1646,10 @@ class TestReturnRef:
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
             raw = await server.dispatch(
-                "infra", "task", response_format="json", return_ref=True,
+                "infra",
+                "task",
+                response_format="json",
+                return_ref=True,
             )
         data = json.loads(raw)
         assert data["parsed_result"] == {"a": 1}
@@ -1618,16 +1661,17 @@ class TestReturnRef:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             return DispatchResult(
-                agent=name, success=True, result=big_text, cost_usd=0.01,
+                agent=name,
+                success=True,
+                result=big_text,
+                cost_usd=0.01,
             )
 
         with (
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            ref_resp = json.loads(await server.dispatch(
-                "infra", "task", return_ref=True
-            ))
+            ref_resp = json.loads(await server.dispatch("infra", "task", return_ref=True))
             full_resp = json.loads(await server.fetch_result(ref_resp["ref"]))
         assert full_resp["result"] == big_text
         assert full_resp["cost_usd"] == 0.01
@@ -1645,9 +1689,7 @@ class TestReturnRef:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            ref_resp = json.loads(await server.dispatch(
-                "infra", "task", return_ref=True
-            ))
+            ref_resp = json.loads(await server.dispatch("infra", "task", return_ref=True))
             raw = await server.fetch_result(ref_resp["ref"], max_chars=100)
         data = json.loads(raw)
         assert data["truncated"] is True
@@ -1664,8 +1706,7 @@ class TestReturnRef:
         """fetch_result reuses JobStore — async job_ids are valid refs too."""
         config = _make_config(tmp_path)
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          on_progress=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             return _ok_dispatch_result(name, "async-result")
 
         with (
@@ -1688,10 +1729,14 @@ class TestReturnRef:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            raw = await server.dispatch_parallel(json.dumps([
-                {"agent": "infra", "task": "t1"},  # full result inline
-                {"agent": "db", "task": "t2", "return_ref": True, "summary_chars": 3},
-            ]))
+            raw = await server.dispatch_parallel(
+                json.dumps(
+                    [
+                        {"agent": "infra", "task": "t1"},  # full result inline
+                        {"agent": "db", "task": "t2", "return_ref": True, "summary_chars": 3},
+                    ]
+                )
+            )
         results = json.loads(raw)
         # First item: full DispatchResult shape
         assert results[0]["result"] == "big-infra"
@@ -1863,8 +1908,7 @@ class TestTimeoutOverride:
         config = _make_config(tmp_path)
         seen: dict = {}
 
-        def fake_dispatch(name, task, agent_config, settings, context=None,
-                          session_id=None, **kw):
+        def fake_dispatch(name, task, agent_config, settings, context=None, session_id=None, **kw):
             seen["timeout"] = agent_config.timeout
             return _ok_dispatch_result(name, session_id="s1")
 
@@ -1888,10 +1932,14 @@ class TestTimeoutOverride:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
         ):
-            await server.dispatch_parallel(json.dumps([
-                {"agent": "infra", "task": "t1", "timeout_seconds": 600},
-                {"agent": "db", "task": "t2"},
-            ]))
+            await server.dispatch_parallel(
+                json.dumps(
+                    [
+                        {"agent": "infra", "task": "t1", "timeout_seconds": 600},
+                        {"agent": "db", "task": "t2"},
+                    ]
+                )
+            )
         assert seen["infra"] == 600
         assert seen["db"] == 300
 
@@ -1900,8 +1948,7 @@ class TestTimeoutOverride:
         config = _make_config(tmp_path)
         seen: dict = {}
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             seen["timeout"] = agent_config.timeout
             return _ok_dispatch_result(name)
 
@@ -1926,8 +1973,11 @@ class TestDeniedToolsSurfacing:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             return DispatchResult(
-                agent=name, success=True, result="partial answer",
-                denied_tools=["Bash"], hint="grant Bash to get a complete answer",
+                agent=name,
+                success=True,
+                result="partial answer",
+                denied_tools=["Bash"],
+                hint="grant Bash to get a complete answer",
             )
 
         with (
@@ -1946,8 +1996,11 @@ class TestDeniedToolsSurfacing:
 
         def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
             return DispatchResult(
-                agent=name, success=True, result="X" * 5000,
-                denied_tools=["WebFetch"], hint="grant WebFetch",
+                agent=name,
+                success=True,
+                result="X" * 5000,
+                denied_tools=["WebFetch"],
+                hint="grant WebFetch",
             )
 
         with (
@@ -1971,8 +2024,7 @@ class TestAsyncJobProgress:
     async def test_progress_persisted_after_completion(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             for i in range(3):
                 on_progress(f"line {i}")
             return _ok_dispatch_result(name)
@@ -1991,8 +2043,7 @@ class TestAsyncJobProgress:
         config = _make_config(tmp_path)
         total = server._JOB_PROGRESS_MAX_LINES + 5
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             for i in range(total):
                 on_progress(f"line {i}")
             return _ok_dispatch_result(name)
@@ -2012,8 +2063,7 @@ class TestAsyncJobProgress:
         config = _make_config(tmp_path)
         release = threading.Event()
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             on_progress("Using tool: Bash")
             release.wait(timeout=5)
             return _ok_dispatch_result(name)
@@ -2064,8 +2114,7 @@ class TestAsyncJobProgress:
     async def test_progress_lines_truncated_to_300_chars(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             on_progress("X" * 1000)
             return _ok_dispatch_result(name)
 
@@ -2087,10 +2136,14 @@ class TestParallelNumericValidation:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch") as mock_dispatch,
         ):
-            raw = await server.dispatch_parallel(json.dumps([
-                {"agent": "infra", "task": "t1"},
-                {"agent": "db", "task": "t2", "timeout_seconds": "abc"},
-            ]))
+            raw = await server.dispatch_parallel(
+                json.dumps(
+                    [
+                        {"agent": "infra", "task": "t1"},
+                        {"agent": "db", "task": "t2", "timeout_seconds": "abc"},
+                    ]
+                )
+            )
         data = json.loads(raw)
         assert "timeout_seconds" in data["error"]
         mock_dispatch.assert_not_called()
@@ -2102,9 +2155,13 @@ class TestParallelNumericValidation:
             patch.object(server, "_get_config", return_value=config),
             patch("agent_dispatch.server.runner.dispatch") as mock_dispatch,
         ):
-            raw = await server.dispatch_parallel(json.dumps([
-                {"agent": "infra", "task": "t", "return_ref": True, "summary_chars": []},
-            ]))
+            raw = await server.dispatch_parallel(
+                json.dumps(
+                    [
+                        {"agent": "infra", "task": "t", "return_ref": True, "summary_chars": []},
+                    ]
+                )
+            )
         assert "summary_chars" in json.loads(raw)["error"]
         mock_dispatch.assert_not_called()
 
@@ -2152,8 +2209,7 @@ class TestStatusPostMortemProgress:
         """The documented post-mortem trace, asserted at the MCP tool level."""
         config = _make_config(tmp_path)
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             on_progress("Using tool: Grep")
             on_progress("Synthesizing answer")
             return _ok_dispatch_result(name)
@@ -2168,3 +2224,103 @@ class TestStatusPostMortemProgress:
             status = json.loads(await server.dispatch_status(job_id))
         assert status["status"] == "done"
         assert status["progress"] == ["Using tool: Grep", "Synthesizing answer"]
+
+
+class TestCancelRunningJob:
+    """dispatch_cancel kills a running job's subprocess when this server owns it."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_kills_running_subprocess(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        started = threading.Event()
+        release = threading.Event()
+        killed = threading.Event()
+
+        class FakeProc:
+            def kill(self):
+                killed.set()
+                release.set()  # the stream "dies" once killed
+
+        def fake_stream(
+            name, task, agent_config, settings, context=None, on_progress=None,
+            *, on_proc=None, **kw,
+        ):
+            if on_proc is not None:
+                on_proc(FakeProc())
+            started.set()
+            release.wait(timeout=2)
+            # what dispatch_stream returns after its subprocess was killed
+            return DispatchResult(
+                agent=name, success=False, result="",
+                error="No result received", error_type="cli_error",
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch_stream", side_effect=fake_stream),
+        ):
+            raw = await server.dispatch_async("infra", "long task")
+            job_id = json.loads(raw)["job_id"]
+            assert started.wait(timeout=2), "worker never started"
+
+            cancel_raw = await server.dispatch_cancel(job_id)
+            data = json.loads(cancel_raw)
+            assert data["outcome"] == "cancelled_running"
+            assert data["status"] == "cancelled"
+            assert "killed" in data["message"]
+            assert killed.is_set()
+
+            # Wait for the worker thread to fully unwind (registry cleanup),
+            # then confirm its trailing finish() did NOT overwrite the cancel.
+            for _ in range(200):
+                if job_id not in server._running_procs:
+                    break
+                await asyncio.sleep(0.01)
+            assert job_id not in server._running_procs
+            job = server._get_job_store().get(job_id)
+            assert job.status == "cancelled"
+            assert job.result is None
+
+    @pytest.mark.asyncio
+    async def test_registry_cleared_after_normal_completion(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        class FakeProc:
+            def kill(self):
+                pass
+
+        def fake_stream(
+            name, task, agent_config, settings, context=None, on_progress=None,
+            *, on_proc=None, **kw,
+        ):
+            if on_proc is not None:
+                on_proc(FakeProc())
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch_stream", side_effect=fake_stream),
+        ):
+            raw = await server.dispatch_async("infra", "task")
+            job_id = json.loads(raw)["job_id"]
+            job = await _wait_terminal(job_id)
+            assert job.status == "done"
+            for _ in range(200):
+                if job_id not in server._running_procs:
+                    break
+                await asyncio.sleep(0.01)
+            assert job_id not in server._running_procs
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_without_registered_proc_keeps_old_behavior(
+        self, tmp_path: Path,
+    ):
+        """A running job from another server instance cannot be killed."""
+        store = server._get_job_store()
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        raw = await server.dispatch_cancel(job.id)
+        data = json.loads(raw)
+        assert data["outcome"] == "running"
+        assert "not started by this server" in data["message"]
+        assert store.get(job.id).status == "running"

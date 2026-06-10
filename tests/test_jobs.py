@@ -379,3 +379,84 @@ class TestCreateCompleted:
         job = store.create_completed("infra", "task", result)
         assert job.status == "failed"
         assert job.error == "boom"
+
+
+class TestForceCancel:
+    def test_force_cancels_running_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        result, outcome = store.cancel(job.id, force=True)
+        assert outcome == "cancelled_running"
+        assert result.status == "cancelled"
+        assert result.completed_at is not None
+        assert "killed" in result.error
+        assert store.get(job.id).status == "cancelled"
+
+    def test_force_on_pending_is_plain_cancel(self, store: JobStore):
+        job = store.create("infra", "task")
+        result, outcome = store.cancel(job.id, force=True)
+        assert outcome == "cancelled"
+        assert result.status == "cancelled"
+
+    def test_force_on_terminal_is_noop(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        result, outcome = store.cancel(job.id, force=True)
+        assert outcome == "already_terminal"
+        assert result.status == "done"
+
+
+class TestTerminalProtection:
+    """finish/fail must not overwrite a terminal job (cancel race)."""
+
+    def test_finish_refuses_cancelled_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.cancel(job.id, force=True)
+        out = store.finish(
+            job.id, DispatchResult(agent="infra", success=True, result="late"),
+        )
+        assert out is None
+        reread = store.get(job.id)
+        assert reread.status == "cancelled"
+        assert reread.result is None  # the late result was discarded
+
+    def test_fail_refuses_cancelled_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.cancel(job.id, force=True)
+        assert store.fail(job.id, "late crash") is None
+        reread = store.get(job.id)
+        assert reread.status == "cancelled"
+        assert "killed" in reread.error  # cancel's error survives
+
+    def test_finish_refuses_done_job(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="first"))
+        out = store.finish(
+            job.id, DispatchResult(agent="infra", success=False, result="second"),
+        )
+        assert out is None
+        assert store.get(job.id).result.result == "first"
+
+    def test_fail_still_works_on_running(self, store: JobStore):
+        # recover_stale depends on fail() accepting running jobs
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        assert store.fail(job.id, "stale") is not None
+        assert store.get(job.id).status == "failed"
+
+
+class TestDefaultJobsDir:
+    def test_env_override(self, monkeypatch, tmp_path: Path):
+        from agent_dispatch.jobs import default_jobs_dir
+        monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "custom"))
+        assert default_jobs_dir() == tmp_path / "custom"
+
+    def test_defaults_next_to_config(self, monkeypatch, tmp_path: Path):
+        from agent_dispatch.jobs import default_jobs_dir
+        monkeypatch.delenv("AGENT_DISPATCH_JOBS_DIR", raising=False)
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "cfg" / "agents.yaml"))
+        assert default_jobs_dir() == tmp_path / "cfg" / "jobs"

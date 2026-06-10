@@ -1,4 +1,4 @@
-"""CLI: init, add, remove, list, update, test, describe, doctor, serve."""
+"""CLI: init, add, remove, list, update, test, describe, doctor, jobs, job, cancel, gc, serve."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import click
@@ -13,6 +14,7 @@ import yaml
 from pydantic import ValidationError
 
 from .config import auto_describe, config_path, load_config, save_config
+from .jobs import JobStore, default_jobs_dir, is_valid_job_id
 from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
 
 
@@ -21,15 +23,13 @@ def _load_or_exit() -> DispatchConfig:
     try:
         return load_config()
     except ValidationError as e:
-        click.echo(click.style(
-            f"Error: config at {config_path()} has an invalid schema:", fg="red"
-        ))
+        click.echo(
+            click.style(f"Error: config at {config_path()} has an invalid schema:", fg="red")
+        )
         click.echo(str(e))
         raise SystemExit(1) from None
     except yaml.YAMLError as e:
-        click.echo(click.style(
-            f"Error: config at {config_path()} is not valid YAML:", fg="red"
-        ))
+        click.echo(click.style(f"Error: config at {config_path()} is not valid YAML:", fg="red"))
         click.echo(str(e))
         raise SystemExit(1) from None
 
@@ -67,11 +67,13 @@ def init() -> None:
         )
         return
 
-    mcp_config = json.dumps({
-        "type": "stdio",
-        "command": agent_dispatch_cmd,
-        "args": ["serve"],
-    })
+    mcp_config = json.dumps(
+        {
+            "type": "stdio",
+            "command": agent_dispatch_cmd,
+            "args": ["serve"],
+        }
+    )
 
     result = subprocess.run(
         ["claude", "mcp", "add-json", "agent-dispatch", mcp_config, "--scope", "user"],
@@ -95,22 +97,27 @@ def init() -> None:
 @click.argument("name")
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, resolve_path=True))
 @click.option(
-    "-d", "--description", default=None,
+    "-d",
+    "--description",
+    default=None,
     help="Agent description. Auto-generated if omitted.",
 )
 @click.option("--timeout", default=300, help="Timeout in seconds (default: 300).")
 @click.option("--model", default=None, help="Model override for this agent.")
 @click.option("--max-budget", default=None, type=float, help="Max cost in USD per dispatch.")
 @click.option(
-    "--permission-mode", default=None,
+    "--permission-mode",
+    default=None,
     help="Permission mode for claude CLI (e.g. default, plan, bypassPermissions).",
 )
 @click.option(
-    "--allowed-tools", default=None,
+    "--allowed-tools",
+    default=None,
     help="Comma-separated list of allowed tools (e.g. Bash,Read,Edit).",
 )
 @click.option(
-    "--disallowed-tools", default=None,
+    "--disallowed-tools",
+    default=None,
     help="Comma-separated list of disallowed tools.",
 )
 def add(
@@ -150,9 +157,11 @@ def add(
         max_budget_usd=max_budget,
         permission_mode=permission_mode,
         allowed_tools=[t.strip() for t in allowed_tools.split(",") if t.strip()]
-        if allowed_tools else None,
+        if allowed_tools
+        else None,
         disallowed_tools=[t.strip() for t in disallowed_tools.split(",") if t.strip()]
-        if disallowed_tools else None,
+        if disallowed_tools
+        else None,
     )
     if warning := check_permission_mode(permission_mode):
         click.echo(click.style(f"Warning: {warning}", fg="yellow"))
@@ -222,15 +231,18 @@ def list_agents() -> None:
 @click.option("--model", default=None, help="Model override.")
 @click.option("--max-budget", default=None, type=float, help="Max cost in USD. Use 0 to clear.")
 @click.option(
-    "--permission-mode", default=None,
+    "--permission-mode",
+    default=None,
     help="Permission mode (default, plan, bypassPermissions). Use 'none' to clear.",
 )
 @click.option(
-    "--allowed-tools", default=None,
+    "--allowed-tools",
+    default=None,
     help="Comma-separated allowed tools. Use 'none' to clear.",
 )
 @click.option(
-    "--disallowed-tools", default=None,
+    "--disallowed-tools",
+    default=None,
     help="Comma-separated disallowed tools. Use 'none' to clear.",
 )
 @click.pass_context
@@ -283,9 +295,7 @@ def update(
         if disallowed_tools.strip().lower() in ("none", ""):
             agent.disallowed_tools = None
         else:
-            agent.disallowed_tools = [
-                t.strip() for t in disallowed_tools.split(",") if t.strip()
-            ]
+            agent.disallowed_tools = [t.strip() for t in disallowed_tools.split(",") if t.strip()]
         updated.append("disallowed_tools")
 
     if not updated:
@@ -300,11 +310,16 @@ def update(
 @click.argument("name")
 @click.argument("task", default="What project is this? Describe in one sentence.")
 @click.option(
-    "--stream", "stream", is_flag=True,
+    "--stream",
+    "stream",
+    is_flag=True,
     help="Show live progress (assistant text + tool use) while the agent works.",
 )
 @click.option(
-    "--timeout", "timeout", default=None, type=int,
+    "--timeout",
+    "timeout",
+    default=None,
+    type=int,
     help="One-off timeout override in seconds (does not change the agent config).",
 )
 def test(name: str, task: str, stream: bool, timeout: int | None) -> None:
@@ -328,10 +343,15 @@ def test(name: str, task: str, stream: bool, timeout: int | None) -> None:
             click.echo(click.style(f"  -> {msg}", fg="cyan"), err=True)
 
         result = dispatch_stream(
-            name, task, agent, config.settings, on_progress=_on_progress,
+            name,
+            task,
+            agent,
+            config.settings,
+            on_progress=_on_progress,
         )
     else:
         from .runner import dispatch
+
         result = dispatch(name, task, agent, config.settings)
 
     if result.success:
@@ -440,10 +460,7 @@ def doctor() -> None:
     if ad_path:
         ok(f"agent-dispatch CLI: {ad_path}")
     else:
-        warn(
-            "agent-dispatch not on PATH "
-            "(MCP server still works via absolute path)"
-        )
+        warn("agent-dispatch not on PATH (MCP server still works via absolute path)")
 
     section("Config")
     cp = config_path()
@@ -471,7 +488,9 @@ def doctor() -> None:
         try:
             result = subprocess.run(
                 [claude_path, "mcp", "list"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             # Match the server name at the start of any line — `claude mcp list`
             # prints `<name>: <command> - <status>`, and we want to avoid false
@@ -516,16 +535,160 @@ def doctor() -> None:
     else:
         parts: list[str] = []
         if issues:
-            parts.append(click.style(
-                f"{issues} issue{'s' if issues != 1 else ''}", fg="red",
-            ))
+            parts.append(
+                click.style(
+                    f"{issues} issue{'s' if issues != 1 else ''}",
+                    fg="red",
+                )
+            )
         if warnings:
-            parts.append(click.style(
-                f"{warnings} warning{'s' if warnings != 1 else ''}", fg="yellow",
-            ))
+            parts.append(
+                click.style(
+                    f"{warnings} warning{'s' if warnings != 1 else ''}",
+                    fg="yellow",
+                )
+            )
         click.echo(", ".join(parts))
         if issues > 0:
             raise SystemExit(1)
+
+
+_STATUS_COLORS = {
+    "pending": "cyan",
+    "running": "yellow",
+    "done": "green",
+    "failed": "red",
+    "cancelled": "magenta",
+}
+
+
+def _job_store() -> JobStore:
+    return JobStore(default_jobs_dir())
+
+
+def _age(ts: float) -> str:
+    """Compact human age like '3m' / '2h' / '5d' for a unix timestamp."""
+    delta = max(0, int(time.time() - ts))
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
+
+
+def _styled_status(status: str) -> str:
+    return click.style(status, fg=_STATUS_COLORS.get(status, "white"))
+
+
+@cli.command("jobs")
+@click.option(
+    "--status",
+    default=None,
+    type=click.Choice(["pending", "running", "done", "failed", "cancelled"]),
+    help="Filter by job status.",
+)
+@click.option("--limit", default=20, type=int, help="Max jobs shown (default: 20).")
+def jobs_list(status: str | None, limit: int) -> None:
+    """List async dispatch jobs (most recent first)."""
+    jobs = _job_store().list(status=status)[: max(1, limit)]  # type: ignore[arg-type]
+    if not jobs:
+        click.echo("No jobs found." if status is None else f"No {status} jobs found.")
+        return
+    for j in jobs:
+        task = j.task[:60].replace("\n", " ")
+        line = (
+            f"{j.id}  {_styled_status(j.status):<18}  "
+            f"{click.style(j.agent, bold=True):<20}  {_age(j.created_at):>4}  {task}"
+        )
+        click.echo(line)
+
+
+@cli.command("job")
+@click.argument("job_id")
+def job_show(job_id: str) -> None:
+    """Show one async job in detail (status, progress tail, result preview)."""
+    if not is_valid_job_id(job_id):
+        click.echo(click.style(f"Invalid job id: {job_id!r} (expected 32 hex chars)", fg="red"))
+        raise SystemExit(1)
+    job = _job_store().get(job_id)
+    if job is None:
+        click.echo(click.style(f"Job not found: {job_id}", fg="red"))
+        raise SystemExit(1)
+
+    click.echo(f"{click.style(job.id, bold=True)} [{_styled_status(job.status)}]")
+    click.echo(f"  agent:      {job.agent}")
+    click.echo(f"  task:       {job.task[:200]}")
+    click.echo(f"  created:    {_age(job.created_at)} ago")
+    if job.started_at:
+        click.echo(f"  started:    {_age(job.started_at)} ago")
+    if job.completed_at:
+        click.echo(f"  completed:  {_age(job.completed_at)} ago")
+    if job.error:
+        click.echo(f"  error:      {click.style(job.error[:300], fg='red')}")
+    if job.progress:
+        click.echo("  progress:")
+        for line in job.progress[-10:]:
+            click.echo(f"    {line}")
+    if job.result is not None:
+        click.echo(f"  success:    {job.result.success}")
+        if job.result.cost_usd is not None:
+            click.echo(f"  cost_usd:   ${job.result.cost_usd:.4f}")
+        if job.result.budget_exceeded:
+            click.echo(click.style("  budget:     EXCEEDED", fg="yellow"))
+        if job.result.result:
+            preview = job.result.result[:2000]
+            truncated = len(job.result.result) > 2000
+            click.echo("  result:")
+            for line in preview.splitlines():
+                click.echo(f"    {line}")
+            if truncated:
+                click.echo(
+                    click.style(
+                        f"    … truncated ({len(job.result.result)} chars total)",
+                        fg="cyan",
+                    )
+                )
+
+
+@cli.command("cancel")
+@click.argument("job_id")
+def job_cancel(job_id: str) -> None:
+    """Cancel a pending async job.
+
+    Running jobs cannot be cancelled from the CLI — their subprocess belongs
+    to the MCP server process. Use the dispatch_cancel MCP tool instead.
+    """
+    if not is_valid_job_id(job_id):
+        click.echo(click.style(f"Invalid job id: {job_id!r} (expected 32 hex chars)", fg="red"))
+        raise SystemExit(1)
+    job, outcome = _job_store().cancel(job_id)
+    if outcome == "not_found":
+        click.echo(click.style(f"Job not found: {job_id}", fg="red"))
+        raise SystemExit(1)
+    if outcome == "cancelled":
+        click.echo(f"Cancelled: {job_id}")
+    elif outcome == "running":
+        click.echo(
+            click.style(
+                "Job is running; its subprocess belongs to the MCP server process. "
+                "Cancel it via the dispatch_cancel MCP tool (same server), or wait.",
+                fg="yellow",
+            )
+        )
+        raise SystemExit(1)
+    else:  # already_terminal
+        status = job.status if job else "terminal"
+        click.echo(f"Job already {status}; nothing to cancel.")
+
+
+@cli.command("gc")
+@click.option("--days", default=7, type=int, help="Delete terminal jobs older than N days.")
+def jobs_gc(days: int) -> None:
+    """Purge old terminal async jobs (done/failed/cancelled)."""
+    deleted = _job_store().gc(max(0, days) * 86400)
+    click.echo(f"Deleted {deleted} job(s) older than {days} day(s).")
 
 
 @cli.command()

@@ -31,6 +31,16 @@ _TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "failed", "cancelled"})
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def default_jobs_dir() -> Path:
+    """Jobs directory: $AGENT_DISPATCH_JOBS_DIR override or <config dir>/jobs."""
+    override = os.environ.get("AGENT_DISPATCH_JOBS_DIR")
+    if override:
+        return Path(override)
+    from .config import config_path
+
+    return config_path().parent / "jobs"
+
+
 def is_valid_job_id(job_id: str) -> bool:
     """Return True if *job_id* is a well-formed uuid4 hex string."""
     return isinstance(job_id, str) and bool(_JOB_ID_RE.match(job_id))
@@ -215,14 +225,20 @@ class JobStore:
             self._write(job)
             return job
 
-    def cancel(self, job_id: str) -> tuple[Job | None, str]:
+    def cancel(self, job_id: str, *, force: bool = False) -> tuple[Job | None, str]:
         """Attempt to cancel a job.
 
-        Only *pending* jobs can be cancelled — a running job's subprocess is
-        already in flight and is left to finish. Returns ``(job, outcome)``
-        where outcome is one of: ``cancelled`` (was pending, now cancelled),
-        ``running`` (in flight, untouched), ``already_terminal`` (done/failed/
-        already cancelled), or ``not_found``.
+        By default only *pending* jobs can be cancelled — a running job's
+        subprocess is already in flight and is left to finish. With
+        ``force=True`` a *running* job is marked cancelled too: the caller
+        promises to kill its subprocess right after this returns (mark-first
+        ordering — ``finish``/``fail`` refuse terminal jobs, so the worker's
+        trailing write cannot overwrite the cancellation).
+
+        Returns ``(job, outcome)`` where outcome is one of: ``cancelled``
+        (was pending), ``cancelled_running`` (was running, force-cancelled),
+        ``running`` (in flight, untouched — force not requested), or
+        ``already_terminal`` / ``not_found``.
         """
         with self._lock:
             job = self.get(job_id)
@@ -231,7 +247,13 @@ class JobStore:
             if job.is_terminal():
                 return job, "already_terminal"
             if job.status == "running":
-                return job, "running"
+                if not force:
+                    return job, "running"
+                job.status = "cancelled"
+                job.completed_at = time.time()
+                job.error = "Cancelled while running — subprocess killed"
+                self._write(job)
+                return job, "cancelled_running"
             # pending -> cancelled
             job.status = "cancelled"
             job.completed_at = time.time()
@@ -255,11 +277,14 @@ class JobStore:
                 if age > stale_threshold_seconds:
                     # Count only jobs we actually transitioned (fail() returns
                     # None for a missing/malformed id, e.g. a planted file).
-                    if self.fail(
-                        job.id,
-                        f"Abandoned in 'running' for {age:.0f}s — likely a "
-                        "server restart. Re-dispatch if still needed.",
-                    ) is not None:
+                    if (
+                        self.fail(
+                            job.id,
+                            f"Abandoned in 'running' for {age:.0f}s — likely a "
+                            "server restart. Re-dispatch if still needed.",
+                        )
+                        is not None
+                    ):
                         recovered += 1
         return recovered
 
@@ -268,10 +293,15 @@ class JobStore:
         job_id: str,
         result: DispatchResult,
     ) -> Job | None:
-        """Mark job as done/failed based on result.success. Persist the result."""
+        """Mark job as done/failed based on result.success. Persist the result.
+
+        Refuses already-terminal jobs (returns None): a force-cancel can land
+        while the worker is still unwinding, and the worker's trailing
+        ``finish`` must not overwrite ``cancelled``.
+        """
         with self._lock:
             job = self.get(job_id)
-            if job is None:
+            if job is None or job.is_terminal():
                 return None
             job.status = "done" if result.success else "failed"
             job.completed_at = time.time()
@@ -282,10 +312,14 @@ class JobStore:
             return job
 
     def fail(self, job_id: str, error: str) -> Job | None:
-        """Mark job as failed with an error message (no DispatchResult)."""
+        """Mark job as failed with an error message (no DispatchResult).
+
+        Refuses already-terminal jobs (returns None) — same race as
+        ``finish``: a crashed worker's error must not overwrite a cancel.
+        """
         with self._lock:
             job = self.get(job_id)
-            if job is None:
+            if job is None or job.is_terminal():
                 return None
             job.status = "failed"
             job.completed_at = time.time()

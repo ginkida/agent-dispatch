@@ -396,7 +396,7 @@ dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
   -> {"id": "...", "status": "running", "timed_out_waiting": true}
 ```
 
-`dispatch_cancel(job_id)` cancels a job that is still **pending** (before its subprocess starts) — a running job is left to finish, since its `claude` subprocess can't be safely interrupted. The response carries an `outcome` of `cancelled`, `running`, `already_terminal`, or `not_found`.
+`dispatch_cancel(job_id)` cancels a **pending** job, and also kills a **running** job's `claude` subprocess when the job was started by the same server instance (the job is marked `cancelled` first, so the worker's trailing write can't undo it; partial work is lost but the progress tail is preserved). A running job started by a *previous* server run can't be killed safely and is left to finish. The response carries an `outcome` of `cancelled`, `cancelled_running`, `running` (not owned by this server), `already_terminal`, or `not_found`.
 
 Async workers run with streaming under the hood: the job file keeps a rolling tail (last 20 lines, ~1 write/sec) of assistant text and tool-use events. `dispatch_status` shows it as `progress` while the job runs and keeps it afterwards as a post-mortem trace; `dispatch_jobs` shows `last_progress` for running jobs.
 
@@ -437,10 +437,11 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 | `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
 | `cli_error` | Anything else from the `claude` subprocess | Read the `error` text; run `agent-dispatch doctor` for environment issues; retry once if transient. |
 
-Two soft signals that arrive with `success: true`:
+Three soft signals that arrive with `success: true`:
 
 - **`denied_tools` + `hint`** — the agent finished but some tool calls were blocked; the result may be incomplete. Grant access (see the `permission` row) and re-dispatch.
 - **`parsed_result: null` with `response_format="json"`** — the reply wasn't valid JSON; the raw text is still in `result`. Caveat: an agent that *can't* comply returns `{"error": "<reason>"}` — which parses successfully — so also check `parsed_result` for an `"error"` key.
+- **`budget_exceeded: true`** — `cost_usd` exceeded the agent's `max_budget_usd` (or the settings default). The dispatch is not failed — the money is already spent — but a runaway agent is now visible. Tighten the task, pick a cheaper model, or raise the budget.
 
 Tool-level errors (unknown agent, malformed input) return a plain envelope instead of a `DispatchResult`:
 
@@ -521,7 +522,7 @@ agent-dispatch MCP server
 - **Argument-injection guard** — structured CLI fields (`session_id`, `model`, `permission_mode`, tool names) that start with `-` are rejected so they can't smuggle extra `claude` flags.
 - **Path-traversal guard** — caller-supplied `job_id`/`ref` values are validated as 32-char hex before any filesystem access.
 - **Owner-only state** — job files (`0o600`) and `agents.yaml` (`0o600`) are written for the owner only; their directories are `0o700`.
-- **Cost control** — `max_budget_usd` per agent or globally.
+- **Cost visibility** — `max_budget_usd` per agent or globally; a dispatch whose cost exceeds it returns `budget_exceeded: true` + a hint (post-hoc — the `claude` CLI has no spend cap, so the overage can be flagged but not prevented).
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). Orphaned processes are cleaned up.
 - **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only successes are cached. Sessions and dialogues are never cached.
@@ -540,6 +541,10 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
 | `agent-dispatch doctor` | Diagnose installation: claude CLI, MCP registration, agent health |
+| `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
+| `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
+| `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |
+| `agent-dispatch gc [--days]` | Purge terminal jobs older than N days (default 7) |
 | `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
 
 ## Requirements
