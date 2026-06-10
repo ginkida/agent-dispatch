@@ -36,7 +36,7 @@ settings:
   default_timeout: 300
   max_dispatch_depth: 3           # recursion protection: A -> B -> A
   max_concurrency: 5              # max parallel claude -p processes
-  # default_max_budget_usd: 1.0   # cost limit per dispatch (all agents)
+  # default_max_budget_usd: 1.0   # flags results over this cost (budget_exceeded + hint; post-hoc, can't prevent the spend)
   # default_permission_mode: bypassPermissions  # inherited by agents without override
   # default_allowed_tools:         # inherited by agents without override
   #   - Bash
