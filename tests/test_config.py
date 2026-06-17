@@ -48,9 +48,39 @@ def test_save_and_load_roundtrip(tmp_path: Path):
     assert loaded.agents["demo"].timeout == 60
 
 
+def test_save_config_omits_empty_capabilities(tmp_path: Path):
+    """Agents without capabilities must not gain empty-list keys in YAML, but
+    declared capabilities must survive the roundtrip."""
+    f = tmp_path / "test.yaml"
+    config = DispatchConfig(
+        agents={
+            "plain": AgentConfig(directory="/tmp", description="No caps"),
+            "withcaps": AgentConfig(
+                directory="/tmp",
+                description="Has caps",
+                capabilities=["docker_logs"],
+                risky_capabilities=["restart_services"],
+            ),
+        }
+    )
+    save_config(config, f)
+
+    text = f.read_text()
+    plain_block = text.split("withcaps")[0]
+    assert "capabilities" not in plain_block
+    assert "risky_capabilities" not in plain_block
+
+    loaded = load_config(f)
+    assert loaded.agents["plain"].capabilities == []
+    assert loaded.agents["plain"].risky_capabilities == []
+    assert loaded.agents["withcaps"].capabilities == ["docker_logs"]
+    assert loaded.agents["withcaps"].risky_capabilities == ["restart_services"]
+
+
 def test_save_and_load_settings_roundtrip(tmp_path: Path):
     """Verify max_concurrency + cache settings survive YAML roundtrip."""
     from agent_dispatch.models import CacheSettings
+
     f = tmp_path / "test.yaml"
     config = DispatchConfig(
         settings=Settings(max_concurrency=3, cache=CacheSettings(enabled=False, ttl=120)),

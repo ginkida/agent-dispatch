@@ -22,6 +22,7 @@ def _isolated_config(tmp_path: Path):
     with patch.dict(os.environ, {"AGENT_DISPATCH_CONFIG": str(config_file)}):
         yield config_file
 
+
 runner = CliRunner()
 
 
@@ -36,12 +37,20 @@ class TestAdd:
     def test_add_with_permissions(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        result = runner.invoke(cli, [
-            "add", "proj", str(agent_dir),
-            "-d", "Test",
-            "--permission-mode", "bypassPermissions",
-            "--allowed-tools", "Bash,Read",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--permission-mode",
+                "bypassPermissions",
+                "--allowed-tools",
+                "Bash,Read",
+            ],
+        )
         assert result.exit_code == 0
         config = load_config()
         assert config.agents["proj"].permission_mode == "bypassPermissions"
@@ -50,12 +59,43 @@ class TestAdd:
     def test_add_with_max_budget(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        result = runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test", "--max-budget", "1.5",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--max-budget",
+                "1.5",
+            ],
+        )
         assert result.exit_code == 0
         config = load_config()
         assert config.agents["proj"].max_budget_usd == 1.5
+
+    def test_add_with_capabilities(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--capabilities",
+                "docker_logs,deploy_debug",
+                "--risky-capabilities",
+                "restart_services",
+            ],
+        )
+        assert result.exit_code == 0
+        config = load_config()
+        assert config.agents["proj"].capabilities == ["docker_logs", "deploy_debug"]
+        assert config.agents["proj"].risky_capabilities == ["restart_services"]
 
     def test_add_invalid_name(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
@@ -82,10 +122,18 @@ class TestAdd:
     def test_add_unknown_permission_mode_warns(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        result = runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--permission-mode", "typoMode",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--permission-mode",
+                "typoMode",
+            ],
+        )
         assert result.exit_code == 0
         assert "Warning" in result.output
         assert "Unknown" in result.output
@@ -124,10 +172,22 @@ class TestList:
     def test_list_shows_extras(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--timeout", "600", "--model", "sonnet", "--max-budget", "2.0",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--timeout",
+                "600",
+                "--model",
+                "sonnet",
+                "--max-budget",
+                "2.0",
+            ],
+        )
         result = runner.invoke(cli, ["list"])
         assert "timeout=600s" in result.output
         assert "model=sonnet" in result.output
@@ -136,14 +196,44 @@ class TestList:
     def test_list_shows_permissions(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--permission-mode", "bypassPermissions",
-            "--allowed-tools", "Bash,Read",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--permission-mode",
+                "bypassPermissions",
+                "--allowed-tools",
+                "Bash,Read",
+            ],
+        )
         result = runner.invoke(cli, ["list"])
         assert "permission_mode: bypassPermissions" in result.output
         assert "allowed_tools: Bash, Read" in result.output
+
+    def test_list_shows_capabilities(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--capabilities",
+                "docker_logs",
+                "--risky-capabilities",
+                "restart_services",
+            ],
+        )
+        result = runner.invoke(cli, ["list"])
+        assert "capabilities: docker_logs" in result.output
+        assert "risky_capabilities: restart_services" in result.output
 
     def test_list_distinguishes_empty_from_inherit(self, tmp_path: Path):
         """Explicit allowed_tools=[] should show '(none)' to distinguish from inherit (None)."""
@@ -153,18 +243,22 @@ class TestList:
         import yaml
 
         from agent_dispatch.config import config_path
+
         cfg_path = config_path()
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        yaml.safe_dump({
-            "agents": {
-                "proj": {
-                    "directory": str(agent_dir),
-                    "description": "Test",
-                    "allowed_tools": [],
-                    "disallowed_tools": [],
+        yaml.safe_dump(
+            {
+                "agents": {
+                    "proj": {
+                        "directory": str(agent_dir),
+                        "description": "Test",
+                        "allowed_tools": [],
+                        "disallowed_tools": [],
+                    },
                 },
             },
-        }, cfg_path.open("w"))
+            cfg_path.open("w"),
+        )
 
         result = runner.invoke(cli, ["list"])
         assert result.exit_code == 0
@@ -186,9 +280,15 @@ class TestUpdate:
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
-        result = runner.invoke(cli, [
-            "update", "proj", "--permission-mode", "bypassPermissions",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "update",
+                "proj",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        )
         assert result.exit_code == 0
         assert "Updated" in result.output
         config = load_config()
@@ -197,10 +297,18 @@ class TestUpdate:
     def test_update_clear_permission_mode(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--permission-mode", "bypassPermissions",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        )
         result = runner.invoke(cli, ["update", "proj", "--permission-mode", "none"])
         assert result.exit_code == 0
         config = load_config()
@@ -239,13 +347,57 @@ class TestUpdate:
         config = load_config()
         assert config.agents["proj"].max_budget_usd is None
 
+    def test_update_capabilities(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        result = runner.invoke(
+            cli,
+            [
+                "update",
+                "proj",
+                "--capabilities",
+                "docker_logs,deploy_debug",
+                "--risky-capabilities",
+                "restart_services",
+            ],
+        )
+        assert result.exit_code == 0
+        config = load_config()
+        assert config.agents["proj"].capabilities == ["docker_logs", "deploy_debug"]
+        assert config.agents["proj"].risky_capabilities == ["restart_services"]
+
+        runner.invoke(
+            cli,
+            [
+                "update",
+                "proj",
+                "--capabilities",
+                "none",
+                "--risky-capabilities",
+                "none",
+            ],
+        )
+        config = load_config()
+        assert config.agents["proj"].capabilities == []
+        assert config.agents["proj"].risky_capabilities == []
+
     def test_update_empty_string_clears_model(self, tmp_path: Path):
         """B2: --model "" should clear to None, not store empty string."""
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test", "--model", "sonnet",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--model",
+                "sonnet",
+            ],
+        )
         result = runner.invoke(cli, ["update", "proj", "--model", ""])
         assert result.exit_code == 0
         config = load_config()
@@ -255,10 +407,18 @@ class TestUpdate:
         """B2: --permission-mode "" should clear to None."""
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--permission-mode", "bypassPermissions",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        )
         result = runner.invoke(cli, ["update", "proj", "--permission-mode", ""])
         assert result.exit_code == 0
         config = load_config()
@@ -268,10 +428,18 @@ class TestUpdate:
         """B1+B2: --allowed-tools "" clears to None (inherit defaults)."""
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir), "-d", "Test",
-            "--allowed-tools", "Bash,Read",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--allowed-tools",
+                "Bash,Read",
+            ],
+        )
         runner.invoke(cli, ["update", "proj", "--allowed-tools", ""])
         config = load_config()
         assert config.agents["proj"].allowed_tools is None
@@ -371,15 +539,26 @@ class TestDescribe:
     def test_describe_basic(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
-        runner.invoke(cli, [
-            "add", "proj", str(agent_dir),
-            "-d", "My agent",
-            "--timeout", "600",
-            "--model", "sonnet",
-            "--max-budget", "1.5",
-            "--permission-mode", "bypassPermissions",
-            "--allowed-tools", "Bash,Read",
-        ])
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "My agent",
+                "--timeout",
+                "600",
+                "--model",
+                "sonnet",
+                "--max-budget",
+                "1.5",
+                "--permission-mode",
+                "bypassPermissions",
+                "--allowed-tools",
+                "Bash,Read",
+            ],
+        )
         result = runner.invoke(cli, ["describe", "proj"])
         assert result.exit_code == 0
         assert "proj" in result.output
@@ -403,16 +582,20 @@ class TestDescribe:
         # Explicit empty list (override defaults)
         _isolated_config.parent.mkdir(parents=True, exist_ok=True)
         import yaml as _yaml
-        _yaml.safe_dump({
-            "agents": {
-                "proj": {
-                    "directory": str(agent_dir),
-                    "description": "Test",
-                    "allowed_tools": [],         # explicit override
-                    # disallowed_tools omitted → None → inherit
+
+        _yaml.safe_dump(
+            {
+                "agents": {
+                    "proj": {
+                        "directory": str(agent_dir),
+                        "description": "Test",
+                        "allowed_tools": [],  # explicit override
+                        # disallowed_tools omitted → None → inherit
+                    },
                 },
             },
-        }, _isolated_config.open("w"))
+            _isolated_config.open("w"),
+        )
         result = runner.invoke(cli, ["describe", "proj"])
         assert result.exit_code == 0
         # allowed_tools=[] → "(none — explicit override)"
@@ -423,10 +606,7 @@ class TestDescribe:
     def test_describe_missing_directory_shows_not_found(self, _isolated_config: Path):
         _isolated_config.parent.mkdir(parents=True, exist_ok=True)
         _isolated_config.write_text(
-            "agents:\n"
-            "  proj:\n"
-            "    directory: /nonexistent/xyz\n"
-            "    description: Test\n"
+            "agents:\n  proj:\n    directory: /nonexistent/xyz\n    description: Test\n"
         )
         result = runner.invoke(cli, ["describe", "proj"])
         assert result.exit_code == 0
@@ -444,12 +624,37 @@ class TestDescribe:
         assert "README.md" in result.output
         assert ".mcp.json" in result.output
 
+    def test_describe_shows_capabilities(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "proj",
+                str(agent_dir),
+                "-d",
+                "Test",
+                "--capabilities",
+                "docker_logs",
+                "--risky-capabilities",
+                "restart_services",
+            ],
+        )
+        result = runner.invoke(cli, ["describe", "proj"])
+        assert "capabilities:     docker_logs" in result.output
+        assert "risky_caps:       restart_services" in result.output
+
 
 class TestDoctor:
     """Tests for `agent-dispatch doctor` diagnostic command."""
 
     def _patch_claude_mcp_list(
-        self, *, registered: bool = True, fail: bool = False, stdout: str | None = None,
+        self,
+        *,
+        registered: bool = True,
+        fail: bool = False,
+        stdout: str | None = None,
     ):
         """Helper: patch subprocess.run for `claude mcp list` calls.
 
@@ -472,7 +677,10 @@ class TestDoctor:
         return patch(
             "agent_dispatch.cli.subprocess.run",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=stdout, stderr="",
+                args=[],
+                returncode=0,
+                stdout=stdout,
+                stderr="",
             ),
         )
 
@@ -591,10 +799,7 @@ class TestDoctor:
         # Write config pointing at a directory that doesn't exist
         _isolated_config.parent.mkdir(parents=True, exist_ok=True)
         _isolated_config.write_text(
-            "agents:\n"
-            "  proj:\n"
-            "    directory: /nonexistent/path/xyz\n"
-            "    description: Test\n"
+            "agents:\n  proj:\n    directory: /nonexistent/path/xyz\n    description: Test\n"
         )
         with (
             patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
@@ -663,8 +868,11 @@ class TestTestCommand:
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test agent"])
         with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
             mock_dispatch.return_value = DispatchResult(
-                agent="proj", success=True, result="This is a test project.",
-                cost_usd=0.01, num_turns=1,
+                agent="proj",
+                success=True,
+                result="This is a test project.",
+                cost_usd=0.01,
+                num_turns=1,
             )
             result = runner.invoke(cli, ["test", "proj"])
         assert result.exit_code == 0
@@ -682,7 +890,9 @@ class TestTestCommand:
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
         with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
             mock_dispatch.return_value = DispatchResult(
-                agent="proj", success=False, result="",
+                agent="proj",
+                success=False,
+                result="",
                 error="permission denied for tool Bash",
                 error_type="permission",
             )
@@ -697,7 +907,9 @@ class TestTestCommand:
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
         with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
             mock_dispatch.return_value = DispatchResult(
-                agent="proj", success=False, result="",
+                agent="proj",
+                success=False,
+                result="",
                 error="timed out after 300s",
                 error_type="timeout",
             )
@@ -717,8 +929,11 @@ class TestTestCommand:
             on_progress("Reading file foo.py")
             on_progress("Using tool: Edit")
             return DispatchResult(
-                agent=name, success=True, result="done",
-                cost_usd=0.01, num_turns=1,
+                agent=name,
+                success=True,
+                result="done",
+                cost_usd=0.01,
+                num_turns=1,
             )
 
         with (
@@ -744,7 +959,9 @@ class TestTestCommand:
             patch("agent_dispatch.runner.dispatch_stream") as mock_stream,
         ):
             mock_dispatch.return_value = DispatchResult(
-                agent="proj", success=True, result="ok",
+                agent="proj",
+                success=True,
+                result="ok",
             )
             runner.invoke(cli, ["test", "proj"])
         mock_dispatch.assert_called_once()
@@ -767,6 +984,7 @@ class TestTestCommand:
         assert seen["timeout"] == 900
         # Persisted config keeps the original timeout
         from agent_dispatch.config import load_config
+
         assert load_config().agents["proj"].timeout == 300
 
     def test_success_with_hint_prints_note(self, tmp_path: Path):
@@ -776,8 +994,11 @@ class TestTestCommand:
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
         with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
             mock_dispatch.return_value = DispatchResult(
-                agent="proj", success=True, result="partial",
-                denied_tools=["Bash"], hint="1 tool call(s) were denied: Bash.",
+                agent="proj",
+                success=True,
+                result="partial",
+                denied_tools=["Bash"],
+                hint="1 tool call(s) were denied: Bash.",
             )
             result = runner.invoke(cli, ["test", "proj"])
         assert result.exit_code == 0
@@ -840,8 +1061,11 @@ class TestJobsCommands:
         jobs_env.finish(
             job.id,
             DispatchResult(
-                agent="infra", success=True, result="done",
-                cost_usd=5.0, budget_exceeded=True,
+                agent="infra",
+                success=True,
+                result="done",
+                cost_usd=5.0,
+                budget_exceeded=True,
             ),
         )
         result = runner.invoke(cli, ["job", job.id])

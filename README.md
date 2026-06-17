@@ -99,6 +99,8 @@ Lists all configured agents. **Call this first** to see what's available.
     "mcp_servers": ["portainer", "postgres"],
     "stacks": ["Python", "Docker"],
     "dbs": ["Alembic"],
+    "capabilities": ["docker_logs", "deploy_debug"],
+    "risky_capabilities": ["restart_services"],
     "permission_mode": "bypassPermissions",
     "allowed_tools": ["Bash", "Read", "Grep"]
   }
@@ -459,6 +461,11 @@ agents:
     directory: ~/projects/infra
     description: "Infrastructure agent. MCP: portainer."
     timeout: 300            # seconds, default: 300
+    capabilities:           # capability labels, shown in list_agents
+      - docker_logs
+      - deploy_debug
+    risky_capabilities:     # high-risk labels, surfaced for visibility
+      - restart_services
     # model: sonnet         # optional model override
     # max_budget_usd: 1.0   # cost limit per dispatch
     # permission_mode: bypassPermissions  # one of: default | plan | bypassPermissions
@@ -495,6 +502,18 @@ Config is reloaded on every tool call — add agents without restarting.
 - `.mcp.json` — lists MCP server names
 - Stack indicators — Docker, Rust, Go, Python, Node.js
 - DB indicators — Prisma, Alembic, migrations
+
+### Explicit Capabilities
+
+Auto-description is useful, but explicit `capabilities` make it clearer what each agent is for. Add short snake_case task labels to agents:
+
+```bash
+agent-dispatch update infra \
+  --capabilities docker_logs,deploy_debug \
+  --risky-capabilities restart_services
+```
+
+`list_agents` and `inspect_agent` surface `capabilities` and `risky_capabilities` so the caller can pick the right agent at a glance — `risky_capabilities` flags higher-risk abilities (e.g. restarting services) for extra scrutiny.
 
 ## How It Works
 

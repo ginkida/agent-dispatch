@@ -3,12 +3,21 @@ agents:
   infra:
     directory: ~/projects/infra
     description: "Infrastructure agent. MCP servers: portainer. Can check container logs, restart services, inspect Docker state."
+    capabilities:
+      - docker_logs
+      - deploy_debug
+    risky_capabilities:
+      - restart_services
     timeout: 300
 
   # Backend agent — source code, tests, database
   backend:
     directory: ~/projects/backend
     description: "Backend API agent. Python, FastAPI, PostgreSQL. Can modify code, run tests, check migrations."
+    capabilities:
+      - code_debug
+      - run_tests
+      - inspect_migrations
     timeout: 300
     model: null  # use default model
 

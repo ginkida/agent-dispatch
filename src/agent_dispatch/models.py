@@ -47,6 +47,8 @@ class AgentConfig(BaseModel):
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    risky_capabilities: list[str] = Field(default_factory=list)
 
     @field_validator("directory", mode="before")
     @classmethod

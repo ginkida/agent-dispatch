@@ -18,6 +18,10 @@ from .jobs import JobStore, default_jobs_dir, is_valid_job_id
 from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
 
 
+def _parse_csv(value: str | None) -> list[str] | None:
+    return [t.strip() for t in value.split(",") if t.strip()] if value else None
+
+
 def _load_or_exit() -> DispatchConfig:
     """Load config, exiting with a friendly error on malformed YAML or schema."""
     try:
@@ -120,6 +124,16 @@ def init() -> None:
     default=None,
     help="Comma-separated list of disallowed tools.",
 )
+@click.option(
+    "--capabilities",
+    default=None,
+    help="Comma-separated task capabilities (e.g. docker_logs,deploy_debug).",
+)
+@click.option(
+    "--risky-capabilities",
+    default=None,
+    help="Comma-separated risky capabilities (e.g. restart_services).",
+)
 def add(
     name: str,
     directory: str,
@@ -130,6 +144,8 @@ def add(
     permission_mode: str | None,
     allowed_tools: str | None,
     disallowed_tools: str | None,
+    capabilities: str | None,
+    risky_capabilities: str | None,
 ) -> None:
     """Add an agent. Auto-generates description from project files if omitted."""
     try:
@@ -156,12 +172,10 @@ def add(
         model=model,
         max_budget_usd=max_budget,
         permission_mode=permission_mode,
-        allowed_tools=[t.strip() for t in allowed_tools.split(",") if t.strip()]
-        if allowed_tools
-        else None,
-        disallowed_tools=[t.strip() for t in disallowed_tools.split(",") if t.strip()]
-        if disallowed_tools
-        else None,
+        allowed_tools=_parse_csv(allowed_tools),
+        disallowed_tools=_parse_csv(disallowed_tools),
+        capabilities=_parse_csv(capabilities) or [],
+        risky_capabilities=_parse_csv(risky_capabilities) or [],
     )
     if warning := check_permission_mode(permission_mode):
         click.echo(click.style(f"Warning: {warning}", fg="yellow"))
@@ -221,6 +235,10 @@ def list_agents() -> None:
         if agent.disallowed_tools is not None:
             rendered = ", ".join(agent.disallowed_tools) if agent.disallowed_tools else "(none)"
             click.echo(f"    disallowed_tools: {rendered}")
+        if agent.capabilities:
+            click.echo(f"    capabilities: {', '.join(agent.capabilities)}")
+        if agent.risky_capabilities:
+            click.echo(f"    risky_capabilities: {', '.join(agent.risky_capabilities)}")
         click.echo()
 
 
@@ -245,6 +263,16 @@ def list_agents() -> None:
     default=None,
     help="Comma-separated disallowed tools. Use 'none' to clear.",
 )
+@click.option(
+    "--capabilities",
+    default=None,
+    help="Comma-separated capabilities. Use 'none' to clear.",
+)
+@click.option(
+    "--risky-capabilities",
+    default=None,
+    help="Comma-separated risky capabilities. Use 'none' to clear.",
+)
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -256,6 +284,8 @@ def update(
     permission_mode: str | None,
     allowed_tools: str | None,
     disallowed_tools: str | None,
+    capabilities: str | None,
+    risky_capabilities: str | None,
 ) -> None:
     """Update an existing agent's configuration."""
     config = _load_or_exit()
@@ -297,6 +327,18 @@ def update(
         else:
             agent.disallowed_tools = [t.strip() for t in disallowed_tools.split(",") if t.strip()]
         updated.append("disallowed_tools")
+    if capabilities is not None:
+        if capabilities.strip().lower() in ("none", ""):
+            agent.capabilities = []
+        else:
+            agent.capabilities = _parse_csv(capabilities) or []
+        updated.append("capabilities")
+    if risky_capabilities is not None:
+        if risky_capabilities.strip().lower() in ("none", ""):
+            agent.risky_capabilities = []
+        else:
+            agent.risky_capabilities = _parse_csv(risky_capabilities) or []
+        updated.append("risky_capabilities")
 
     if not updated:
         click.echo("Nothing to update. Pass at least one option (see --help).")
@@ -413,6 +455,10 @@ def describe(name: str) -> None:
         click.echo(f"  max_budget_usd:   ${agent.max_budget_usd}")
     if agent.permission_mode:
         click.echo(f"  permission_mode:  {agent.permission_mode}")
+    if agent.capabilities:
+        click.echo(f"  capabilities:     {', '.join(agent.capabilities)}")
+    if agent.risky_capabilities:
+        click.echo(f"  risky_caps:       {', '.join(agent.risky_capabilities)}")
     click.echo(f"  allowed_tools:    {_render_tools(agent.allowed_tools)}")
     click.echo(f"  disallowed_tools: {_render_tools(agent.disallowed_tools)}")
 

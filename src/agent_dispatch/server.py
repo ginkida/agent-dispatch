@@ -211,6 +211,10 @@ def _validate_ref(ref: str) -> str | None:
     return None
 
 
+def _parse_csv(value: str) -> list[str]:
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
 def _get_job_store() -> JobStore:
     """Return the global JobStore instance, creating it on first call."""
     global _job_store  # noqa: PLW0603
@@ -295,6 +299,10 @@ async def list_agents(ctx: Context | None = None) -> str:
             entry["allowed_tools"] = agent.allowed_tools
         if agent.disallowed_tools is not None:
             entry["disallowed_tools"] = agent.disallowed_tools
+        if agent.capabilities:
+            entry["capabilities"] = agent.capabilities
+        if agent.risky_capabilities:
+            entry["risky_capabilities"] = agent.risky_capabilities
         agents.append(entry)
     if ctx:
         await ctx.info(f"Found {len(agents)} configured agents")
@@ -361,6 +369,10 @@ async def inspect_agent(
         info["allowed_tools"] = agent.allowed_tools
     if agent.disallowed_tools is not None:
         info["disallowed_tools"] = agent.disallowed_tools
+    if agent.capabilities:
+        info["capabilities"] = agent.capabilities
+    if agent.risky_capabilities:
+        info["risky_capabilities"] = agent.risky_capabilities
 
     try:
         healthy = agent.directory.is_dir()
@@ -1056,6 +1068,8 @@ async def add_agent(
     permission_mode: str = "",
     allowed_tools: str = "",
     disallowed_tools: str = "",
+    capabilities: str = "",
+    risky_capabilities: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Register a project directory as a dispatchable agent.
@@ -1077,6 +1091,11 @@ async def add_agent(
             (e.g. "Bash,Read,Edit"). Leave empty for no restrictions.
         disallowed_tools: Comma-separated list of disallowed tools.
             Leave empty for no restrictions.
+        capabilities: Comma-separated task labels describing what the agent is
+            good at (e.g. "docker_logs,deploy_debug"). Surfaced in list_agents /
+            inspect_agent to help callers pick the right agent.
+        risky_capabilities: Comma-separated high-risk capability labels
+            (e.g. "restart_services"). Descriptive only; surfaced for visibility.
     """
     try:
         validate_agent_name(name)
@@ -1094,12 +1113,10 @@ async def add_agent(
         return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
 
     desc = description or auto_describe(dir_path)
-    parsed_allowed = (
-        [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else None
-    )
-    parsed_disallowed = (
-        [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else None
-    )
+    parsed_allowed = _parse_csv(allowed_tools) if allowed_tools else None
+    parsed_disallowed = _parse_csv(disallowed_tools) if disallowed_tools else None
+    parsed_capabilities = _parse_csv(capabilities)
+    parsed_risky_capabilities = _parse_csv(risky_capabilities)
 
     if ctx and (warning := check_permission_mode(permission_mode or None)):
         await ctx.info(f"Warning: {warning}")
@@ -1112,6 +1129,8 @@ async def add_agent(
         permission_mode=permission_mode or None,
         allowed_tools=parsed_allowed,
         disallowed_tools=parsed_disallowed,
+        capabilities=parsed_capabilities,
+        risky_capabilities=parsed_risky_capabilities,
     )
     save_config(config)
 
@@ -1129,6 +1148,10 @@ async def add_agent(
         result["allowed_tools"] = parsed_allowed
     if parsed_disallowed:
         result["disallowed_tools"] = parsed_disallowed
+    if parsed_capabilities:
+        result["capabilities"] = parsed_capabilities
+    if parsed_risky_capabilities:
+        result["risky_capabilities"] = parsed_risky_capabilities
 
     return json.dumps(result, indent=2)
 
@@ -1167,6 +1190,8 @@ async def update_agent(
     permission_mode: str = "",
     allowed_tools: str = "",
     disallowed_tools: str = "",
+    capabilities: str = "",
+    risky_capabilities: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Update an existing agent's configuration.
@@ -1185,6 +1210,9 @@ async def update_agent(
         permission_mode: Permission mode. Pass "none" to clear.
         allowed_tools: Comma-separated allowed tools. Pass "none" to clear.
         disallowed_tools: Comma-separated disallowed tools. Pass "none" to clear.
+        capabilities: Comma-separated capabilities. Pass "none" to clear.
+        risky_capabilities: Comma-separated risky capabilities. Pass "none"
+            to clear.
     """
     config = _get_config()
     if name not in config.agents:
@@ -1222,8 +1250,16 @@ async def update_agent(
         if disallowed_tools.lower() == "none":
             agent.disallowed_tools = None
         else:
-            agent.disallowed_tools = [t.strip() for t in disallowed_tools.split(",") if t.strip()]
+            agent.disallowed_tools = _parse_csv(disallowed_tools)
         updated.append("disallowed_tools")
+    if capabilities:
+        agent.capabilities = [] if capabilities.lower() == "none" else _parse_csv(capabilities)
+        updated.append("capabilities")
+    if risky_capabilities:
+        agent.risky_capabilities = (
+            [] if risky_capabilities.lower() == "none" else _parse_csv(risky_capabilities)
+        )
+        updated.append("risky_capabilities")
 
     if not updated:
         return json.dumps({"error": "Nothing to update. Pass at least one non-empty field."})

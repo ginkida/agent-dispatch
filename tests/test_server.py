@@ -845,6 +845,36 @@ class TestAddRemoveAgent:
             os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 
     @pytest.mark.asyncio
+    async def test_add_agent_with_capabilities(self, tmp_path: Path):
+        import os
+
+        from agent_dispatch.config import load_config
+
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "infra"
+            agent_dir.mkdir()
+
+            raw = await server.add_agent(
+                "infra",
+                str(agent_dir),
+                description="Infra agent",
+                capabilities="docker_logs,deploy_debug",
+                risky_capabilities="restart_services",
+            )
+            result = json.loads(raw)
+            assert result["capabilities"] == ["docker_logs", "deploy_debug"]
+            assert result["risky_capabilities"] == ["restart_services"]
+
+            loaded = load_config(config_file)
+            agent = loaded.agents["infra"]
+            assert agent.capabilities == ["docker_logs", "deploy_debug"]
+            assert agent.risky_capabilities == ["restart_services"]
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
+
+    @pytest.mark.asyncio
     async def test_add_agent_invalid_name(self):
         raw = await server.add_agent("-bad", "/tmp")
         assert "error" in json.loads(raw)
@@ -961,6 +991,45 @@ class TestUpdateAgent:
             assert agent.permission_mode is None
             # "none" sentinel clears to None (inherit defaults), not []
             assert agent.allowed_tools is None
+        finally:
+            os.environ.pop("AGENT_DISPATCH_CONFIG", None)
+
+    @pytest.mark.asyncio
+    async def test_update_capabilities(self, tmp_path: Path):
+        import os
+
+        from agent_dispatch.config import load_config
+
+        config_file = tmp_path / "agents.yaml"
+        os.environ["AGENT_DISPATCH_CONFIG"] = str(config_file)
+        try:
+            agent_dir = tmp_path / "proj"
+            agent_dir.mkdir()
+            await server.add_agent("proj", str(agent_dir), description="test")
+
+            raw = await server.update_agent(
+                "proj",
+                capabilities="docker_logs,deploy_debug",
+                risky_capabilities="restart_services",
+            )
+            result = json.loads(raw)
+            assert "capabilities" in result["fields"]
+            assert "risky_capabilities" in result["fields"]
+
+            loaded = load_config(config_file)
+            agent = loaded.agents["proj"]
+            assert agent.capabilities == ["docker_logs", "deploy_debug"]
+            assert agent.risky_capabilities == ["restart_services"]
+
+            await server.update_agent(
+                "proj",
+                capabilities="none",
+                risky_capabilities="none",
+            )
+            loaded = load_config(config_file)
+            agent = loaded.agents["proj"]
+            assert agent.capabilities == []
+            assert agent.risky_capabilities == []
         finally:
             os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 
@@ -1367,6 +1436,28 @@ class TestListAgentsEnriched:
         assert "mcp_servers" not in entry
         assert "stacks" not in entry
         assert "dbs" not in entry
+        assert "capabilities" not in entry
+        assert "risky_capabilities" not in entry
+
+    @pytest.mark.asyncio
+    async def test_list_surfaces_declared_capabilities(self, tmp_path: Path):
+        agent_dir = tmp_path / "infra"
+        agent_dir.mkdir()
+        config = DispatchConfig(
+            agents={
+                "infra": AgentConfig(
+                    directory=agent_dir,
+                    description="d",
+                    capabilities=["docker_logs"],
+                    risky_capabilities=["restart_services"],
+                )
+            }
+        )
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.list_agents()
+        entry = json.loads(raw)[0]
+        assert entry["capabilities"] == ["docker_logs"]
+        assert entry["risky_capabilities"] == ["restart_services"]
 
 
 class TestInspectAgent:
@@ -1387,6 +1478,8 @@ class TestInspectAgent:
                     timeout=120,
                     permission_mode="bypassPermissions",
                     allowed_tools=["Bash", "Read"],
+                    capabilities=["docker_logs"],
+                    risky_capabilities=["restart_services"],
                 ),
             }
         )
@@ -1398,6 +1491,8 @@ class TestInspectAgent:
         assert info["timeout"] == 120
         assert info["permission_mode"] == "bypassPermissions"
         assert info["allowed_tools"] == ["Bash", "Read"]
+        assert info["capabilities"] == ["docker_logs"]
+        assert info["risky_capabilities"] == ["restart_services"]
         assert info["mcp_servers"] == ["portainer"]
         assert "Python" in info["stacks"]
         assert info["has_claude_md"] is True
@@ -2242,8 +2337,15 @@ class TestCancelRunningJob:
                 release.set()  # the stream "dies" once killed
 
         def fake_stream(
-            name, task, agent_config, settings, context=None, on_progress=None,
-            *, on_proc=None, **kw,
+            name,
+            task,
+            agent_config,
+            settings,
+            context=None,
+            on_progress=None,
+            *,
+            on_proc=None,
+            **kw,
         ):
             if on_proc is not None:
                 on_proc(FakeProc())
@@ -2251,8 +2353,11 @@ class TestCancelRunningJob:
             release.wait(timeout=2)
             # what dispatch_stream returns after its subprocess was killed
             return DispatchResult(
-                agent=name, success=False, result="",
-                error="No result received", error_type="cli_error",
+                agent=name,
+                success=False,
+                result="",
+                error="No result received",
+                error_type="cli_error",
             )
 
         with (
@@ -2290,8 +2395,15 @@ class TestCancelRunningJob:
                 pass
 
         def fake_stream(
-            name, task, agent_config, settings, context=None, on_progress=None,
-            *, on_proc=None, **kw,
+            name,
+            task,
+            agent_config,
+            settings,
+            context=None,
+            on_progress=None,
+            *,
+            on_proc=None,
+            **kw,
         ):
             if on_proc is not None:
                 on_proc(FakeProc())
@@ -2313,7 +2425,8 @@ class TestCancelRunningJob:
 
     @pytest.mark.asyncio
     async def test_cancel_running_without_registered_proc_keeps_old_behavior(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ):
         """A running job from another server instance cannot be killed."""
         store = server._get_job_store()

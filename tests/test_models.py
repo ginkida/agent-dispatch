@@ -30,6 +30,8 @@ def test_agent_config_defaults():
     # None = inherit from settings (B1)
     assert agent.allowed_tools is None
     assert agent.disallowed_tools is None
+    assert agent.capabilities == []
+    assert agent.risky_capabilities == []
 
 
 def test_agent_config_explicit_empty_tools():

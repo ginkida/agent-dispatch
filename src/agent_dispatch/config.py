@@ -47,6 +47,13 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _chmod_quiet(p.parent, 0o700)
     data = config.model_dump(mode="json", exclude_none=True)
+    # capabilities/risky_capabilities default to [] (not None), so exclude_none
+    # won't drop them — prune empties so agents that never declare capabilities
+    # stay clean in YAML instead of growing two empty-list keys on every save.
+    for agent_data in data.get("agents", {}).values():
+        for key in ("capabilities", "risky_capabilities"):
+            if not agent_data.get(key):
+                agent_data.pop(key, None)
     p.write_text(
         yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
@@ -84,9 +91,7 @@ def detect_stacks(directory: Path) -> list[str]:
     indicators: list[str] = []
     if (directory / "Dockerfile").exists():
         indicators.append("Docker")
-    if (directory / "docker-compose.yaml").exists() or (
-        directory / "docker-compose.yml"
-    ).exists():
+    if (directory / "docker-compose.yaml").exists() or (directory / "docker-compose.yml").exists():
         indicators.append("Docker Compose")
     if (directory / "Cargo.toml").exists():
         indicators.append("Rust")

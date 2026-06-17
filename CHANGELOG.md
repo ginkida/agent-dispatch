@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-17
+
+Let agents declare what they are good at, so callers can pick the right one.
+
+### Added
+- **Declared capabilities.** `AgentConfig` gains `capabilities` and
+  `risky_capabilities` — short snake_case labels describing what an agent is
+  for (e.g. `docker_logs`, `restart_services`). They are descriptive metadata
+  only (never passed to the `claude` CLI): settable via `add_agent` /
+  `update_agent` (MCP) and `add` / `update` (CLI, `--capabilities` /
+  `--risky-capabilities`, `none` clears), and surfaced in `list_agents` /
+  `inspect_agent` so the calling agent can choose a target at a glance.
+  `risky_capabilities` flags higher-risk abilities for extra scrutiny.
+
+### Changed
+- `save_config` no longer writes empty `capabilities` / `risky_capabilities`
+  keys for agents that don't declare them, keeping `agents.yaml` clean.
+
+### Note
+- A keyword-scoring router (`recommend_agent` / `dispatch_auto` MCP tools and
+  `recommend` / `auto` CLI commands) was prototyped during this cycle and then
+  removed before release: a deterministic keyword scorer adds little over the
+  calling LLM's own judgment when there are only a handful of agents, and the
+  capability labels above cover the "what is this agent for" need without the
+  extra surface area or the risk of auto-dispatching to a wrong guess.
+
 ## [0.7.0] - 2026-06-10
 
 Job control release: running jobs become cancellable, the budget field stops
