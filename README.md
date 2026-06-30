@@ -13,6 +13,8 @@
 
 Each agent runs as a separate `claude -p` session in its own project directory — inheriting that project's MCP servers, CLAUDE.md, and tools. The calling agent just gets the result back.
 
+Related projects can be bundled into a **[group](#groups)** — a shared brief plus a member list — so one session can coordinate work across them (e.g. code repos + an `infra`/Portainer gateway + an `analytics` gateway).
+
 Works with OAuth, API key, and Claude subscription authentication.
 
 > **AI agents:** this README is the canonical doc for *using* the tool — setup: [Quick Start](#quick-start) (every step has a deterministic verify), first call: [`dispatch`](#dispatch), tool selection: [Which Tool to Use](#which-tool-to-use), failure handling: [Error Recovery](#error-recovery). Working *on* this repo instead? See [AGENTS.md](AGENTS.md).
@@ -509,6 +511,23 @@ agents:
     # disallowed_tools:     # block specific tools
     #   - Write
 
+# Optional: bundle related agents into a cross-project working set.
+# A descriptive layer — no router; the orchestrating session coordinates
+# with the normal dispatch tools. See the Groups section above.
+groups:
+  shop:
+    # ORCHESTRATOR-facing: how to coordinate the group. Surfaced by
+    # list_groups/inspect_group, NEVER injected into a member's prompt.
+    description: "After a code change: deploy via infra, then verify via analytics."
+    # MEMBER-facing facts, auto-prepended to dispatch(..., group="shop").
+    shared_context: |
+      Prod runs in Portainer stack "shop". Metrica counter 12345.
+    members:                # reference agents above (many-to-many)
+      - agent: infra
+        use_for: deploy, restart, container logs
+      # - agent: backend
+      #   use_for: orders/payments endpoints
+
 settings:
   default_timeout: 300
   # default_permission_mode: bypassPermissions  # inherited by all agents
@@ -578,7 +597,7 @@ agent-dispatch MCP server
 - **Cost visibility** — `max_budget_usd` per agent or globally; a dispatch whose cost exceeds it returns `budget_exceeded: true` + a hint (post-hoc — the `claude` CLI has no spend cap, so the overage can be flagged but not prevented).
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). Orphaned processes are cleaned up.
-- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only successes are cached. Sessions and dialogues are never cached.
+- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only successes are cached. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
 
 See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
 
@@ -591,6 +610,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, etc.) |
 | `agent-dispatch remove <name>` | Remove an agent |
 | `agent-dispatch list` | List agents with health status and permissions |
+| `agent-dispatch group <add\|list\|inspect\|update\|remove>` | Manage [groups](#groups) — cross-project working sets of agents |
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
 | `agent-dispatch doctor` | Diagnose installation: claude CLI, MCP registration, agent health |
