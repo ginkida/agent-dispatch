@@ -10,6 +10,17 @@ agents:
       - restart_services
     timeout: 300
 
+  # Analytics gateway — a browser + Yandex Metrica agent, no codebase of its own.
+  # Its value is its MCP servers + access, not its source. Shared across groups.
+  analytics:
+    directory: ~/projects/analytics
+    description: "Analytics gateway. MCP servers: browser, yandex-metrica. Pulls funnels, conversion, traffic. Read-only."
+    capabilities:
+      - funnel_report
+      - conversion_metrics
+    permission_mode: bypassPermissions  # runs non-interactively against read-only sources
+    timeout: 300
+
   # Backend agent — source code, tests, database
   backend:
     directory: ~/projects/backend
@@ -62,7 +73,21 @@ groups:
         use_for: orders/payments endpoints, migrations
       - agent: infra
         use_for: deploy, restart, container logs
-      # - agent: analytics   # a shared gateway agent could also live here
+      - agent: analytics
+        use_for: funnel + conversion verification
+
+  # A second product reusing the SHARED infra/analytics gateways. Membership is
+  # many-to-many — gateways are referenced, not owned, so one analytics/infra
+  # agent serves every product.
+  blog:
+    description: "Content site. Same deploy-then-verify loop via the shared gateways."
+    shared_context: |
+      Production runs in Portainer stack "blog". Metrica counter 67890.
+    members:
+      - agent: infra
+        use_for: deploy, logs
+      - agent: analytics
+        use_for: pageview + bounce-rate checks
 
 settings:
   default_timeout: 300

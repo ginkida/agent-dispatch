@@ -51,7 +51,7 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## When adding a feature, check every layer
 
-`models.py` (data shape) → `runner.py` (dispatch mechanics) → `server.py` (MCP tool) → `cli.py` (CLI flag) → tests for each → `README.md` + `agents.example.yaml` (user docs).
+`models.py` (data shape) → `config.py` (YAML round-trip + empty-collection pruning) → `runner.py` (dispatch mechanics) → `server.py` (MCP tool) → `cli.py` (CLI flag) → tests for each → `README.md` + `agents.example.yaml` (user docs).
 
 ## More detail
 
