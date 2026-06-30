@@ -8,9 +8,16 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agent_dispatch.config import auto_describe, load_config, save_config
-from agent_dispatch.models import AgentConfig, DispatchConfig, Settings
+from agent_dispatch.models import (
+    AgentConfig,
+    DispatchConfig,
+    DispatchGroup,
+    GroupMember,
+    Settings,
+)
 
 
 def test_load_missing_file(tmp_path: Path):
@@ -167,3 +174,50 @@ def test_auto_describe_with_stack_indicators(tmp_path: Path):
 def test_auto_describe_fallback(tmp_path: Path):
     desc = auto_describe(tmp_path)
     assert tmp_path.name in desc
+
+
+def test_save_and_load_groups_roundtrip(tmp_path: Path):
+    f = tmp_path / "test.yaml"
+    config = DispatchConfig(
+        agents={
+            "web": AgentConfig(directory="/tmp", description="Web"),
+            "infra": AgentConfig(directory="/tmp", description="Infra"),
+        },
+        groups={
+            "shop": DispatchGroup(
+                description="Coordinate the shop",
+                shared_context="Prod stack shop. Counter 123.",
+                members=[
+                    GroupMember(agent="web", use_for="ui"),
+                    GroupMember(agent="infra"),
+                ],
+            )
+        },
+    )
+    save_config(config, f)
+
+    loaded = load_config(f)
+    grp = loaded.groups["shop"]
+    assert grp.description == "Coordinate the shop"
+    assert grp.shared_context == "Prod stack shop. Counter 123."
+    assert [(m.agent, m.use_for) for m in grp.members] == [("web", "ui"), ("infra", "")]
+
+    # Declaration order: groups sits between agents and settings in the YAML.
+    assert list(yaml.safe_load(f.read_text()).keys()) == ["agents", "groups", "settings"]
+
+
+def test_save_config_omits_empty_groups(tmp_path: Path):
+    """A group-less config must not gain a `groups:` key, and round-trips to {}."""
+    f = tmp_path / "test.yaml"
+    save_config(DispatchConfig(agents={"x": AgentConfig(directory="/tmp")}), f)
+    assert "groups:" not in f.read_text()
+    assert load_config(f).groups == {}
+
+
+def test_save_config_prunes_empty_members(tmp_path: Path):
+    """A declared group with no members must not write an empty `members:` list."""
+    f = tmp_path / "test.yaml"
+    config = DispatchConfig(groups={"solo": DispatchGroup(description="standalone")})
+    save_config(config, f)
+    assert "members" not in yaml.safe_load(f.read_text())["groups"]["solo"]
+    assert load_config(f).groups["solo"].members == []

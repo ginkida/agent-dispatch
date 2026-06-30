@@ -11,9 +11,9 @@ MCP server + CLI that lets Claude Code agents delegate tasks to agents in other 
 | File | Role |
 |------|------|
 | `src/agent_dispatch/runner.py` | Sync subprocess wrapper around `claude -p` — the actual work |
-| `src/agent_dispatch/server.py` | Async FastMCP interface (19 MCP tools), wraps runner in `asyncio.to_thread` + semaphore |
-| `src/agent_dispatch/cli.py` | Click CLI: `init`, `add`, `update`, `remove`, `list`, `describe`, `test`, `doctor`, `jobs`, `job`, `cancel`, `gc`, `serve` |
-| `src/agent_dispatch/models.py` | Pydantic v2 models (`AgentConfig`, `Settings`, `DispatchResult`) |
+| `src/agent_dispatch/server.py` | Async FastMCP interface (21 MCP tools), wraps runner in `asyncio.to_thread` + semaphore |
+| `src/agent_dispatch/cli.py` | Click CLI: `init`, `add`, `update`, `remove`, `list`, `describe`, `test`, `doctor`, `jobs`, `job`, `cancel`, `gc`, `group` (add/list/inspect/update/remove), `serve` |
+| `src/agent_dispatch/models.py` | Pydantic v2 models (`AgentConfig`, `DispatchGroup`/`GroupMember`, `Settings`, `DispatchResult`) |
 | `src/agent_dispatch/config.py` | YAML config load/save + project auto-description |
 | `src/agent_dispatch/cache.py` | Thread-safe in-memory TTL cache |
 | `src/agent_dispatch/jobs.py` | Persistent per-job JSON files for async dispatch |
@@ -28,7 +28,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 428 tests, ~2s — all subprocess calls are mocked
+python3 -m pytest tests/ -v   # 466 tests, ~2s — all subprocess calls are mocked
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`.
@@ -37,6 +37,7 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 
 - `allowed_tools` / `disallowed_tools` are **tri-state**: `None` = inherit settings defaults, `[]` = explicitly no tools, `[...]` = exactly these. Check with `is not None`, never `or` — `[]` is falsy but semantically distinct.
 - `denied_tools` non-empty + `is_error` ⇒ `error_type="permission"`, regardless of what the error text matches.
+- **Groups**: a group's `shared_context` is folded into the `context` *string* before the cache/runner calls (`_merge_group_context` in server.py) — runner.py and cache.py are untouched, the cache key disambiguates groups for free, and `group=""` is byte-identical to a plain dispatch. Membership is validated up front (`_validate_group_member`, separate from the pure merge so `dispatch_parallel`'s all-or-nothing pre-check holds). `DispatchConfig` validates only group *keys*, never member existence — a hard cross-ref check would brick config load when a shared gateway agent is removed; dangling refs are flagged (`unknown:true`) at read time instead.
 - On failure, callers read `DispatchResult.error` + `error_type` — `result` holds the raw agent output even on errors.
 - `--session-id` and `--resume` conflict — never pass both to `claude`.
 - Valid permission modes: `default`, `plan`, `bypassPermissions` (`models.py: KNOWN_PERMISSION_MODES`).
@@ -54,4 +55,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 428 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 466 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

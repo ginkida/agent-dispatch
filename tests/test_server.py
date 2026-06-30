@@ -15,7 +15,9 @@ from agent_dispatch.models import (
     AgentConfig,
     CacheSettings,
     DispatchConfig,
+    DispatchGroup,
     DispatchResult,
+    GroupMember,
     Settings,
 )
 
@@ -2437,3 +2439,253 @@ class TestCancelRunningJob:
         assert data["outcome"] == "running"
         assert "not started by this server" in data["message"]
         assert store.get(job.id).status == "running"
+
+
+class TestGroups:
+    def _cfg(self, tmp_path: Path) -> DispatchConfig:
+        config = _make_config(tmp_path)  # agents: infra, db, monitoring, backend
+        config.groups = {
+            "shop": DispatchGroup(
+                description="Coordinate the shop",
+                shared_context="Prod stack shop. Counter 123.",
+                members=[
+                    GroupMember(agent="infra", use_for="deploy"),
+                    GroupMember(agent="db"),
+                ],
+            ),
+            "blog": DispatchGroup(
+                description="Blog ops",
+                shared_context="Blog facts only.",
+                members=[GroupMember(agent="infra")],
+            ),
+        }
+        return config
+
+    @pytest.mark.asyncio
+    async def test_list_groups_shape(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        ctx = AsyncMock()
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.list_groups(ctx=ctx))
+        shop = next(g for g in data if g["name"] == "shop")
+        assert shop["shared_context_present"] is True
+        assert shop["member_count"] == 2
+        assert {m["agent"] for m in shop["members"]} == {"infra", "db"}
+        assert any(m.get("use_for") == "deploy" for m in shop["members"])
+        ctx.info.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_list_groups_empty_config(self, tmp_path: Path):
+        config = _make_config(tmp_path)  # no groups
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.list_groups())
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_list_groups_flags_unknown_member(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        config.groups["ghosts"] = DispatchGroup(members=[GroupMember(agent="gone")])
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.list_groups())
+        ghosts = next(g for g in data if g["name"] == "ghosts")
+        assert ghosts["members"][0]["unknown"] is True
+
+    @pytest.mark.asyncio
+    async def test_inspect_group(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.inspect_group("shop"))
+        assert data["shared_context"] == "Prod stack shop. Counter 123."
+        assert data["member_count"] == 2
+        infra = next(m for m in data["members"] if m["agent"] == "infra")
+        assert "directory" in infra  # known member gets enriched
+        assert infra.get("use_for") == "deploy"
+
+    @pytest.mark.asyncio
+    async def test_inspect_group_unknown(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.inspect_group("nope"))
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_inspect_group_unknown_member_no_crash(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        config.groups["g"] = DispatchGroup(members=[GroupMember(agent="gone")])
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.inspect_group("g"))
+        m = data["members"][0]
+        assert m["unknown"] is True
+        assert "directory" not in m  # never touched config.agents[gone]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_group_injects_shared_context(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        captured = {}
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            captured["context"] = context
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "deploy now", context="urgent", group="shop")
+
+        assert "Prod stack shop" in captured["context"]
+        assert "urgent" in captured["context"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_group_non_member_rejected(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.dispatch("monitoring", "x", group="shop"))
+        assert "error" in data
+        assert "not a member" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_unknown_group_rejected(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            data = json.loads(await server.dispatch("infra", "x", group="ghost"))
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_dispatch_no_group_context_unchanged(self, tmp_path: Path):
+        """group='' must leave context byte-identical to today (None when empty)."""
+        config = self._cfg(tmp_path)
+        captured = {}
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            captured["context"] = context
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "x")
+        assert captured["context"] is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_groups_no_cache_collision(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(context)
+            return _ok_dispatch_result(name, text=context or "")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            r_shop = json.loads(await server.dispatch("infra", "same", group="shop"))
+            r_blog = json.loads(await server.dispatch("infra", "same", group="blog"))
+            r_shop2 = json.loads(await server.dispatch("infra", "same", group="shop"))
+
+        # Different shared_context => different effective context => no collision.
+        assert r_shop["result"] != r_blog["result"]
+        assert "Prod stack shop" in r_shop["result"]
+        assert "Blog facts" in r_blog["result"]
+        # Identical (agent, task, group) => cache hit, runner not called a 3rd time.
+        assert r_shop2.get("cached") is True
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_parallel_group_membership_validated_up_front(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(name)
+            return _ok_dispatch_result(name)
+
+        dispatches = json.dumps(
+            [
+                {"agent": "infra", "task": "t1", "group": "shop"},
+                {"agent": "monitoring", "task": "t2", "group": "shop"},  # not a member
+            ]
+        )
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            data = json.loads(await server.dispatch_parallel(dispatches))
+        # One bad item rejects the whole call BEFORE any dispatch runs.
+        assert "error" in data
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_parallel_group_injects_context(self, tmp_path: Path):
+        config = self._cfg(tmp_path)
+        captured = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            captured.append(context)
+            return _ok_dispatch_result(name)
+
+        dispatches = json.dumps([{"agent": "infra", "task": "t", "group": "shop"}])
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch_parallel(dispatches)
+        assert any("Prod stack shop" in (c or "") for c in captured)
+
+    @pytest.mark.asyncio
+    async def test_parallel_group_cache_roundtrip(self, tmp_path: Path):
+        """A per-item group dispatch must store AND re-fetch under the same
+        effective_context — guards dispatch_parallel's cache.get/cache.put
+        sites against a silent store-under-merged / fetch-under-raw miss."""
+        config = self._cfg(tmp_path)
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(context)
+            return _ok_dispatch_result(name, text=context or "")
+
+        item = json.dumps([{"agent": "infra", "task": "same", "group": "shop"}])
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            first = json.loads(await server.dispatch_parallel(item))
+            second = json.loads(await server.dispatch_parallel(item))
+
+        # Second identical group dispatch is served from cache, not re-run.
+        assert first[0].get("cached") is None
+        assert second[0]["cached"] is True
+        assert "Prod stack shop" in second[0]["result"]
+        assert len(calls) == 1  # runner invoked once; the 2nd was a cache hit
+
+    @pytest.mark.asyncio
+    async def test_group_tools_handle_unreadable_member(self, tmp_path: Path):
+        """An OSError on a member's is_dir() degrades only that member to
+        'UNREADABLE'; later members still appear and the tools still return
+        JSON (no early-return, no crash)."""
+        config = self._cfg(tmp_path)  # shop members order: [infra, db]
+        bad_dir = config.agents["infra"].directory
+        original_is_dir = Path.is_dir
+
+        def selective_is_dir(self):
+            if self == bad_dir:
+                raise PermissionError("denied")
+            return original_is_dir(self)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(Path, "is_dir", selective_is_dir),
+        ):
+            listed = json.loads(await server.list_groups())
+            inspected = json.loads(await server.inspect_group("shop"))
+
+        shop = next(g for g in listed if g["name"] == "shop")
+        by_agent = {m["agent"]: m for m in shop["members"]}
+        assert by_agent["infra"]["healthy"] == "UNREADABLE"
+        assert by_agent["db"]["healthy"] is True  # member after the bad one survives
+
+        imembers = {m["agent"]: m for m in inspected["members"]}
+        assert imembers["infra"]["healthy"] == "UNREADABLE"
+        assert imembers["db"]["healthy"] is True

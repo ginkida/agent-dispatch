@@ -54,6 +54,15 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
         for key in ("capabilities", "risky_capabilities"):
             if not agent_data.get(key):
                 agent_data.pop(key, None)
+    # `groups` also defaults to {} (not None), so exclude_none keeps it — prune
+    # the whole block when empty, and drop empty per-group member lists. Empty
+    # LISTS only, mirroring capabilities; empty strings (description /
+    # shared_context / use_for) are kept, like AgentConfig.description.
+    for group_data in data.get("groups", {}).values():
+        if not group_data.get("members"):
+            group_data.pop("members", None)
+    if not data.get("groups"):
+        data.pop("groups", None)
     p.write_text(
         yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
         encoding="utf-8",

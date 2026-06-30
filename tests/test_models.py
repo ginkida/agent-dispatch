@@ -8,7 +8,9 @@ from pydantic import ValidationError
 from agent_dispatch.models import (
     AgentConfig,
     DispatchConfig,
+    DispatchGroup,
     DispatchResult,
+    GroupMember,
     Settings,
     check_permission_mode,
     validate_agent_name,
@@ -82,7 +84,10 @@ def test_dispatch_result_success():
 
 def test_dispatch_result_error_type():
     r = DispatchResult(
-        agent="test", success=False, result="", error="permission denied",
+        agent="test",
+        success=False,
+        result="",
+        error="permission denied",
         error_type="permission",
     )
     assert not r.success
@@ -173,11 +178,13 @@ class TestSettingsValidation:
 
     def test_cache_ttl_zero_allowed(self):
         from agent_dispatch.models import CacheSettings
+
         c = CacheSettings(ttl=0)
         assert c.ttl == 0
 
     def test_cache_ttl_negative_rejected(self):
         from agent_dispatch.models import CacheSettings
+
         with pytest.raises(ValidationError):
             CacheSettings(ttl=-1)
 
@@ -196,3 +203,54 @@ class TestBudgetExceededField:
 
         r = DispatchResult(agent="a", success=True, result="x", budget_exceeded=True)
         assert r.model_dump(exclude_none=True)["budget_exceeded"] is True
+
+
+class TestGroups:
+    def test_group_member_defaults(self):
+        m = GroupMember(agent="infra")
+        assert m.agent == "infra"
+        assert m.use_for == ""
+
+    def test_group_member_validates_agent_name(self):
+        with pytest.raises(ValidationError):
+            GroupMember(agent="-bad")
+
+    def test_dispatch_group_defaults(self):
+        g = DispatchGroup()
+        assert g.description == ""
+        assert g.shared_context == ""
+        assert g.members == []
+
+    def test_dispatch_config_groups_default_empty(self):
+        cfg = DispatchConfig()
+        assert cfg.groups == {}
+
+    def test_dispatch_config_accepts_groups(self):
+        cfg = DispatchConfig.model_validate(
+            {
+                "agents": {"web": {"directory": "/tmp"}},
+                "groups": {
+                    "shop": {
+                        "description": "coordinate",
+                        "shared_context": "facts",
+                        "members": [{"agent": "web", "use_for": "ui"}],
+                    }
+                },
+            }
+        )
+        grp = cfg.groups["shop"]
+        assert grp.shared_context == "facts"
+        assert grp.members[0].agent == "web"
+        assert grp.members[0].use_for == "ui"
+
+    def test_group_key_must_be_valid_name(self):
+        with pytest.raises(ValidationError):
+            DispatchConfig.model_validate({"groups": {"-bad": {}}})
+
+    def test_member_existence_not_enforced_at_load(self):
+        # Dangling member refs must NOT brick config load — they are flagged at
+        # read time and blocked at CLI mutation time instead.
+        cfg = DispatchConfig.model_validate(
+            {"groups": {"g": {"members": [{"agent": "ghost"}]}}}
+        )
+        assert cfg.groups["g"].members[0].agent == "ghost"

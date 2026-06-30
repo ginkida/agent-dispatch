@@ -15,7 +15,14 @@ from pydantic import ValidationError
 
 from .config import auto_describe, config_path, load_config, save_config
 from .jobs import JobStore, default_jobs_dir, is_valid_job_id
-from .models import AgentConfig, DispatchConfig, check_permission_mode, validate_agent_name
+from .models import (
+    AgentConfig,
+    DispatchConfig,
+    DispatchGroup,
+    GroupMember,
+    check_permission_mode,
+    validate_agent_name,
+)
 
 
 def _parse_csv(value: str | None) -> list[str] | None:
@@ -473,6 +480,176 @@ def describe(name: str) -> None:
             click.echo(f"  project files:    {', '.join(files)}")
     except OSError:
         pass
+
+
+@cli.group("group")
+def group_cmd() -> None:
+    """Manage agent groups (cross-project working sets)."""
+
+
+@group_cmd.command("add")
+@click.argument("name")
+@click.option(
+    "-d",
+    "--description",
+    default="",
+    help="Orchestrator-facing brief: how to coordinate the group (not sent to members).",
+)
+@click.option(
+    "--shared-context",
+    default="",
+    help="Member-facing facts (stack names, ids) auto-injected into group dispatches.",
+)
+@click.option(
+    "--member",
+    "members",
+    multiple=True,
+    help="Agent name to include (repeatable). Must already exist.",
+)
+def group_add(name: str, description: str, shared_context: str, members: tuple[str, ...]) -> None:
+    """Create a group referencing existing agents."""
+    try:
+        validate_agent_name(name)
+    except ValueError as e:
+        click.echo(f"Error: {e}")
+        raise SystemExit(1) from None
+
+    config = _load_or_exit()
+    if name in config.groups:
+        click.echo(
+            f"Group '{name}' already exists. Use 'agent-dispatch group remove {name}' first."
+        )
+        raise SystemExit(1)
+
+    member_objs: list[GroupMember] = []
+    for agent_name in members:
+        if agent_name not in config.agents:
+            click.echo(
+                click.style(
+                    f"Error: agent '{agent_name}' not found. "
+                    "Add it first ('agent-dispatch add') or check the name.",
+                    fg="red",
+                )
+            )
+            raise SystemExit(1)
+        member_objs.append(GroupMember(agent=agent_name))
+
+    config.groups[name] = DispatchGroup(
+        description=description,
+        shared_context=shared_context,
+        members=member_objs,
+    )
+    save_config(config)
+    click.echo(f"Added group '{name}' ({len(member_objs)} member(s)).")
+    if not member_objs:
+        click.echo(
+            click.style(
+                "Warning: group has no members yet. Recreate with --member, "
+                "or add agents + use_for hints by editing agents.yaml.",
+                fg="yellow",
+            )
+        )
+
+
+@group_cmd.command("list")
+def group_list() -> None:
+    """List configured groups."""
+    config = _load_or_exit()
+    if not config.groups:
+        click.echo("No groups configured. Run: agent-dispatch group add <name> --member <agent>")
+        return
+
+    for name, grp in config.groups.items():
+        click.echo(f"  {click.style(name, bold=True)} ({len(grp.members)} member(s))")
+        if grp.description:
+            click.echo(f"    desc: {grp.description}")
+        rendered: list[str] = []
+        for m in grp.members:
+            if m.agent in config.agents:
+                rendered.append(m.agent)
+            else:
+                rendered.append(click.style(f"{m.agent}(unknown)", fg="red"))
+        if rendered:
+            click.echo(f"    members: {', '.join(rendered)}")
+        click.echo(f"    shared context: {'yes' if grp.shared_context.strip() else 'no'}")
+        click.echo()
+
+
+@group_cmd.command("inspect")
+@click.argument("name")
+def group_inspect(name: str) -> None:
+    """Show a group's brief, shared context, and members."""
+    config = _load_or_exit()
+    if name not in config.groups:
+        click.echo(f"Group '{name}' not found. Run 'agent-dispatch group list' to see groups.")
+        raise SystemExit(1)
+
+    grp = config.groups[name]
+    click.echo(click.style(name, bold=True))
+    if grp.description:
+        click.echo(f"  description:    {grp.description}")
+    if grp.shared_context:
+        click.echo("  shared_context:")
+        for line in grp.shared_context.splitlines():
+            click.echo(f"    {line}")
+    click.echo(f"  members ({len(grp.members)}):")
+    for m in grp.members:
+        marker = "" if m.agent in config.agents else click.style(" (unknown)", fg="red")
+        hint = f" — {m.use_for}" if m.use_for else ""
+        click.echo(f"    - {m.agent}{marker}{hint}")
+    if not grp.members:
+        click.echo(
+            click.style(
+                "    (no members — recreate with --member or edit agents.yaml)", fg="yellow"
+            )
+        )
+
+
+@group_cmd.command("update")
+@click.argument("name")
+@click.option("-d", "--description", default=None, help="New description (pass '' to clear).")
+@click.option("--shared-context", default=None, help="New shared context (pass '' to clear).")
+def group_update(name: str, description: str | None, shared_context: str | None) -> None:
+    """Update a group's description / shared_context.
+
+    These are plain text fields: a new value is stored literally (pass an empty
+    string to clear). Edit members by recreating the group or editing
+    agents.yaml.
+    """
+    config = _load_or_exit()
+    if name not in config.groups:
+        click.echo(f"Group '{name}' not found. Run 'agent-dispatch group list' to see groups.")
+        raise SystemExit(1)
+
+    grp = config.groups[name]
+    updated: list[str] = []
+    if description is not None:
+        grp.description = description
+        updated.append("description")
+    if shared_context is not None:
+        grp.shared_context = shared_context
+        updated.append("shared_context")
+
+    if not updated:
+        click.echo("Nothing to update. Pass --description and/or --shared-context.")
+        raise SystemExit(1)
+
+    save_config(config)
+    click.echo(f"Updated group '{name}': {', '.join(updated)}")
+
+
+@group_cmd.command("remove")
+@click.argument("name")
+def group_remove(name: str) -> None:
+    """Remove a group (does not touch the underlying agents)."""
+    config = _load_or_exit()
+    if name not in config.groups:
+        click.echo(f"Group '{name}' not found.")
+        raise SystemExit(1)
+
+    del config.groups[name]
+    save_config(config)
+    click.echo(f"Removed group '{name}'.")
 
 
 @cli.command()

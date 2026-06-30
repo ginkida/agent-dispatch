@@ -1119,3 +1119,123 @@ class TestJobsCommands:
         assert result.exit_code == 0
         assert "Deleted 1 job(s)" in result.output
         assert jobs_env.get(job.id) is None
+
+
+class TestGroup:
+    def _add_agents(self, tmp_path: Path, *names: str) -> None:
+        for n in names:
+            d = tmp_path / n
+            d.mkdir(exist_ok=True)
+            res = runner.invoke(cli, ["add", n, str(d), "-d", f"{n} agent"])
+            assert res.exit_code == 0, res.output
+
+    def test_group_add_and_list(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web", "infra")
+        res = runner.invoke(
+            cli,
+            [
+                "group",
+                "add",
+                "shop",
+                "-d",
+                "Coordinate the shop",
+                "--shared-context",
+                "Prod stack shop",
+                "--member",
+                "web",
+                "--member",
+                "infra",
+            ],
+        )
+        assert res.exit_code == 0
+        assert "Added group 'shop' (2 member(s))" in res.output
+
+        loaded = load_config()
+        assert "shop" in loaded.groups
+        assert [m.agent for m in loaded.groups["shop"].members] == ["web", "infra"]
+
+        res = runner.invoke(cli, ["group", "list"])
+        assert res.exit_code == 0
+        assert "shop" in res.output
+        assert "shared context: yes" in res.output
+
+    def test_group_add_duplicate_rejected(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(cli, ["group", "add", "shop", "--member", "web"])
+        res = runner.invoke(cli, ["group", "add", "shop", "--member", "web"])
+        assert res.exit_code == 1
+        assert "already exists" in res.output
+
+    def test_group_add_unknown_member_rejected(self, tmp_path: Path):
+        res = runner.invoke(cli, ["group", "add", "shop", "--member", "ghost"])
+        assert res.exit_code == 1
+        assert "not found" in res.output
+        # Nothing persisted.
+        assert "shop" not in load_config().groups
+
+    def test_group_add_invalid_name_rejected(self, tmp_path: Path):
+        # `--` stops option parsing so the leading-dash name reaches validation.
+        res = runner.invoke(cli, ["group", "add", "--", "-bad"])
+        assert res.exit_code == 1
+        assert "Invalid agent name" in res.output
+
+    def test_group_add_empty_warns(self, tmp_path: Path):
+        res = runner.invoke(cli, ["group", "add", "solo"])
+        assert res.exit_code == 0
+        assert "no members yet" in res.output
+
+    def test_group_inspect(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(
+            cli,
+            ["group", "add", "shop", "--shared-context", "Stack facts", "--member", "web"],
+        )
+        res = runner.invoke(cli, ["group", "inspect", "shop"])
+        assert res.exit_code == 0
+        assert "Stack facts" in res.output
+        assert "web" in res.output
+
+    def test_group_inspect_missing(self, tmp_path: Path):
+        res = runner.invoke(cli, ["group", "inspect", "nope"])
+        assert res.exit_code == 1
+        assert "not found" in res.output
+
+    def test_group_update(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(cli, ["group", "add", "shop", "-d", "old", "--member", "web"])
+        res = runner.invoke(cli, ["group", "update", "shop", "--shared-context", "new facts"])
+        assert res.exit_code == 0
+        assert load_config().groups["shop"].shared_context == "new facts"
+
+    def test_group_update_clear_via_empty_string(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(cli, ["group", "add", "shop", "--shared-context", "facts", "--member", "web"])
+        res = runner.invoke(cli, ["group", "update", "shop", "--shared-context", ""])
+        assert res.exit_code == 0
+        assert load_config().groups["shop"].shared_context == ""
+
+    def test_group_update_nothing(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(cli, ["group", "add", "shop", "--member", "web"])
+        res = runner.invoke(cli, ["group", "update", "shop"])
+        assert res.exit_code == 1
+        assert "Nothing to update" in res.output
+
+    def test_group_remove(self, tmp_path: Path):
+        self._add_agents(tmp_path, "web")
+        runner.invoke(cli, ["group", "add", "shop", "--member", "web"])
+        res = runner.invoke(cli, ["group", "remove", "shop"])
+        assert res.exit_code == 0
+        assert "shop" not in load_config().groups
+        # Underlying agent is untouched.
+        assert "web" in load_config().agents
+
+    def test_group_remove_missing(self, tmp_path: Path):
+        res = runner.invoke(cli, ["group", "remove", "nope"])
+        assert res.exit_code == 1
+        assert "not found" in res.output
+
+    def test_group_list_empty(self, tmp_path: Path):
+        res = runner.invoke(cli, ["group", "list"])
+        assert res.exit_code == 0
+        assert "No groups configured" in res.output
