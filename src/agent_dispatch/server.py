@@ -53,6 +53,12 @@ mcp = FastMCP(
         "6. dispatch_stream(agent, task) — live progress updates\n"
         "7. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
         "8. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "GROUPS (coordinate a set of related projects):\n"
+        "- list_groups() — see configured groups (code repos + gateway agents)\n"
+        "- inspect_group(name) — the group's brief + members + shared facts\n"
+        "- dispatch(agent, task, group=name) — agent must be a member; the "
+        "group's shared_context (stack names, ids, conventions) is auto-prepended "
+        "to your context. Works on dispatch and per-item in dispatch_parallel.\n\n"
         "TIMEOUTS: pass timeout_seconds= per call for known-long tasks (no config "
         "edit needed). If a dispatch times out anyway, the error includes a "
         "session_id — resume the partial work via dispatch_session(agent, "
@@ -195,6 +201,64 @@ def _validate_agent(config: DispatchConfig, name: str) -> str | None:
         available = ", ".join(config.agents.keys()) or "(none configured)"
         return json.dumps({"error": f"Unknown agent: {name!r}. Available: {available}"})
     return None
+
+
+def _validate_group(config: DispatchConfig, name: str) -> str | None:
+    """Return an error JSON string if the group doesn't exist, else None."""
+    if name not in config.groups:
+        available = ", ".join(config.groups.keys()) or "(none configured)"
+        return json.dumps({"error": f"Unknown group: {name!r}. Available: {available}"})
+    return None
+
+
+def _validate_group_member(config: DispatchConfig, group: str, agent: str) -> str | None:
+    """Return an error JSON string if (group, agent) is not a valid membership.
+
+    Validates the group exists and `agent` is one of its members. A str|None
+    validator (not a value-returning helper) so it plugs into the established
+    walrus idiom: ``if err := _validate_group_member(...): return err``. The
+    actual shared_context merge is a separate pure function (_merge_group_context)
+    — this split keeps dispatch_parallel's up-front-rejection contract intact.
+    """
+    if err := _validate_group(config, group):
+        return err
+    members = [m.agent for m in config.groups[group].members]
+    if agent not in members:
+        if not members:
+            return json.dumps(
+                {
+                    "error": f"Group {group!r} has no members yet. Add some with "
+                    "'agent-dispatch group add' or by editing agents.yaml."
+                }
+            )
+        return json.dumps(
+            {
+                "error": f"Agent {agent!r} is not a member of group {group!r}. "
+                f"Members: {', '.join(members)}"
+            }
+        )
+    return None
+
+
+def _merge_group_context(config: DispatchConfig, group: str, context: str | None) -> str | None:
+    """Fold a group's member-facing shared_context into the per-call context.
+
+    Returns the effective context string (or None when both are empty). The
+    group's shared_context is prepended as a labeled block so the member knows
+    these are group-wide facts. Pure value function — assumes membership was
+    already validated by the caller. Folding into the context STRING (rather
+    than a new prompt section or cache-key field) keeps runner.py and cache.py
+    untouched and the cache key correct: a different shared_context yields a
+    different effective context and therefore a different key, while group=""
+    leaves the context byte-identical to today (full backward compatibility).
+    """
+    shared = config.groups[group].shared_context.strip() if group in config.groups else ""
+    ctx = (context or "").strip()
+    if shared and ctx:
+        return f"Shared context (group {group!r}):\n{shared}\n\n{ctx}"
+    if shared:
+        return f"Shared context (group {group!r}):\n{shared}"
+    return context or None
 
 
 def _validate_ref(ref: str) -> str | None:
@@ -416,6 +480,105 @@ async def inspect_agent(
 
 
 @mcp.tool()
+async def list_groups(ctx: Context | None = None) -> str:
+    """List configured agent groups — cross-project working sets.
+
+    A group bundles related agents (code projects + capability gateways such as
+    infra or analytics) so one orchestrating session can coordinate work across
+    them. This is a cheap, descriptive readout: it never spawns a claude
+    subprocess and does no routing — you pick members by reading their hints.
+
+    Then: inspect_group(name) for the full brief + members, and
+    dispatch(agent, task, group=name) to auto-attach the group's shared facts.
+    """
+    config = _get_config()
+    if not config.groups:
+        return json.dumps(
+            {"error": "No groups configured. Create one: agent-dispatch group add <name>"},
+            indent=2,
+        )
+
+    groups = []
+    for name, grp in config.groups.items():
+        members = []
+        for m in grp.members:
+            entry: dict = {"agent": m.agent}
+            if m.use_for:
+                entry["use_for"] = m.use_for
+            # Flag dangling refs (agent removed) instead of crashing — never
+            # touch config.agents[m.agent] when it's unknown.
+            if m.agent not in config.agents:
+                entry["unknown"] = True
+            else:
+                try:
+                    entry["healthy"] = config.agents[m.agent].directory.is_dir()
+                except OSError:
+                    entry["healthy"] = "UNREADABLE"
+            members.append(entry)
+        groups.append(
+            {
+                "name": name,
+                "description": grp.description,
+                "shared_context_present": bool(grp.shared_context.strip()),
+                "member_count": len(grp.members),
+                "members": members,
+            }
+        )
+    if ctx:
+        await ctx.info(f"Found {len(groups)} configured groups")
+    return json.dumps(groups, indent=2)
+
+
+@mcp.tool()
+async def inspect_group(name: str, ctx: Context | None = None) -> str:
+    """Inspect one group: its orchestration brief, shared facts, and members.
+
+    Returns the orchestrator-facing ``description`` (how to coordinate the
+    group), the full member-facing ``shared_context`` (the facts auto-injected
+    into dispatches made with group=), and the member list with each agent's
+    ``use_for`` hint + health. For a deep dive on a specific member, call
+    inspect_agent(member) — this tool deliberately stays a cheap membership +
+    brief readout and does not duplicate inspect_agent's per-project scan.
+
+    Args:
+        name: Group name (from list_groups).
+    """
+    config = _get_config()
+    if err := _validate_group(config, name):
+        return err
+
+    grp = config.groups[name]
+    members = []
+    for m in grp.members:
+        entry: dict = {"agent": m.agent}
+        if m.use_for:
+            entry["use_for"] = m.use_for
+        if m.agent not in config.agents:
+            entry["unknown"] = True
+        else:
+            agent = config.agents[m.agent]
+            entry["directory"] = str(agent.directory)
+            if agent.description:
+                entry["description"] = agent.description
+            try:
+                entry["healthy"] = agent.directory.is_dir()
+            except OSError:
+                entry["healthy"] = "UNREADABLE"
+        members.append(entry)
+
+    info = {
+        "name": name,
+        "description": grp.description,
+        "shared_context": grp.shared_context,
+        "member_count": len(grp.members),
+        "members": members,
+    }
+    if ctx:
+        await ctx.info(f"Inspected group {name} ({len(members)} members)")
+    return json.dumps(info, indent=2)
+
+
+@mcp.tool()
 async def dispatch(
     agent: str,
     task: str,
@@ -426,6 +589,7 @@ async def dispatch(
     return_ref: bool = False,
     summary_chars: int = _DEFAULT_SUMMARY_CHARS,
     timeout_seconds: int = 0,
+    group: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Delegate a task to an agent in another project directory.
@@ -455,12 +619,22 @@ async def dispatch(
             you know are long instead of editing the agent config. If a
             dispatch still times out, the error includes a session_id you can
             resume via dispatch_session.
+        group: Optional group name (from list_groups). When set, the agent must
+            be a member of the group, and the group's shared_context (member-
+            facing facts) is auto-prepended to ``context``. Leave empty for a
+            plain dispatch.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
+    if group and (err := _validate_group_member(config, group, agent)):
+        return err
 
     rf = response_format or None
+    # Fold the group's shared facts into the context once, then reuse the same
+    # string at every cache/runner/persist site below — store-under-merged /
+    # fetch-under-raw would otherwise make every group dispatch a cache miss.
+    effective_context = _merge_group_context(config, group, context) if group else (context or None)
 
     # Check cache. caller/goal/response_format are part of the key because
     # they change the prompt sent to Claude and therefore the response.
@@ -469,7 +643,7 @@ async def dispatch(
         cached = cache.get(
             agent,
             task,
-            context or None,
+            effective_context,
             caller or None,
             goal or None,
             rf,
@@ -492,7 +666,7 @@ async def dispatch(
             task,
             agent_config,
             config.settings,
-            context or None,
+            effective_context,
             caller=caller or None,
             goal=goal or None,
             response_format=rf,
@@ -504,7 +678,7 @@ async def dispatch(
             agent,
             task,
             result,
-            context or None,
+            effective_context,
             caller or None,
             goal or None,
             rf,
@@ -516,7 +690,7 @@ async def dispatch(
             agent,
             task,
             result,
-            context=context or None,
+            context=effective_context,
             caller=caller or None,
             goal=goal or None,
         )
@@ -598,7 +772,9 @@ async def dispatch_parallel(
     Args:
         dispatches: JSON array of requests, each with "agent", "task", and
             optional "context", "caller", "goal", "response_format",
-            "return_ref", "summary_chars", "timeout_seconds".  Example:
+            "return_ref", "summary_chars", "timeout_seconds", "group" (the
+            agent must be a member; its shared_context is auto-injected).
+            Example:
             [
               {"agent": "infra", "task": "check pod logs for errors"},
               {"agent": "db", "task": "are all migrations applied?", "timeout_seconds": 900}
@@ -640,6 +816,13 @@ async def dispatch_parallel(
             return json.dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
         if err := _validate_agent(config, item["agent"]):
             return err
+        # Group membership is validated up front too — keeps the documented
+        # contract that one bad item rejects the whole call before any paid
+        # subprocess runs. The actual shared_context merge happens in _run_one.
+        if item.get("group") and (
+            err := _validate_group_member(config, str(item["group"]), item["agent"])
+        ):
+            return err
         # Numeric fields are coerced inside _run_one — validate here so a bad
         # value rejects the whole call before any dispatch runs (per contract),
         # instead of surfacing as a cryptic per-item int() error.
@@ -666,6 +849,12 @@ async def dispatch_parallel(
         name = item["agent"]
         task = item["task"]
         item_context = item.get("context") or None
+        item_group = str(item["group"]) if item.get("group") else ""
+        # Fold group shared_context once, reuse at every cache/runner/persist
+        # site below (see dispatch()). Membership was validated up front.
+        effective_context = (
+            _merge_group_context(config, item_group, item_context) if item_group else item_context
+        )
         item_caller = item.get("caller") or None
         item_goal = item.get("goal") or None
         item_rf = item.get("response_format") or None
@@ -681,7 +870,7 @@ async def dispatch_parallel(
             cached = cache.get(
                 name,
                 task,
-                item_context,
+                effective_context,
                 item_caller,
                 item_goal,
                 item_rf,
@@ -693,7 +882,7 @@ async def dispatch_parallel(
                         name,
                         task,
                         cached,
-                        context=item_context,
+                        context=effective_context,
                         caller=item_caller,
                         goal=item_goal,
                     )
@@ -712,7 +901,7 @@ async def dispatch_parallel(
                 task,
                 agent_config,
                 config.settings,
-                item_context,
+                effective_context,
                 caller=item_caller,
                 goal=item_goal,
                 response_format=item_rf,
@@ -723,7 +912,7 @@ async def dispatch_parallel(
                 name,
                 task,
                 result,
-                item_context,
+                effective_context,
                 item_caller,
                 item_goal,
                 item_rf,
@@ -735,7 +924,7 @@ async def dispatch_parallel(
                 name,
                 task,
                 result,
-                context=item_context,
+                context=effective_context,
                 caller=item_caller,
                 goal=item_goal,
             )

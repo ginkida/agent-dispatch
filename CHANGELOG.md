@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-30
+
+Coordinate a group of related projects from one session.
+
+### Added
+- **Project groups.** A new `groups` mapping in the config bundles related
+  agents — code repos plus capability gateways like infra (Portainer) or
+  analytics (browser / Yandex Metrica) — into a cross-project working set.
+  Each group has an orchestrator-facing `description` (how to coordinate, never
+  sent to members) and a member-facing `shared_context` of facts (stack names,
+  ids, conventions). Members reference agents by name; membership is
+  many-to-many (a shared gateway can belong to several groups). A group is a
+  *descriptive layer*, not an execution engine — there is no router; the
+  orchestrating LLM coordinates with the existing dispatch tools.
+- **`list_groups()` / `inspect_group(name)` MCP tools** — cheap, no-subprocess
+  readouts of groups, their briefs, and members (dangling member refs are
+  flagged, never crash). For a deep dive on a member, use `inspect_agent`.
+- **`group=` on `dispatch` and per-item in `dispatch_parallel`** — when set,
+  the agent must be a member of the group and the group's `shared_context` is
+  auto-prepended to the call's `context`. Folded into the context string, so
+  the cache key disambiguates groups automatically and `group=""` is byte-for-
+  byte identical to a plain dispatch. Parallel validates membership up front
+  (one bad item rejects the whole call before any subprocess runs).
+- **`agent-dispatch group` CLI** — `add` / `list` / `inspect` / `update` /
+  `remove` for managing groups, mirroring the agent commands.
+
+### Changed
+- `save_config` prunes an empty `groups` block and empty member lists so
+  group-less configs stay clean in YAML (same idiom as capabilities).
+
 ## [0.8.0] - 2026-06-17
 
 Let agents declare what they are good at, so callers can pick the right one.

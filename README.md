@@ -120,6 +120,37 @@ Cheap detailed lookup — reads the agent's files without spawning a `claude` se
 
 Use this **before** `dispatch_async`/`dispatch` to confirm an agent has the tools and context for your task — much cheaper than a probe dispatch.
 
+### Groups
+
+A **group** bundles related agents into a cross-project working set — typically a few code repos plus capability gateways (an `infra` agent with a Portainer MCP, an `analytics` agent with a browser + Yandex Metrica). It lets one orchestrating session coordinate work that spans code, deploy, and verification.
+
+A group is a **descriptive layer, not an execution engine** — there is no router and no state machine. You pick members by reading their hints and coordinate with the normal dispatch tools. Two text fields target two audiences:
+
+- `description` — **orchestrator-facing**: how to coordinate the group (the order of steps, who to call for what). Surfaced by `list_groups`/`inspect_group`, **never** injected into a member's prompt.
+- `shared_context` — **member-facing facts** (stack names, counter ids, conventions) that hold regardless of which member reads them. Auto-prepended to a member's `context` when you pass `group=`.
+
+Members reference agents by name; membership is many-to-many (a shared gateway can belong to several groups). Manage groups with the `agent-dispatch group` CLI (`add`/`list`/`inspect`/`update`/`remove`) or by editing `agents.yaml`.
+
+**`list_groups()`** — cheap, no-subprocess readout of every group: description, member count, and each member's `use_for` hint + health. A member whose agent was removed is flagged `"unknown": true` rather than crashing.
+
+**`inspect_group(name)`** — one group's full brief: `description`, the complete `shared_context`, and the member list. For a deep dive on a specific member, call `inspect_agent(member)` — `inspect_group` deliberately stays a cheap membership readout.
+
+**Using a group** — pass `group=` to `dispatch` (or per-item in `dispatch_parallel`). The agent must be a member; its group's `shared_context` rides along automatically:
+
+```python
+# From the shop-web codebase, hand the deploy to the infra gateway.
+# The "shop" group's facts (stack name, counter id) are auto-attached.
+dispatch(
+    agent="infra",
+    task="Redeploy the shop-web container",
+    caller="shop-web",
+    goal="ship the checkout fix",
+    group="shop",
+)
+```
+
+`group=""` (the default) is byte-for-byte identical to a plain dispatch — the shared facts are folded into the `context` string, so the result cache disambiguates groups automatically and group-less calls are unaffected.
+
 ### `dispatch`
 
 One-shot task delegation. Results are cached — identical requests within TTL return instantly.
@@ -135,6 +166,7 @@ One-shot task delegation. Results are cached — identical requests within TTL r
 | `return_ref` | bool | no | When `true`, returns just a `ref` + summary preview instead of the full result text. Use `fetch_result(ref)` to load the full text on demand. |
 | `summary_chars` | int | no | Max chars of result text to include in the ref response (default 500). |
 | `timeout_seconds` | int | no | One-off timeout override for this call (0 = agent's configured timeout; clamped to 10–7200). No config edit needed for known-long tasks. |
+| `group` | string | no | Group name (from `list_groups`). The agent must be a member; the group's `shared_context` (member-facing facts) is auto-prepended to `context`. Empty = plain dispatch. See [Groups](#groups). |
 
 ```python
 # Call — recommended form (always include caller and goal)
@@ -244,7 +276,7 @@ Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `dispatches` | string (JSON) | yes | JSON array of `{"agent", "task", "context?", "caller?", "goal?", "response_format?", "return_ref?", "summary_chars?", "timeout_seconds?"}` |
+| `dispatches` | string (JSON) | yes | JSON array of `{"agent", "task", "context?", "caller?", "goal?", "response_format?", "return_ref?", "summary_chars?", "timeout_seconds?", "group?"}` (a per-item `group` validates membership up front and auto-injects its `shared_context`) |
 | `aggregate` | string | no | Agent name to synthesize all results into one answer |
 
 **Important:** `dispatches` is a JSON string, not a list.
@@ -426,6 +458,8 @@ Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `A
 | Check progress without blocking | `dispatch_status` |
 | Known-long task, one-off | any dispatch tool with `timeout_seconds=...` |
 | A dispatch timed out | `dispatch_session` with the `session_id` from the error |
+| Coordinating a set of related projects | define a [group](#groups), then `dispatch(..., group=name)` |
+| See which agents form a working set | `list_groups` / `inspect_group` |
 
 ## Error Recovery
 

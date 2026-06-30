@@ -41,6 +41,29 @@ agents:
   #   description: "Frontend React app. Can modify components, run build, check TypeScript errors."
   #   timeout: 180
 
+# Groups bundle related agents (code repos + capability gateways like infra)
+# into a cross-project working set. A group is a *descriptive layer* — there is
+# no router and no execution engine; the orchestrating session coordinates with
+# the normal dispatch tools. `members` reference agents above (many-to-many: a
+# shared gateway can belong to several groups). Manage via `agent-dispatch
+# group add/list/inspect/update/remove`; read via the list_groups /
+# inspect_group MCP tools; auto-attach the brief via dispatch(..., group="shop").
+groups:
+  shop:
+    # description = ORCHESTRATOR-facing: how to coordinate the group.
+    # Surfaced by list_groups/inspect_group, never injected into a member.
+    description: "E-commerce team. After a code change: deploy via infra, then verify the checkout funnel via the analytics gateway before reporting done."
+    # shared_context = MEMBER-facing FACTS, auto-prepended to group dispatches.
+    shared_context: |
+      Production runs in Portainer stack "shop".
+      Conversion is tracked in Yandex Metrica counter 12345.
+    members:
+      - agent: backend
+        use_for: orders/payments endpoints, migrations
+      - agent: infra
+        use_for: deploy, restart, container logs
+      # - agent: analytics   # a shared gateway agent could also live here
+
 settings:
   default_timeout: 300
   max_dispatch_depth: 3           # recursion protection: A -> B -> A

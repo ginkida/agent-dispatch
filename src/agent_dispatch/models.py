@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _AGENT_NAME_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$"
 
@@ -97,11 +97,66 @@ def validate_agent_name(name: str) -> str:
     return name
 
 
+class GroupMember(BaseModel):
+    """One member of a dispatch group: a reference to an existing agent.
+
+    `agent` is the name of an agent in `DispatchConfig.agents`. `use_for` is a
+    short, group-contextual hint ("dispatch me when...") that helps the
+    orchestrating LLM route within the group. It is descriptive only — never
+    passed to the `claude` CLI.
+    """
+
+    agent: str
+    use_for: str = ""
+
+    @field_validator("agent")
+    @classmethod
+    def _valid_agent(cls, v: str) -> str:
+        return validate_agent_name(v)
+
+
+class DispatchGroup(BaseModel):
+    """A named, descriptive group of agents for coordinated cross-project work.
+
+    A group is a *layer*, not an execution engine: there is no router and no
+    state machine — the orchestrating LLM coordinates using the normal dispatch
+    tools. The two text fields target two different audiences:
+
+    - `description` is ORCHESTRATOR-facing (how to coordinate the group, who to
+      call for what). It is surfaced by list_groups/inspect_group but is NEVER
+      injected into a member's prompt.
+    - `shared_context` is MEMBER-facing FACTS (stack names, counter ids,
+      conventions) that hold regardless of which member reads them. It is
+      auto-injected into dispatches made with `group=`.
+
+    `members` reference agents by name. Membership is many-to-many: a shared
+    gateway agent (e.g. infra, analytics) can belong to several groups.
+    """
+
+    description: str = ""
+    shared_context: str = ""
+    members: list[GroupMember] = Field(default_factory=list)
+
+
 class DispatchConfig(BaseModel):
-    """Top-level config: agents + settings."""
+    """Top-level config: agents + groups + settings."""
 
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
+    groups: dict[str, DispatchGroup] = Field(default_factory=dict)
     settings: Settings = Field(default_factory=Settings)
+
+    @model_validator(mode="after")
+    def _validate_group_names(self) -> DispatchConfig:
+        # Validate only the group KEYS (cheap, keeps prompt-label construction
+        # provably safe regardless of how the YAML was hand-authored).
+        # Deliberately does NOT check that each member's agent exists — gateway
+        # agents are shared and a hard cross-ref check would make removing one
+        # brick config load (every CLI command + MCP call dies in load_config).
+        # Dangling refs are flagged at read time (list_groups/inspect_group) and
+        # blocked at CLI mutation time instead.
+        for name in self.groups:
+            validate_agent_name(name)
+        return self
 
 
 class DispatchResult(BaseModel):
