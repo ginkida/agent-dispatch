@@ -852,6 +852,57 @@ class TestDoctor:
         assert "CLAUDE.md" in result.output
         assert ".mcp.json" in result.output
 
+    def test_healthy_group_passes(self, tmp_path: Path, _isolated_config: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text(
+            f"agents:\n  proj:\n    directory: {agent_dir}\n"
+            "groups:\n  product:\n    members:\n      - agent: proj\n"
+        )
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "product: 1 member" in result.output
+        assert "All checks passed" in result.output
+
+    def test_dangling_group_member_fails(self, tmp_path: Path, _isolated_config: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text(
+            f"agents:\n  proj:\n    directory: {agent_dir}\n"
+            "groups:\n  product:\n    members:\n"
+            "      - agent: proj\n      - agent: removed_gateway\n"
+        )
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code != 0
+        assert "product: unknown member(s): removed_gateway" in result.output
+        assert "group remove product && agent-dispatch group add product --member" in result.output
+
+    def test_empty_group_warns(self, tmp_path: Path, _isolated_config: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        _isolated_config.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_config.write_text(
+            f"agents:\n  proj:\n    directory: {agent_dir}\ngroups:\n  product:\n    members: []\n"
+        )
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}"),
+            self._patch_claude_mcp_list(registered=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == 0
+        assert "product: no members configured" in result.output
+        assert "1 warning" in result.output
+
     def test_summary_singular_plural(self, tmp_path: Path):
         """One issue should say 'issue' not 'issues'."""
         with patch("agent_dispatch.cli.shutil.which", return_value=None):

@@ -192,17 +192,18 @@ class JobStore:
     def mark_running(self, job_id: str) -> Job | None:
         """Mark a pending job as running.
 
-        Returns the updated job, or None if the job is missing OR has already
-        been cancelled. Refusing to run a cancelled job closes the race with
-        ``cancel()``: both take ``self._lock``, so whichever wins, the worker
-        either sees ``cancelled`` (and skips) or sets ``running`` first (and
-        cancel then refuses).
+        Returns the updated job, or None unless the job exists and is still
+        pending. Refusing every non-pending state prevents a duplicate worker
+        from resurrecting a completed/failed/cancelled job. It also closes the
+        race with ``cancel()``: both take ``self._lock``, so whichever wins,
+        the worker either sees ``cancelled`` (and skips) or sets ``running``
+        first (and cancel then refuses).
         """
         with self._lock:
             job = self.get(job_id)
             if job is None:
                 return None
-            if job.status == "cancelled":
+            if job.status != "pending":
                 return None
             job.status = "running"
             job.started_at = time.time()

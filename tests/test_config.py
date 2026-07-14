@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_dispatch.config import auto_describe, load_config, save_config
+from agent_dispatch.config import auto_describe, collect_mcp_servers, load_config, save_config
 from agent_dispatch.models import (
     AgentConfig,
     DispatchConfig,
@@ -174,6 +174,34 @@ def test_auto_describe_with_stack_indicators(tmp_path: Path):
 def test_auto_describe_fallback(tmp_path: Path):
     desc = auto_describe(tmp_path)
     assert tmp_path.name in desc
+
+
+def test_collect_mcp_servers_ignores_wrong_json_shapes(tmp_path: Path):
+    (tmp_path / ".mcp.json").write_text("[]")
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text('{"mcpServers": []}')
+
+    assert collect_mcp_servers(tmp_path) == []
+
+
+def test_auto_describe_tolerates_malformed_metadata_shapes(tmp_path: Path):
+    (tmp_path / "CLAUDE.md").write_bytes(b"\xff\xfe")
+    (tmp_path / "README.md").write_bytes(b"\xff\xfe")
+    (tmp_path / "pyproject.toml").write_text("description\n")
+    (tmp_path / "package.json").write_text("[]")
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": []}')
+
+    assert auto_describe(tmp_path) == "Stack: Python, Node.js"
+
+
+def test_auto_describe_ignores_empty_package_json_description(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"description": ""}')
+
+    desc = auto_describe(tmp_path)
+
+    assert not desc.startswith(" | ")
+    assert "Stack: Node.js" == desc
 
 
 def test_save_and_load_groups_roundtrip(tmp_path: Path):

@@ -613,7 +613,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch group <add\|list\|inspect\|update\|remove>` | Manage [groups](#groups) — cross-project working sets of agents |
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
-| `agent-dispatch doctor` | Diagnose installation: claude CLI, MCP registration, agent health |
+| `agent-dispatch doctor` | Diagnose installation: Claude CLI, MCP registration, agent health, and group membership |
 | `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
 | `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
 | `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |

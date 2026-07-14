@@ -158,6 +158,10 @@ class DispatchConfig(BaseModel):
             validate_agent_name(name)
         return self
 
+    def unknown_group_members(self, group: DispatchGroup) -> list[str]:
+        """Member agent names in `group` that aren't in `self.agents` (sorted, deduped)."""
+        return sorted({m.agent for m in group.members if m.agent not in self.agents})
+
 
 class DispatchResult(BaseModel):
     """Result of a dispatch call."""

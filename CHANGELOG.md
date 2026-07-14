@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-14
+
+`doctor` learns to check groups; three correctness fixes found in review.
+
+### Added
+- **`agent-dispatch doctor` diagnoses group health.** A new "Groups" section
+  reports each group's member count, flags dangling members (agents removed
+  from config but still referenced) as a failure, and empty groups as a
+  warning — each with a concrete remediation command.
+
+### Fixed
+- `auto_describe()`: an empty `"description"` field in `package.json` (a
+  common `npm init` placeholder) was no longer being filtered out, producing
+  malformed generated descriptions like `" | Stack: Node.js"`. Empty/blank
+  descriptions are ignored again.
+- `doctor`'s group remediation hints pointed at `group update --members`,
+  a flag that doesn't exist (`group update` only edits `description` /
+  `shared_context`; membership is set via `group add --member`). Hints now
+  point at the working `group remove` + `group add --member` recreation path.
+- `JobStore.mark_running()` now refuses to start any job that isn't
+  `pending` (previously only refused `cancelled`), closing a race where a
+  stale/duplicate worker could resurrect an already-finished or failed job.
+
+### Changed
+- Consolidated the "unknown group member" check — previously duplicated
+  across five call sites in `cli.py` and `server.py` — into a single
+  `DispatchConfig.unknown_group_members()` helper.
+
 ## [0.9.0] - 2026-06-30
 
 Coordinate a group of related projects from one session.

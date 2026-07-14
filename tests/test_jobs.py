@@ -315,6 +315,20 @@ class TestJobCancel:
         assert store.mark_running(job.id) is None
         assert store.get(job.id).status == "cancelled"
 
+    def test_mark_running_refuses_completed_job(self, store: JobStore):
+        job = store.create("agent", "task")
+        store.finish(job.id, DispatchResult(agent="agent", success=True, result="done"))
+
+        assert store.mark_running(job.id) is None
+        assert store.get(job.id).status == "done"
+
+    def test_mark_running_refuses_failed_job(self, store: JobStore):
+        job = store.create("agent", "task")
+        store.fail(job.id, "boom")
+
+        assert store.mark_running(job.id) is None
+        assert store.get(job.id).status == "failed"
+
 
 class TestRecoverStale:
     def test_recovers_old_running_job(self, store: JobStore):

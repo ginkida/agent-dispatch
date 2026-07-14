@@ -563,12 +563,13 @@ def group_list() -> None:
         click.echo(f"  {click.style(name, bold=True)} ({len(grp.members)} member(s))")
         if grp.description:
             click.echo(f"    desc: {grp.description}")
+        unknown_members = set(config.unknown_group_members(grp))
         rendered: list[str] = []
         for m in grp.members:
-            if m.agent in config.agents:
-                rendered.append(m.agent)
-            else:
+            if m.agent in unknown_members:
                 rendered.append(click.style(f"{m.agent}(unknown)", fg="red"))
+            else:
+                rendered.append(m.agent)
         if rendered:
             click.echo(f"    members: {', '.join(rendered)}")
         click.echo(f"    shared context: {'yes' if grp.shared_context.strip() else 'no'}")
@@ -593,8 +594,9 @@ def group_inspect(name: str) -> None:
         for line in grp.shared_context.splitlines():
             click.echo(f"    {line}")
     click.echo(f"  members ({len(grp.members)}):")
+    unknown_members = set(config.unknown_group_members(grp))
     for m in grp.members:
-        marker = "" if m.agent in config.agents else click.style(" (unknown)", fg="red")
+        marker = click.style(" (unknown)", fg="red") if m.agent in unknown_members else ""
         hint = f" — {m.use_for}" if m.use_for else ""
         click.echo(f"    - {m.agent}{marker}{hint}")
     if not grp.members:
@@ -749,6 +751,32 @@ def doctor() -> None:
                     fail(f"{name}: directory missing - {agent.directory}")
             except OSError as e:
                 fail(f"{name}: directory unreadable - {e}")
+
+    section("Groups")
+    if config is None:
+        warn("Skipped (config could not be loaded)")
+    elif not config.groups:
+        ok("No groups configured")
+    else:
+        for name, group in config.groups.items():
+            unknown = config.unknown_group_members(group)
+            if unknown:
+                missing = ", ".join(unknown)
+                fail(f"{name}: unknown member(s): {missing}")
+                click.echo(
+                    f"    Fix by recreating: agent-dispatch group remove {name} && "
+                    f"agent-dispatch group add {name} --member ... (or edit agents.yaml)"
+                )
+            elif not group.members:
+                warn(f"{name}: no members configured")
+                click.echo(
+                    f"    Add members by recreating: agent-dispatch group remove {name} && "
+                    f"agent-dispatch group add {name} --member agent1 --member agent2"
+                )
+            else:
+                count = len(group.members)
+                suffix = "member" if count == 1 else "members"
+                ok(f"{name}: {count} {suffix}")
 
     section("Summary")
     issues = counters["issues"]

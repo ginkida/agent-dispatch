@@ -500,6 +500,7 @@ async def list_groups(ctx: Context | None = None) -> str:
 
     groups = []
     for name, grp in config.groups.items():
+        unknown_members = set(config.unknown_group_members(grp))
         members = []
         for m in grp.members:
             entry: dict = {"agent": m.agent}
@@ -507,7 +508,7 @@ async def list_groups(ctx: Context | None = None) -> str:
                 entry["use_for"] = m.use_for
             # Flag dangling refs (agent removed) instead of crashing — never
             # touch config.agents[m.agent] when it's unknown.
-            if m.agent not in config.agents:
+            if m.agent in unknown_members:
                 entry["unknown"] = True
             else:
                 try:
@@ -548,12 +549,13 @@ async def inspect_group(name: str, ctx: Context | None = None) -> str:
         return err
 
     grp = config.groups[name]
+    unknown_members = set(config.unknown_group_members(grp))
     members = []
     for m in grp.members:
         entry: dict = {"agent": m.agent}
         if m.use_for:
             entry["use_for"] = m.use_for
-        if m.agent not in config.agents:
+        if m.agent in unknown_members:
             entry["unknown"] = True
         else:
             agent = config.agents[m.agent]

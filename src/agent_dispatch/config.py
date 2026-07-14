@@ -80,8 +80,13 @@ def _collect_mcp_servers(directory: Path) -> list[str]:
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                servers.extend(data.get("mcpServers", {}).keys())
-            except (json.JSONDecodeError, KeyError):
+                if not isinstance(data, dict):
+                    raise ValueError("top-level JSON value is not an object")
+                configured = data.get("mcpServers", {})
+                if not isinstance(configured, dict):
+                    raise ValueError("mcpServers is not an object")
+                servers.extend(str(name) for name in configured)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 logger.debug("Failed to parse MCP config: %s", path)
     return list(dict.fromkeys(servers))  # deduplicate, preserve order
 
@@ -137,7 +142,12 @@ def auto_describe(directory: Path) -> str:
     claude_md = directory / "CLAUDE.md"
     if claude_md.exists():
         sentences: list[str] = []
-        for line in claude_md.read_text(encoding="utf-8").strip().splitlines()[:40]:
+        try:
+            lines = claude_md.read_text(encoding="utf-8").strip().splitlines()[:40]
+        except (OSError, UnicodeDecodeError):
+            logger.debug("Failed to read CLAUDE.md: %s", claude_md)
+            lines = []
+        for line in lines:
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and not stripped.startswith("--"):
                 sentences.append(stripped)
@@ -150,7 +160,12 @@ def auto_describe(directory: Path) -> str:
     if not parts:
         readme = directory / "README.md"
         if readme.exists():
-            for line in readme.read_text(encoding="utf-8").strip().splitlines()[:20]:
+            try:
+                lines = readme.read_text(encoding="utf-8").strip().splitlines()[:20]
+            except (OSError, UnicodeDecodeError):
+                logger.debug("Failed to read README.md: %s", readme)
+                lines = []
+            for line in lines:
                 stripped = line.strip()
                 if (
                     stripped
@@ -165,9 +180,17 @@ def auto_describe(directory: Path) -> str:
     # pyproject.toml — project description
     pyproject = directory / "pyproject.toml"
     if pyproject.exists():
-        for line in pyproject.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = pyproject.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            logger.debug("Failed to read pyproject.toml: %s", pyproject)
+            lines = []
+        for line in lines:
             if line.strip().startswith("description"):
-                desc = line.split("=", 1)[1].strip().strip('"').strip("'")
+                _, separator, value = line.partition("=")
+                if not separator:
+                    continue
+                desc = value.strip().strip('"').strip("'")
                 if desc:
                     parts.append(desc)
                 break
@@ -177,9 +200,11 @@ def auto_describe(directory: Path) -> str:
     if pkg_json.exists():
         try:
             pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
-            if pkg.get("description"):
-                parts.append(pkg["description"])
-        except (json.JSONDecodeError, KeyError):
+            if isinstance(pkg, dict):
+                desc = pkg.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    parts.append(desc)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             logger.debug("Failed to parse package.json: %s", pkg_json)
 
     # MCP servers — critical for understanding what tools this agent has
