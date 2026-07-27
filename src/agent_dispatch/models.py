@@ -174,7 +174,7 @@ class DispatchResult(BaseModel):
     duration_ms: int | None = None
     num_turns: int | None = None
     error: str | None = None
-    error_type: str | None = None  # permission, timeout, recursion, not_found, cli_error
+    error_type: str | None = None  # permission, timeout, recursion, not_found, budget, cli_error
     # Set when response_format="json" was requested AND the agent's result
     # parsed cleanly. None means: not requested, or requested but unparseable.
     parsed_result: Any | None = None

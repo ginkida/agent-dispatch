@@ -138,16 +138,146 @@ def _denial_hint(agent_name: str, denied_tools: list[str]) -> str:
     )
 
 
+def _effective_budget(agent: AgentConfig, settings: Settings) -> float | None:
+    """The spend cap for this dispatch: per-agent, else the settings default."""
+    return agent.max_budget_usd or settings.default_max_budget_usd
+
+
+# The claude CLI enforces `--max-budget-usd` itself: when the cap is reached it
+# ends the session and emits a result payload with `is_error: true`, NO `result`
+# field, `subtype: "error_max_budget_usd"`, `terminal_reason: "budget_exhausted"`
+# and the human-readable reason in `errors`. Verified against claude 2.1.220.
+_BUDGET_ERROR_SUBTYPE = "error_max_budget_usd"
+_BUDGET_TERMINAL_REASON = "budget_exhausted"
+
+# `errors` also comes from the untrusted subprocess — cap it like denied_tools.
+_MAX_ERROR_DETAILS = 5
+_MAX_ERROR_DETAIL_CHARS = 300
+
+
+def _is_budget_error(data: dict) -> bool:
+    """True when the CLI ended the session because the spend cap was reached."""
+    return (
+        data.get("subtype") == _BUDGET_ERROR_SUBTYPE
+        or data.get("terminal_reason") == _BUDGET_TERMINAL_REASON
+    )
+
+
+def _cli_error_details(data: dict) -> str:
+    """Best available failure text for an error payload that has no `result`.
+
+    CLI-level failures (budget exhausted, max turns, execution errors) carry no
+    `result` text — the reason lives in `errors` and `subtype`. Without this the
+    caller only ever saw "reported an error with no details".
+    """
+    errors = data.get("errors")
+    if isinstance(errors, list):
+        details = [
+            text[:_MAX_ERROR_DETAIL_CHARS]
+            for text in (str(item).strip() for item in errors[:_MAX_ERROR_DETAILS])
+            if text
+        ]
+        if details:
+            return "; ".join(details)
+    subtype = data.get("subtype")
+    if isinstance(subtype, str) and subtype.strip():
+        return f"claude CLI reported '{subtype.strip()[:_MAX_ERROR_DETAIL_CHARS]}'"
+    return ""
+
+
+def _budget_error_hint(agent_name: str, budget: float | None, session_uuid: str | None) -> str:
+    """Actionable hint for a dispatch the CLI stopped at the spend cap."""
+    cap = f"${budget:g}" if budget else "the configured cap"
+    msg = (
+        f"\n\nHint: the dispatch was stopped by the spend cap {cap} "
+        "(passed to claude as --max-budget-usd), so this answer is incomplete. "
+        f"Raise it (agent-dispatch update {agent_name} --max-budget-usd <amount>), "
+        "use a cheaper model, or split the task into smaller dispatches."
+    )
+    if session_uuid:
+        msg += (
+            f" Partial work may be resumable: dispatch_session(agent='{agent_name}', "
+            f"task='Continue where you left off', session_id='{session_uuid}')."
+        )
+    return msg
+
+
+def _build_error_result(
+    agent_name: str,
+    data: dict,
+    denied: list[str] | None,
+    agent: AgentConfig,
+    settings: Settings,
+    *,
+    session_fallback: str | None,
+    exit_code: int | None = None,
+) -> DispatchResult:
+    """Build the DispatchResult for a CLI payload with ``is_error: true``.
+
+    Shared by ``dispatch`` and ``dispatch_stream`` — the two paths differ only
+    in which session id they fall back to and whether an exit code is known.
+    Error-type precedence: budget (the CLI's own terminal reason) > denied tools
+    (a deterministic signal) > text classification.
+    """
+    raw_result = data.get("result", "")
+    result_text = str(raw_result) if raw_result else ""
+    detail = _cli_error_details(data)
+    if result_text:
+        error_text = result_text
+    elif detail:
+        error_text = f"Agent '{agent_name}' failed: {detail}"
+    else:
+        suffix = f" (exit code {exit_code})" if exit_code is not None else ""
+        error_text = f"Agent '{agent_name}' reported an error with no details{suffix}"
+
+    session_id = data.get("session_id") or session_fallback
+    budget_error = _is_budget_error(data)
+    if budget_error:
+        error_type = "budget"
+        error_text += _budget_error_hint(agent_name, _effective_budget(agent, settings), session_id)
+    elif denied:
+        # Denied tools are a stronger signal than substring matching.
+        error_type = "permission"
+        error_text += _permission_hint(agent_name)
+    else:
+        error_type = _classify_error(error_text)
+        if error_type == "permission":
+            error_text += _permission_hint(agent_name)
+
+    return _apply_budget(
+        DispatchResult(
+            agent=agent_name,
+            success=False,
+            result=result_text,
+            session_id=session_id,
+            cost_usd=data.get("total_cost_usd"),
+            duration_ms=data.get("duration_ms"),
+            num_turns=data.get("num_turns"),
+            error=error_text,
+            error_type=error_type,
+            denied_tools=denied,
+            # The cap was hit by definition — flag it even if the reported cost
+            # lands a hair under the budget after rounding.
+            budget_exceeded=True if budget_error else None,
+        ),
+        agent,
+        settings,
+    )
+
+
 def _apply_budget(result: DispatchResult, agent: AgentConfig, settings: Settings) -> DispatchResult:
     """Flag a result whose cost exceeded the configured budget (post-hoc).
 
-    ``claude -p`` has no spend-cap flag, so the budget cannot be enforced up
-    front — by the time the cost is known the money is already spent. The
-    result is therefore NOT failed; it gets ``budget_exceeded=True`` plus a
-    hint so callers notice runaway agents instead of the field being silently
-    ignored. Applied to error results too (a failed dispatch still costs).
+    The CLI's own ``--max-budget-usd`` stops a session once the cap is reached
+    (that path returns ``error_type="budget"``), but the last turn can still
+    overshoot, and the cap only covers a single dispatch. This adds the
+    post-hoc signal: ``budget_exceeded=True`` plus a hint, without failing the
+    result — the money is already spent. Applied to error results too.
     """
-    budget = agent.max_budget_usd or settings.default_max_budget_usd
+    budget = _effective_budget(agent, settings)
+    if result.error_type == "budget":
+        # Already flagged with a far more actionable message — don't double up.
+        return result
     if not budget or not result.cost_usd or result.cost_usd <= budget:
         return result
     result.budget_exceeded = True
@@ -510,36 +640,14 @@ def dispatch(
 
     is_error = data.get("is_error", False)
     if is_error:
-        raw_result = data.get("result", "")
-        error_text = (
-            str(raw_result)
-            if raw_result
-            else (
-                f"Agent '{agent_name}' reported an error with no details "
-                f"(exit code {proc.returncode})"
-            )
-        )
-        error_type = _classify_error(error_text)
-        if denied and error_type != "permission":
-            # Denied tools are a stronger signal than substring matching.
-            error_type = "permission"
-        if error_type == "permission":
-            error_text += _permission_hint(agent_name)
-        return _apply_budget(
-            DispatchResult(
-                agent=agent_name,
-                success=False,
-                result=str(raw_result) if raw_result else "",
-                session_id=data.get("session_id") or session_uuid,
-                cost_usd=data.get("total_cost_usd"),
-                duration_ms=data.get("duration_ms"),
-                num_turns=data.get("num_turns"),
-                error=error_text,
-                error_type=error_type,
-                denied_tools=denied,
-            ),
+        return _build_error_result(
+            agent_name,
+            data,
+            denied,
             agent,
             settings,
+            session_fallback=session_uuid,
+            exit_code=proc.returncode,
         )
 
     result_text = data.get("result", "")
@@ -749,32 +857,13 @@ def dispatch_stream(
         denied = _extract_denied_tools(result_data)
         is_error = result_data.get("is_error", False)
         if is_error:
-            raw_result = result_data.get("result", "")
-            error_text = (
-                str(raw_result)
-                if raw_result
-                else (f"Agent '{agent_name}' reported an error with no details")
-            )
-            error_type = _classify_error(error_text)
-            if denied and error_type != "permission":
-                error_type = "permission"
-            if error_type == "permission":
-                error_text += _permission_hint(agent_name)
-            return _apply_budget(
-                DispatchResult(
-                    agent=agent_name,
-                    success=False,
-                    result=str(raw_result) if raw_result else "",
-                    session_id=result_data.get("session_id") or new_session,
-                    cost_usd=result_data.get("total_cost_usd"),
-                    duration_ms=result_data.get("duration_ms"),
-                    num_turns=result_data.get("num_turns"),
-                    error=error_text,
-                    error_type=error_type,
-                    denied_tools=denied,
-                ),
+            return _build_error_result(
+                agent_name,
+                result_data,
+                denied,
                 agent,
                 settings,
+                session_fallback=new_session,
             )
         result_text = result_data.get("result", "")
         parsed = _parse_structured_response(result_text) if response_format == "json" else None

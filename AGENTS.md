@@ -28,7 +28,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 466 tests, ~2s — all subprocess calls are mocked
+python3 -m pytest tests/ -v   # 495 tests, ~2s — all subprocess calls are mocked
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`.
@@ -36,14 +36,20 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 ## Non-obvious invariants (violating these breaks real behavior)
 
 - `allowed_tools` / `disallowed_tools` are **tri-state**: `None` = inherit settings defaults, `[]` = explicitly no tools, `[...]` = exactly these. Check with `is not None`, never `or` — `[]` is falsy but semantically distinct.
-- `denied_tools` non-empty + `is_error` ⇒ `error_type="permission"`, regardless of what the error text matches.
+- Error-type precedence on an `is_error` payload (`_build_error_result`): the CLI's own budget stop wins, then `denied_tools` non-empty ⇒ `error_type="permission"` regardless of the error text, then text classification.
 - **Groups**: a group's `shared_context` is folded into the `context` *string* before the cache/runner calls (`_merge_group_context` in server.py) — runner.py and cache.py are untouched, the cache key disambiguates groups for free, and `group=""` is byte-identical to a plain dispatch. Membership is validated up front (`_validate_group_member`, separate from the pure merge so `dispatch_parallel`'s all-or-nothing pre-check holds). `DispatchConfig` validates only group *keys*, never member existence — a hard cross-ref check would brick config load when a shared gateway agent is removed; dangling refs are flagged (`unknown:true`) at read time instead.
 - On failure, callers read `DispatchResult.error` + `error_type` — `result` holds the raw agent output even on errors.
 - `--session-id` and `--resume` conflict — never pass both to `claude`.
 - Valid permission modes: `default`, `plan`, `bypassPermissions` (`models.py: KNOWN_PERMISSION_MODES`).
-- `JobStore.finish`/`fail` refuse already-terminal jobs (returns `None`) — this closes the race with force-cancel; never "fix" it by overwriting.
+- `JobStore.finish`/`fail` refuse already-terminal jobs (returns `None`) — this closes the race with force-cancel; never "fix" it by overwriting. `mark_running` likewise refuses any job that isn't `pending`, so a stale or duplicate worker can't resurrect a finished one.
+- "Is this group member missing?" has exactly one implementation: `DispatchConfig.unknown_group_members()`. Any new surface that lists or validates membership calls it instead of re-deriving the check.
 - Cancelling a *running* job requires the in-memory `_running_procs` registry (server.py) — the job is marked `cancelled` **before** the subprocess is killed. Don't persist PIDs to disk (PID reuse after restart could kill an unrelated process).
-- `max_budget_usd` is **post-hoc**: `_apply_budget` (runner.py) sets `budget_exceeded` + `hint` after the cost is known; it never fails the dispatch.
+- `max_budget_usd` is enforced **by the claude CLI** (`_build_command` passes `--max-budget-usd`): a run stopped at the cap comes back `is_error` with no `result` text, and `_build_error_result` turns it into `error_type="budget"` + `budget_exceeded=True` + a resumable `session_id`. `_apply_budget` is the *secondary*, post-hoc signal for an overshoot that didn't stop the run; it never fails a dispatch.
+- A CLI error payload can have no `result` field at all — the reason lives in `errors` / `subtype`. Read it via `_cli_error_details`, never assume `result` is populated on failure.
+
+## Deliberately not built
+
+These were considered — some fully implemented — and cut on purpose: an agent router / auto-dispatch (`recommend_agent` / `dispatch_auto`, removed before 0.8.0 — a keyword scorer adds little over the calling LLM at a handful of agents, and auto-dispatch can spend money or mutate a repo on a guess); groups as an execution engine (they are a descriptive layer — no routing, no per-group settings); an agent-dispatch-side budget ledger across dispatches (the CLI's own `--max-budget-usd` covers a single run; anything cumulative would need state we deliberately don't keep). Please open an issue with the use case before adding any of them.
 
 ## Conventions
 
@@ -55,4 +61,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 466 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 495 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

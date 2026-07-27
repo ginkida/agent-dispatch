@@ -200,7 +200,10 @@ class TestBuildCommand:
 
     def test_new_session_id_flag(self):
         cmd = _build_command(
-            "claude", "hello", self.agent, self.settings,
+            "claude",
+            "hello",
+            self.agent,
+            self.settings,
             new_session_id="11111111-2222-3333-4444-555555555555",
         )
         idx = cmd.index("--session-id")
@@ -210,8 +213,12 @@ class TestBuildCommand:
     def test_resume_wins_over_new_session_id(self):
         """When resuming, --session-id must NOT be passed (they conflict)."""
         cmd = _build_command(
-            "claude", "hello", self.agent, self.settings,
-            session_id="abc-123", new_session_id="should-be-ignored",
+            "claude",
+            "hello",
+            self.agent,
+            self.settings,
+            session_id="abc-123",
+            new_session_id="should-be-ignored",
         )
         assert "--resume" in cmd
         assert "--session-id" not in cmd
@@ -246,7 +253,9 @@ class TestArgInjection:
 
     def test_normal_values_still_build(self):
         agent = AgentConfig(
-            directory="/tmp", model="sonnet", permission_mode="bypassPermissions",
+            directory="/tmp",
+            model="sonnet",
+            permission_mode="bypassPermissions",
             allowed_tools=["Bash(git diff)", "Read"],
         )
         cmd = _build_command("claude", "hi", agent, self.settings, session_id="abc-123-def")
@@ -360,7 +369,8 @@ class TestDispatch:
     def test_is_error_true_with_empty_result(self, mock_run, _which):
         """A3: is_error=true with empty/missing result should get a fallback error message."""
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
+            args=[],
+            returncode=0,
             stdout=json.dumps({"is_error": True, "result": ""}),
             stderr="",
         )
@@ -374,7 +384,8 @@ class TestDispatch:
     def test_is_error_true_with_none_result(self, mock_run, _which):
         """A1+A3: is_error=true with result=null should not crash."""
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
+            args=[],
+            returncode=0,
             stdout=json.dumps({"is_error": True, "result": None}),
             stderr="",
         )
@@ -434,10 +445,12 @@ class TestDispatch:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": "Tool_use is not allowed in this permission mode",
-                "is_error": True,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": "Tool_use is not allowed in this permission mode",
+                    "is_error": True,
+                }
+            ),
             stderr="",
         )
         result = dispatch("test", "run command", self.agent, self.settings)
@@ -460,8 +473,7 @@ class TestDispatch:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_successful_dispatch_has_no_error_type(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
+            args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
         )
         result = dispatch("test", "check", self.agent, self.settings)
         assert result.success
@@ -474,8 +486,12 @@ class TestDispatch:
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
         )
         dispatch(
-            "test", "check logs", self.agent, self.settings,
-            caller="backend-api", goal="debug production crash",
+            "test",
+            "check logs",
+            self.agent,
+            self.settings,
+            caller="backend-api",
+            goal="debug production crash",
         )
         prompt = mock_run.call_args[0][0][mock_run.call_args[0][0].index("-p") + 1]
         assert "backend-api" in prompt
@@ -494,22 +510,27 @@ class TestResumableTimeout:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_fresh_dispatch_passes_session_id_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}),
+            stderr="",
         )
         dispatch("test", "hello", self.agent, self.settings)
         cmd = mock_run.call_args[0][0]
         idx = cmd.index("--session-id")
         # Must be a well-formed UUID (claude requires it)
         import uuid as _uuid
+
         _uuid.UUID(cmd[idx + 1])
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
     def test_resume_does_not_pass_session_id_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}),
+            stderr="",
         )
         dispatch("test", "hello", self.agent, self.settings, session_id="prior-sess")
         cmd = mock_run.call_args[0][0]
@@ -533,7 +554,11 @@ class TestResumableTimeout:
     def test_timeout_on_resume_keeps_original_session(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
         result = dispatch(
-            "test", "slow", self.agent, self.settings, session_id="orig-sess",
+            "test",
+            "slow",
+            self.agent,
+            self.settings,
+            session_id="orig-sess",
         )
         assert result.error_type == "timeout"
         assert result.session_id == "orig-sess"
@@ -543,10 +568,9 @@ class TestResumableTimeout:
     def test_json_session_id_wins_over_generated(self, mock_run, _which):
         """claude's reported session_id is authoritative when present."""
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps(
-                {"result": "ok", "is_error": False, "session_id": "from-cli"}
-            ),
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False, "session_id": "from-cli"}),
             stderr="",
         )
         result = dispatch("test", "hello", self.agent, self.settings)
@@ -556,8 +580,10 @@ class TestResumableTimeout:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_generated_session_id_fallback_when_missing(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({"result": "ok", "is_error": False}), stderr="",
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False}),
+            stderr="",
         )
         result = dispatch("test", "hello", self.agent, self.settings)
         cmd = mock_run.call_args[0][0]
@@ -583,11 +609,13 @@ class TestDeniedTools:
         self.settings = Settings()
 
     def test_extract_dedupes_and_preserves_order(self):
-        data = {"permission_denials": [
-            {"tool_name": "Bash", "tool_input": {}},
-            {"tool_name": "WebFetch"},
-            {"tool_name": "Bash"},
-        ]}
+        data = {
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_input": {}},
+                {"tool_name": "WebFetch"},
+                {"tool_name": "Bash"},
+            ]
+        }
         assert _extract_denied_tools(data) == ["Bash", "WebFetch"]
 
     def test_extract_handles_missing_or_empty(self):
@@ -616,12 +644,15 @@ class TestDeniedTools:
     def test_success_with_denials_gets_hint(self, mock_run, _which):
         """The user-reported case: agent 'succeeds' but asks for permission."""
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({
-                "result": "I need your permission for one read-only query.",
-                "is_error": False,
-                "permission_denials": [{"tool_name": "Bash", "tool_input": {}}],
-            }),
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "I need your permission for one read-only query.",
+                    "is_error": False,
+                    "permission_denials": [{"tool_name": "Bash", "tool_input": {}}],
+                }
+            ),
             stderr="",
         )
         result = dispatch("analysis", "map the data", self.agent, self.settings)
@@ -636,7 +667,8 @@ class TestDeniedTools:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_success_without_denials_no_hint(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
+            args=[],
+            returncode=0,
             stdout=json.dumps({"result": "all done", "is_error": False}),
             stderr="",
         )
@@ -649,12 +681,15 @@ class TestDeniedTools:
     def test_is_error_with_denials_classified_as_permission(self, mock_run, _which):
         """Denials are a stronger signal than substring matching on the text."""
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps({
-                "result": "could not finish the task",  # no permission keywords
-                "is_error": True,
-                "permission_denials": [{"tool_name": "Edit"}],
-            }),
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "could not finish the task",  # no permission keywords
+                    "is_error": True,
+                    "permission_denials": [{"tool_name": "Edit"}],
+                }
+            ),
             stderr="",
         )
         result = dispatch("test", "task", self.agent, self.settings)
@@ -694,12 +729,14 @@ class TestStreamResumableTimeout:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_stream_success_with_denials(self, mock_popen, _which):
-        result_line = json.dumps({
-            "type": "result",
-            "result": "partial answer",
-            "is_error": False,
-            "permission_denials": [{"tool_name": "WebFetch"}],
-        })
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "result": "partial answer",
+                "is_error": False,
+                "permission_denials": [{"tool_name": "WebFetch"}],
+            }
+        )
         mock_popen.return_value = _FakePopen([result_line])
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert result.success
@@ -723,10 +760,12 @@ class TestStreamResumableTimeout:
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_stream_no_result_fallback_carries_session_id(self, mock_popen, _which):
         """Crash mid-stream (no result line) must stay resumable."""
-        assistant_line = json.dumps({
-            "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "working..."}]},
-        })
+        assistant_line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "working..."}]},
+            }
+        )
         mock_popen.return_value = _FakePopen([assistant_line], returncode=1)
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert not result.success
@@ -739,9 +778,7 @@ class _FakePopenWithStderr:
     def __init__(self, stdout_lines, returncode=0, stderr_text=""):
         self.returncode = returncode
         self.stdout = iter(line + "\n" for line in stdout_lines)
-        self.stderr = type(
-            "FakeStderr", (), {"read": lambda _self: stderr_text}
-        )()
+        self.stderr = type("FakeStderr", (), {"read": lambda _self: stderr_text})()
 
     def wait(self):
         pass
@@ -764,14 +801,15 @@ class TestOldCliSessionFlagFallback:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_retries_without_session_flag(self, mock_run, _which):
         ok = subprocess.CompletedProcess(
-            args=[], returncode=0,
-            stdout=json.dumps(
-                {"result": "ok", "is_error": False, "session_id": "from-cli"}
-            ),
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": "ok", "is_error": False, "session_id": "from-cli"}),
             stderr="",
         )
         rejected = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="",
+            args=[],
+            returncode=1,
+            stdout="",
             stderr="error: unknown option '--session-id'",
         )
         mock_run.side_effect = [rejected, ok]
@@ -786,7 +824,10 @@ class TestOldCliSessionFlagFallback:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_no_retry_on_other_errors(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="", stderr="connection refused",
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="connection refused",
         )
         result = dispatch("test", "hello", self.agent, self.settings)
         assert not result.success
@@ -796,7 +837,9 @@ class TestOldCliSessionFlagFallback:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_retry_failure_does_not_loop(self, mock_run, _which):
         rejected = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout="",
+            args=[],
+            returncode=1,
+            stdout="",
             stderr="error: unknown option '--session-id'",
         )
         mock_run.side_effect = [rejected, rejected]
@@ -809,7 +852,9 @@ class TestOldCliSessionFlagFallback:
     def test_stream_retries_without_session_flag(self, mock_popen, _which):
         result_line = json.dumps({"type": "result", "result": "ok", "is_error": False})
         rejected = _FakePopenWithStderr(
-            [], returncode=1, stderr_text="error: unknown option '--session-id'",
+            [],
+            returncode=1,
+            stderr_text="error: unknown option '--session-id'",
         )
         mock_popen.side_effect = [rejected, _FakePopen([result_line])]
         result = dispatch_stream("test", "hello", self.agent, self.settings)
@@ -868,16 +913,18 @@ class TestDispatchStream:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_successful_stream_result(self, mock_popen, _which):
-        result_line = json.dumps({
-            "type": "result",
-            "subtype": "success",
-            "result": "Found 3 errors",
-            "session_id": "sess-stream",
-            "total_cost_usd": 0.03,
-            "duration_ms": 8000,
-            "num_turns": 4,
-            "is_error": False,
-        })
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "Found 3 errors",
+                "session_id": "sess-stream",
+                "total_cost_usd": 0.03,
+                "duration_ms": 8000,
+                "num_turns": 4,
+                "is_error": False,
+            }
+        )
         mock_popen.return_value = _FakePopen([result_line])
         result = dispatch_stream("test", "find errors", self.agent, self.settings)
         assert result.success
@@ -888,34 +935,38 @@ class TestDispatchStream:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_progress_callback_receives_text(self, mock_popen, _which):
-        assistant_line = json.dumps({
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "text", "text": "Checking logs..."}],
-            },
-        })
-        result_line = json.dumps({
-            "type": "result",
-            "result": "done",
-            "is_error": False,
-        })
+        assistant_line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "Checking logs..."}],
+                },
+            }
+        )
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "result": "done",
+                "is_error": False,
+            }
+        )
         mock_popen.return_value = _FakePopen([assistant_line, result_line])
 
         progress: list[str] = []
-        dispatch_stream(
-            "test", "check", self.agent, self.settings, on_progress=progress.append
-        )
+        dispatch_stream("test", "check", self.agent, self.settings, on_progress=progress.append)
         assert any("Checking logs" in p for p in progress)
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_progress_callback_receives_tool_use(self, mock_popen, _which):
-        tool_line = json.dumps({
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "tool_use", "name": "Read", "id": "x", "input": {}}],
-            },
-        })
+        tool_line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "name": "Read", "id": "x", "input": {}}],
+                },
+            }
+        )
         result_line = json.dumps({"type": "result", "result": "ok", "is_error": False})
         mock_popen.return_value = _FakePopen([tool_line, result_line])
 
@@ -941,10 +992,12 @@ class TestDispatchStream:
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_no_result_line_returns_error(self, mock_popen, _which):
         # Only an assistant message, no result line
-        assistant_line = json.dumps({
-            "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "working..."}]},
-        })
+        assistant_line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "working..."}]},
+            }
+        )
         mock_popen.return_value = _FakePopen([assistant_line], returncode=1)
         result = dispatch_stream("test", "hello", self.agent, self.settings)
         assert not result.success
@@ -995,29 +1048,31 @@ class TestStructuredResponse:
         assert "Respond with a single valid JSON" in prompt
 
     def test_build_prompt_appends_json_footer_structured(self):
-        prompt = _build_prompt(
-            "do thing", caller="api", goal="audit", response_format="json"
-        )
+        prompt = _build_prompt("do thing", caller="api", goal="audit", response_format="json")
         assert "## Goal" in prompt
-        assert prompt.rstrip().endswith(
-            '{"error": "<reason>"}.'
-        )
+        assert prompt.rstrip().endswith('{"error": "<reason>"}.')
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_parses_clean_json_object(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
+
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": '{"count": 3, "errors": ["a", "b"]}',
-                "is_error": False,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": '{"count": 3, "errors": ["a", "b"]}',
+                    "is_error": False,
+                }
+            ),
             stderr="",
         )
         result = dispatch(
-            "test", "find errors", self.agent, self.settings,
+            "test",
+            "find errors",
+            self.agent,
+            self.settings,
             response_format="json",
         )
         assert result.success
@@ -1027,7 +1082,8 @@ class TestStructuredResponse:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_parses_fenced_json(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
-        fenced = "```json\n{\"ok\": true}\n```"
+
+        fenced = '```json\n{"ok": true}\n```'
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -1035,7 +1091,11 @@ class TestStructuredResponse:
             stderr="",
         )
         result = dispatch(
-            "test", "task", self.agent, self.settings, response_format="json",
+            "test",
+            "task",
+            self.agent,
+            self.settings,
+            response_format="json",
         )
         assert result.success
         assert result.parsed_result == {"ok": True}
@@ -1044,6 +1104,7 @@ class TestStructuredResponse:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_parses_fenced_without_lang(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
+
         fenced = "```\n[1, 2, 3]\n```"
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1052,7 +1113,11 @@ class TestStructuredResponse:
             stderr="",
         )
         result = dispatch(
-            "test", "task", self.agent, self.settings, response_format="json",
+            "test",
+            "task",
+            self.agent,
+            self.settings,
+            response_format="json",
         )
         assert result.parsed_result == [1, 2, 3]
 
@@ -1061,17 +1126,24 @@ class TestStructuredResponse:
     def test_dispatch_unparseable_keeps_success_with_none_parsed(self, mock_run, _which):
         """Soft-mode: bad JSON doesn't fail the dispatch, just leaves parsed_result=None."""
         from agent_dispatch.runner import dispatch
+
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": "Sure! Here is what I found: 3 errors.",
-                "is_error": False,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": "Sure! Here is what I found: 3 errors.",
+                    "is_error": False,
+                }
+            ),
             stderr="",
         )
         result = dispatch(
-            "test", "task", self.agent, self.settings, response_format="json",
+            "test",
+            "task",
+            self.agent,
+            self.settings,
+            response_format="json",
         )
         assert result.success is True
         assert result.parsed_result is None
@@ -1081,13 +1153,16 @@ class TestStructuredResponse:
     @patch("agent_dispatch.runner.subprocess.run")
     def test_dispatch_without_response_format_does_not_parse(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
+
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": '{"data": "yes"}',
-                "is_error": False,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": '{"data": "yes"}',
+                    "is_error": False,
+                }
+            ),
             stderr="",
         )
         # No response_format → parsed_result stays None even though result is valid JSON
@@ -1101,6 +1176,7 @@ class TestStructuredResponse:
         """Non-claude-wrapper stdout → plain text branch still records None
         for parsed_result when content isn't valid JSON."""
         from agent_dispatch.runner import dispatch
+
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -1108,7 +1184,11 @@ class TestStructuredResponse:
             stderr="",
         )
         result = dispatch(
-            "test", "task", self.agent, self.settings, response_format="json",
+            "test",
+            "task",
+            self.agent,
+            self.settings,
+            response_format="json",
         )
         assert result.success
         assert result.parsed_result is None
@@ -1116,6 +1196,7 @@ class TestStructuredResponse:
 
     def test_parse_helper_handles_scalars(self):
         from agent_dispatch.runner import _parse_structured_response
+
         assert _parse_structured_response("42") == 42
         assert _parse_structured_response('"hello"') == "hello"
         assert _parse_structured_response("true") is True
@@ -1123,6 +1204,7 @@ class TestStructuredResponse:
 
     def test_parse_helper_returns_none_on_garbage(self):
         from agent_dispatch.runner import _parse_structured_response
+
         assert _parse_structured_response("") is None
         assert _parse_structured_response("not json at all") is None
         assert _parse_structured_response("```python\nprint(1)\n```") is None
@@ -1136,8 +1218,13 @@ class TestBudget:
 
     def _result(self, cost: float | None, success: bool = True, hint: str | None = None):
         from agent_dispatch.models import DispatchResult
+
         return DispatchResult(
-            agent="a", success=success, result="x", cost_usd=cost, hint=hint,
+            agent="a",
+            success=success,
+            result="x",
+            cost_usd=cost,
+            hint=hint,
         )
 
     def _agent(self, budget: float | None = None) -> AgentConfig:
@@ -1145,6 +1232,7 @@ class TestBudget:
 
     def test_exceeded_sets_flag_and_hint(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(self._result(0.05), self._agent(0.01), self.settings)
         assert result.budget_exceeded is True
         assert "exceeded" in result.hint
@@ -1153,34 +1241,40 @@ class TestBudget:
 
     def test_within_budget_untouched(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(self._result(0.005), self._agent(0.01), self.settings)
         assert result.budget_exceeded is None
         assert result.hint is None
 
     def test_no_budget_configured(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(self._result(99.0), self._agent(None), self.settings)
         assert result.budget_exceeded is None
 
     def test_no_cost_untouched(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(self._result(None), self._agent(0.01), self.settings)
         assert result.budget_exceeded is None
 
     def test_settings_default_fallback(self):
         from agent_dispatch.runner import _apply_budget
+
         settings = Settings(default_max_budget_usd=0.01)
         result = _apply_budget(self._result(0.05), self._agent(None), settings)
         assert result.budget_exceeded is True
 
     def test_agent_budget_overrides_settings_default(self):
         from agent_dispatch.runner import _apply_budget
+
         settings = Settings(default_max_budget_usd=0.001)
         result = _apply_budget(self._result(0.5), self._agent(1.0), settings)
         assert result.budget_exceeded is None
 
     def test_hint_appended_to_existing(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(
             self._result(0.05, hint="tools were denied."),
             self._agent(0.01),
@@ -1191,8 +1285,11 @@ class TestBudget:
 
     def test_applies_to_failed_result_too(self):
         from agent_dispatch.runner import _apply_budget
+
         result = _apply_budget(
-            self._result(0.05, success=False), self._agent(0.01), self.settings,
+            self._result(0.05, success=False),
+            self._agent(0.01),
+            self.settings,
         )
         assert result.budget_exceeded is True
         # success is NOT flipped — the flag is advisory
@@ -1204,12 +1301,14 @@ class TestBudget:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": "done",
-                "session_id": "s1",
-                "total_cost_usd": 0.50,
-                "is_error": False,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": "done",
+                    "session_id": "s1",
+                    "total_cost_usd": 0.50,
+                    "is_error": False,
+                }
+            ),
             stderr="",
         )
         agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
@@ -1224,12 +1323,14 @@ class TestBudget:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=json.dumps({
-                "result": "done",
-                "session_id": "s1",
-                "total_cost_usd": 0.05,
-                "is_error": False,
-            }),
+            stdout=json.dumps(
+                {
+                    "result": "done",
+                    "session_id": "s1",
+                    "total_cost_usd": 0.05,
+                    "is_error": False,
+                }
+            ),
             stderr="",
         )
         agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
@@ -1240,18 +1341,252 @@ class TestBudget:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_stream_flags_over_budget(self, mock_popen, _which):
-        result_line = json.dumps({
-            "type": "result",
-            "result": "done",
-            "session_id": "s1",
-            "total_cost_usd": 0.50,
-            "is_error": False,
-        })
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "result": "done",
+                "session_id": "s1",
+                "total_cost_usd": 0.50,
+                "is_error": False,
+            }
+        )
         mock_popen.return_value = _FakePopen([result_line])
         agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.10)
         result = dispatch_stream("test", "task", agent, Settings())
         assert result.success
         assert result.budget_exceeded is True
+
+
+def _budget_payload(**extra):
+    """The result payload a real claude CLI emits when --max-budget-usd is hit.
+
+    Captured from claude 2.1.220: no `result` field at all — the reason lives
+    in `errors` / `subtype` / `terminal_reason`.
+    """
+    payload = {
+        "is_error": True,
+        "subtype": "error_max_budget_usd",
+        "terminal_reason": "budget_exhausted",
+        "errors": ["Reached maximum budget ($0.0001)"],
+        "session_id": "sess-budget",
+        "total_cost_usd": 0.000583,
+        "num_turns": 1,
+        "type": "result",
+    }
+    payload.update(extra)
+    return payload
+
+
+class TestBudgetExhausted:
+    """The CLI stops the session at --max-budget-usd -> error_type='budget'."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.0001)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_classifies_budget_error(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(_budget_payload()),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "budget"
+        assert result.budget_exceeded is True
+        # The real reason is surfaced instead of "no details"
+        assert "Reached maximum budget" in result.error
+        assert "no details" not in result.error
+        # ...along with the recovery path
+        assert "--max-budget-usd" in result.error
+        assert "sess-budget" in result.error  # resumable
+        assert result.session_id == "sess-budget"
+        assert result.cost_usd == 0.000583
+        assert result.num_turns == 1
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_terminal_reason_alone_is_enough(self, mock_run, _which):
+        payload = _budget_payload()
+        del payload["subtype"]
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.error_type == "budget"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_subtype_alone_is_enough(self, mock_run, _which):
+        payload = _budget_payload()
+        del payload["terminal_reason"]
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.error_type == "budget"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_budget_flag_set_even_when_cost_under_cap(self, mock_run, _which):
+        """The cap was reached by definition — don't rely on the cost compare."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(_budget_payload(total_cost_usd=0.00009)),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.budget_exceeded is True
+        # No duplicate post-hoc overage note — the error text already explains it
+        assert result.hint is None
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_budget_wins_over_denied_tools(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(_budget_payload(permission_denials=[{"tool_name": "Bash"}])),
+            stderr="",
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert result.error_type == "budget"  # the terminal reason, not the denial
+        assert result.denied_tools == ["Bash"]  # still reported
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_hint_names_the_cap(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(_budget_payload()),
+            stderr="",
+        )
+        agent = AgentConfig(directory="/tmp", description="t", max_budget_usd=0.25)
+        result = dispatch("test", "task", agent, Settings())
+        assert "$0.25" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_settings_default_budget_named_in_hint(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(_budget_payload()),
+            stderr="",
+        )
+        agent = AgentConfig(directory="/tmp", description="t")
+        result = dispatch("test", "task", agent, Settings(default_max_budget_usd=0.5))
+        assert "$0.5" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_classifies_budget_error(self, mock_popen, _which):
+        mock_popen.return_value = _FakePopen([json.dumps(_budget_payload())])
+        result = dispatch_stream("test", "task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "budget"
+        assert result.budget_exceeded is True
+        assert "Reached maximum budget" in result.error
+        assert result.session_id == "sess-budget"
+
+
+class TestCliErrorDetails:
+    """CLI-level failures carry their reason in `errors`/`subtype`, not `result`."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="t")
+        self.settings = Settings()
+
+    def _dispatch(self, mock_run, payload):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        return dispatch("test", "task", self.agent, self.settings)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_errors_list_is_surfaced(self, mock_run, _which):
+        result = self._dispatch(
+            mock_run, {"is_error": True, "errors": ["Reached maximum turns (5)"]}
+        )
+        assert result.error_type == "cli_error"
+        assert "Reached maximum turns (5)" in result.error
+        assert "no details" not in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_multiple_errors_joined(self, mock_run, _which):
+        result = self._dispatch(mock_run, {"is_error": True, "errors": ["first", "second"]})
+        assert "first; second" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_subtype_used_when_errors_absent(self, mock_run, _which):
+        result = self._dispatch(mock_run, {"is_error": True, "subtype": "error_during_execution"})
+        assert "error_during_execution" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_result_text_still_wins(self, mock_run, _which):
+        result = self._dispatch(
+            mock_run, {"is_error": True, "result": "agent said no", "errors": ["ignored"]}
+        )
+        assert result.error.startswith("agent said no")
+        assert result.result == "agent said no"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_fallback_when_nothing_available(self, mock_run, _which):
+        result = self._dispatch(mock_run, {"is_error": True})
+        assert "no details" in result.error
+        assert "exit code 0" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_details_are_classified(self, mock_run, _which):
+        """A permission failure reported only in `errors` is still classified."""
+        result = self._dispatch(mock_run, {"is_error": True, "errors": ["Permission denied: Bash"]})
+        assert result.error_type == "permission"
+        assert "agent-dispatch update" in result.error  # permission hint appended
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_untrusted_errors_are_capped(self, mock_run, _which):
+        result = self._dispatch(
+            mock_run,
+            {"is_error": True, "errors": ["x" * 5000] * 20},
+        )
+        # 5 entries x 300 chars + separators — bounded, not 100k of subprocess output
+        assert len(result.error) < 2500
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_non_string_errors_do_not_crash(self, mock_run, _which):
+        result = self._dispatch(mock_run, {"is_error": True, "errors": [{"code": 7}, None]})
+        assert not result.success
+        assert result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_blank_errors_fall_through_to_subtype(self, mock_run, _which):
+        result = self._dispatch(
+            mock_run, {"is_error": True, "errors": ["   ", ""], "subtype": "error_weird"}
+        )
+        assert "error_weird" in result.error
 
 
 class TestOnProc:
@@ -1260,14 +1595,20 @@ class TestOnProc:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_on_proc_receives_popen_handle(self, mock_popen, _which):
-        result_line = json.dumps({
-            "type": "result", "result": "ok", "session_id": "s", "is_error": False,
-        })
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "result": "ok",
+                "session_id": "s",
+                "is_error": False,
+            }
+        )
         fake = _FakePopen([result_line])
         mock_popen.return_value = fake
         seen: list = []
         result = dispatch_stream(
-            "test", "task",
+            "test",
+            "task",
             AgentConfig(directory="/tmp", description="t"),
             Settings(),
             on_proc=seen.append,
@@ -1278,11 +1619,19 @@ class TestOnProc:
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_no_on_proc_is_fine(self, mock_popen, _which):
-        result_line = json.dumps({
-            "type": "result", "result": "ok", "session_id": "s", "is_error": False,
-        })
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "result": "ok",
+                "session_id": "s",
+                "is_error": False,
+            }
+        )
         mock_popen.return_value = _FakePopen([result_line])
         result = dispatch_stream(
-            "test", "task", AgentConfig(directory="/tmp", description="t"), Settings(),
+            "test",
+            "task",
+            AgentConfig(directory="/tmp", description="t"),
+            Settings(),
         )
         assert result.success

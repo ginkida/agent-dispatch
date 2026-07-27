@@ -969,6 +969,24 @@ class TestTestCommand:
         assert "Diagnosis: timeout" in result.output
         assert "--timeout 600" in result.output
 
+    def test_budget_error_shows_diagnosis(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Test"])
+        with patch("agent_dispatch.runner.dispatch") as mock_dispatch:
+            mock_dispatch.return_value = DispatchResult(
+                agent="proj",
+                success=False,
+                result="",
+                error="Agent 'proj' failed: Reached maximum budget ($0.10)",
+                error_type="budget",
+                budget_exceeded=True,
+            )
+            result = runner.invoke(cli, ["test", "proj"])
+        assert result.exit_code != 0
+        assert "Diagnosis: spend cap reached" in result.output
+        assert "--max-budget-usd" in result.output
+
     def test_stream_uses_dispatch_stream(self, tmp_path: Path):
         """--stream should call dispatch_stream, not dispatch, and forward progress."""
         agent_dir = tmp_path / "proj"

@@ -99,10 +99,22 @@ class JobStore:
 
     def _write(self, job: Job) -> None:
         path = self._path(job.id)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(job.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
-        _chmod_quiet(tmp, 0o600)  # owner-only before it becomes visible
-        os.replace(tmp, path)
+        # Unique temp name per write: `self._lock` only serializes writers inside
+        # one process, but the CLI (cancel/gc) and the MCP server touch the same
+        # files. A shared `<id>.tmp` could be written by both at once and the
+        # rename would publish interleaved, unparseable JSON.
+        tmp = path.with_name(f"{job.id}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(job.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
+            _chmod_quiet(tmp, 0o600)  # owner-only before it becomes visible
+            os.replace(tmp, path)
+        except OSError:
+            # Don't leave a half-written temp file behind on a failed write.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - best effort
+                logger.debug("Failed to clean up temp file %s", tmp)
+            raise
 
     def create(
         self,

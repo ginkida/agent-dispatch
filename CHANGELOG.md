@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-27
+
+The spend cap was already real — now the result says so.
+
+### Added
+- **`error_type: "budget"`.** The `claude` CLI enforces the `--max-budget-usd`
+  value agent-dispatch has always passed: when the cap is reached it ends the
+  session and reports the failure with no `result` text. That payload used to
+  surface as the useless `"reported an error with no details"` fallback with
+  `error_type: "cli_error"`. It is now classified as `budget`, carries the
+  CLI's own reason (`Reached maximum budget ($X)`), sets
+  `budget_exceeded: true`, and spells out the recovery — raise the cap, pick a
+  cheaper model, or resume the partial session via the returned `session_id`.
+  `agent-dispatch test` prints a matching diagnosis.
+
+### Fixed
+- **Error details are no longer dropped.** CLI-level failures (budget
+  exhausted, max turns, execution errors) put their reason in `errors` /
+  `subtype` rather than `result`. Both `dispatch` and `dispatch_stream` now
+  read those fields when `result` is empty, so the error text names the actual
+  problem. Values are capped (5 entries × 300 chars) like every other field
+  read back from the subprocess.
+- **Job files can no longer be corrupted by a concurrent writer.** `JobStore`
+  wrote through a fixed `<id>.tmp` path; the in-process lock does not cover
+  the CLI (`cancel` / `gc`) and the MCP server writing the same job at the
+  same time, and the rename could publish interleaved JSON. Each write now
+  uses a unique temp name and cleans it up if the write fails.
+
+### Changed
+- The `is_error` handling in `dispatch` and `dispatch_stream` is now one
+  shared `_build_error_result()` with an explicit precedence: budget stop >
+  denied tools > text classification.
+- Documentation corrected throughout: `max_budget_usd` is enforced per
+  dispatch by the CLI, with the `budget_exceeded` flag as the secondary
+  post-hoc signal for a run that overshot without being stopped. Previous
+  releases described it as post-hoc only.
+
 ## [0.10.0] - 2026-07-14
 
 `doctor` learns to check groups; three correctness fixes found in review.
@@ -389,7 +426,11 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ginkida/agent-dispatch/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/ginkida/agent-dispatch/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/ginkida/agent-dispatch/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/ginkida/agent-dispatch/compare/v0.6.0...v0.8.0
 [0.6.0]: https://github.com/ginkida/agent-dispatch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ginkida/agent-dispatch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/agent-dispatch/compare/v0.3.0...v0.4.0

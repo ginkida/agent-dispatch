@@ -423,6 +423,12 @@ def test(name: str, task: str, stream: bool, timeout: int | None) -> None:
             click.echo(click.style("Diagnosis: timeout", fg="yellow"))
             click.echo(f"  agent-dispatch test {name} --timeout 600    # one-off")
             click.echo(f"  agent-dispatch update {name} --timeout 600  # permanent")
+        elif result.error_type == "budget":
+            click.echo()
+            click.echo(click.style("Diagnosis: spend cap reached", fg="yellow"))
+            click.echo("The claude CLI stopped the session at --max-budget-usd.")
+            click.echo(f"  agent-dispatch update {name} --max-budget-usd 2.0  # raise the cap")
+            click.echo(f"  agent-dispatch update {name} --model haiku         # cheaper model")
         raise SystemExit(1)
 
 

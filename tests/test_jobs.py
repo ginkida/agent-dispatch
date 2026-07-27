@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import sys
 import time
@@ -263,6 +264,45 @@ class TestJobIdValidation:
             store._path("../escape")
 
 
+class TestAtomicWrites:
+    """Temp files are per-write so concurrent writers can't corrupt a job file."""
+
+    def test_temp_name_is_unique_per_write(self, store: JobStore, monkeypatch):
+        job = store.create("infra", "task")
+        seen: list[str] = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            seen.append(Path(src).name)
+            real_replace(src, dst)
+
+        monkeypatch.setattr("agent_dispatch.jobs.os.replace", spy)
+        store.mark_running(job.id)
+        store.update_progress(job.id, ["a"])
+        assert len(seen) == 2
+        assert seen[0] != seen[1], "shared temp name — a cross-process write could interleave"
+        assert all(name.startswith(job.id) and name.endswith(".tmp") for name in seen)
+
+    def test_no_temp_files_left_behind(self, store: JobStore):
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="ok"))
+        assert list(store.directory.glob("*.tmp")) == []
+
+    def test_failed_write_cleans_up_temp(self, store: JobStore, monkeypatch):
+        job = store.create("infra", "task")
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("agent_dispatch.jobs.os.replace", boom)
+        with pytest.raises(OSError, match="disk full"):
+            store.mark_running(job.id)
+        assert list(store.directory.glob("*.tmp")) == []
+        # The previously published record is untouched
+        assert store.get(job.id).status == "pending"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 class TestJobFilePermissions:
     def test_job_file_is_owner_only(self, store: JobStore):
@@ -359,11 +399,10 @@ class TestRecoverStale:
 
     def test_planted_malformed_id_file_not_counted(self, store: JobStore):
         """A hand-planted running file with a bad id must not crash or be counted."""
-        planted = Job(id="../evil", agent="x", task="t", status="running",
-                      started_at=time.time() - 7200)
-        (store.directory / "planted.json").write_text(
-            planted.model_dump_json(), encoding="utf-8"
+        planted = Job(
+            id="../evil", agent="x", task="t", status="running", started_at=time.time() - 7200
         )
+        (store.directory / "planted.json").write_text(planted.model_dump_json(), encoding="utf-8")
         # Does not raise; the malformed id can't be transitioned, so it's not counted.
         assert store.recover_stale(stale_threshold_seconds=3600) == 0
 
@@ -371,7 +410,10 @@ class TestRecoverStale:
 class TestCreateCompleted:
     def test_create_completed_success(self, store: JobStore):
         result = DispatchResult(
-            agent="infra", success=True, result="ok-text", cost_usd=0.03,
+            agent="infra",
+            success=True,
+            result="ok-text",
+            cost_usd=0.03,
         )
         job = store.create_completed("infra", "task", result, caller="api")
         assert job.status == "done"
@@ -387,8 +429,11 @@ class TestCreateCompleted:
 
     def test_create_completed_failure(self, store: JobStore):
         result = DispatchResult(
-            agent="infra", success=False, result="",
-            error="boom", error_type="cli_error",
+            agent="infra",
+            success=False,
+            result="",
+            error="boom",
+            error_type="cli_error",
         )
         job = store.create_completed("infra", "task", result)
         assert job.status == "failed"
@@ -429,7 +474,8 @@ class TestTerminalProtection:
         store.mark_running(job.id)
         store.cancel(job.id, force=True)
         out = store.finish(
-            job.id, DispatchResult(agent="infra", success=True, result="late"),
+            job.id,
+            DispatchResult(agent="infra", success=True, result="late"),
         )
         assert out is None
         reread = store.get(job.id)
@@ -450,7 +496,8 @@ class TestTerminalProtection:
         store.mark_running(job.id)
         store.finish(job.id, DispatchResult(agent="infra", success=True, result="first"))
         out = store.finish(
-            job.id, DispatchResult(agent="infra", success=False, result="second"),
+            job.id,
+            DispatchResult(agent="infra", success=False, result="second"),
         )
         assert out is None
         assert store.get(job.id).result.result == "first"
@@ -466,11 +513,13 @@ class TestTerminalProtection:
 class TestDefaultJobsDir:
     def test_env_override(self, monkeypatch, tmp_path: Path):
         from agent_dispatch.jobs import default_jobs_dir
+
         monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "custom"))
         assert default_jobs_dir() == tmp_path / "custom"
 
     def test_defaults_next_to_config(self, monkeypatch, tmp_path: Path):
         from agent_dispatch.jobs import default_jobs_dir
+
         monkeypatch.delenv("AGENT_DISPATCH_JOBS_DIR", raising=False)
         monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "cfg" / "agents.yaml"))
         assert default_jobs_dir() == tmp_path / "cfg" / "jobs"
