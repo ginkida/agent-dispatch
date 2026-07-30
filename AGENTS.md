@@ -62,6 +62,9 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 
 - Tests must not touch anything outside `tmp_path`. `test_server.py`'s autouse `_reset_globals` and `test_cli.py`'s `_isolated_config` redirect **both** `AGENT_DISPATCH_CONFIG` and `AGENT_DISPATCH_JOBS_DIR`: a mutation tool that bails out early (unknown agent) still takes `config_lock()` first, which would otherwise create a lock file beside the developer's real config.
 
+- `mcp` is pinned **`>=1.2.0,<2`** deliberately: 2.0 removed `mcp.server.fastmcp`, which `server.py` imports, so an unbounded range gives every fresh install a dead `agent-dispatch serve`. Lifting the cap means porting to `mcp.server.mcpserver.MCPServer` — it is not a dependency bump.
+- Verify packaging in a **clean venv**, never the dev machine: build the wheel, install it fresh, import the server. A stale pin in local site-packages hides exactly the failure a new user hits first.
+
 ## Deliberately not built
 
 These were considered — some fully implemented — and cut on purpose: an agent router / auto-dispatch (`recommend_agent` / `dispatch_auto`, removed before 0.8.0 — a keyword scorer adds little over the calling LLM at a handful of agents, and auto-dispatch can spend money or mutate a repo on a guess); groups as an execution engine (they are a descriptive layer — no routing, no per-group settings); an agent-dispatch-side budget ledger across dispatches (the CLI's own `--max-budget-usd` covers a single run; anything cumulative would need state we deliberately don't keep). Please open an issue with the use case before adding any of them.
