@@ -1,6 +1,6 @@
 [project]
 name = "agent-dispatch"
-version = "0.11.0"
+version = "0.12.0"
 description = "MCP server that lets Claude Code agents delegate tasks to agents in other project directories"
 readme = "README.md"
 license = "MIT"
@@ -32,7 +32,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "mcp[cli]>=1.2.0",
+    # Upper bound is load-bearing: mcp 2.0 removed `mcp.server.fastmcp` (FastMCP
+    # was replaced by `mcp.server.mcpserver.MCPServer`), which server.py imports.
+    # Without the cap a fresh install resolves 2.x and `agent-dispatch serve`
+    # dies with ModuleNotFoundError. Lift it only together with the port.
+    "mcp[cli]>=1.2.0,<2",
     "pyyaml>=6.0",
     "click>=8.0",
 ]

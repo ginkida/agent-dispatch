@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -772,13 +774,37 @@ class TestStreamResumableTimeout:
         assert result.session_id  # partial transcript may exist on disk
 
 
+class _FakeStderr:
+    """Stand-in for a real stderr pipe.
+
+    ``read(size)`` must accept a size and return "" at EOF: the runner drains
+    stderr in a background thread with chunked reads (a stderr pipe that is only
+    read after the stdout loop deadlocks a chatty child).
+    """
+
+    def __init__(self, text: str = ""):
+        self._text = text
+        self._pos = 0
+
+    def read(self, size: int | None = None) -> str:
+        if size is None:
+            chunk, self._pos = self._text[self._pos :], len(self._text)
+            return chunk
+        chunk = self._text[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        pass
+
+
 class _FakePopenWithStderr:
     """Like _FakePopen (defined below) but with configurable stderr text."""
 
     def __init__(self, stdout_lines, returncode=0, stderr_text=""):
         self.returncode = returncode
         self.stdout = iter(line + "\n" for line in stdout_lines)
-        self.stderr = type("FakeStderr", (), {"read": lambda _self: stderr_text})()
+        self.stderr = _FakeStderr(stderr_text)
 
     def wait(self):
         pass
@@ -870,7 +896,7 @@ class _FakePopen:
     def __init__(self, stdout_lines: list[str], returncode: int = 0):
         self._stdout_lines = stdout_lines
         self.returncode = returncode
-        self.stderr = type("FakeStderr", (), {"read": lambda self: ""})()
+        self.stderr = _FakeStderr("")
         self.stdout = iter(line + "\n" for line in stdout_lines)
 
     def wait(self):
@@ -1634,4 +1660,209 @@ class TestOnProc:
             AgentConfig(directory="/tmp", description="t"),
             Settings(),
         )
+        assert result.success
+
+
+class TestStreamPipeHandling:
+    """Regression tests for the stderr pipe.
+
+    These spawn a real python subprocess (never the `claude` CLI) on purpose: a
+    mocked Popen cannot reproduce a pipe deadlock, because the deadlock lives in
+    the OS pipe buffer, not in our code's control flow. Each test finishes in
+    well under a second.
+    """
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @staticmethod
+    def _fake_cli(tmp_path: Path, body: str) -> Path:
+        script = tmp_path / "fake_cli.py"
+        script.write_text(body)
+        launcher = tmp_path / "fake_cli"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        launcher.chmod(0o755)
+        return launcher
+
+    def test_chatty_stderr_does_not_deadlock(self, tmp_path: Path):
+        # 1 MiB of stderr — far past the ~64 KiB pipe buffer. Before stderr was
+        # drained concurrently the child blocked in write(2), never emitted its
+        # result line, and the dispatch burned its whole timeout.
+        cli = self._fake_cli(
+            tmp_path,
+            "import json, sys\n"
+            "sys.stderr.write('W' * 1_000_000)\n"
+            "sys.stderr.flush()\n"
+            "print(json.dumps({'type': 'result', 'is_error': False, "
+            "'result': 'done', 'session_id': 's1'}))\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch_stream("test", "hello", agent, Settings())
+        assert result.success, result.error
+        assert result.result == "done"
+        assert result.error_type is None
+
+    @patch("agent_dispatch.runner.threading.Timer", _InstantTimer)
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_result_survives_a_child_that_lingers_past_the_timeout(self, mock_popen, _which):
+        """The agent answered (and was billed) but its process outlived the deadline.
+
+        Checking ``timed_out`` before ``result_data`` threw the paid-for answer
+        away and reported ``error_type="timeout"`` instead.
+        """
+        mock_popen.return_value = _FakePopen(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "is_error": False,
+                        "result": "REAL ANSWER",
+                        "session_id": "s2",
+                        "total_cost_usd": 0.42,
+                    }
+                )
+            ]
+        )
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert result.result == "REAL ANSWER"
+        assert result.cost_usd == 0.42
+        assert result.error_type is None
+        assert "killed" in (result.hint or "").lower()
+
+    def test_grandchild_holding_stderr_does_not_hang_the_dispatch(self, tmp_path: Path):
+        """A stdio MCP server inherits fd 2 and can outlive `claude`.
+
+        The stderr pipe then never reaches EOF, so the drain thread stays parked
+        in read(). Closing that pipe from here would block on the BufferedReader
+        lock *without a timeout* and hang dispatch_stream (and its caller's
+        semaphore slot) forever — so the close is skipped while the reader lives.
+        """
+        cli = self._fake_cli(
+            tmp_path,
+            "import json, subprocess, sys\n"
+            # stderr is inherited by the grandchild; stdin/stdout are not
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)\n"
+            "print(json.dumps({'type': 'result', 'is_error': False, "
+            "'result': 'ANSWER', 'session_id': 's3'}), flush=True)\n"
+            "sys.exit(0)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=30)
+        started = time.monotonic()
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch_stream("test", "hello", agent, Settings())
+        elapsed = time.monotonic() - started
+        assert result.success
+        assert result.result == "ANSWER"
+        # Must not wait on stderr we do not need: the agent already answered.
+        assert elapsed < 5, f"dispatch_stream took {elapsed:.1f}s — it waited on stderr"
+
+    def test_backgrounded_grandchild_does_not_extend_the_timeout(self, tmp_path: Path):
+        """The timeout must bound the call even when the agent leaves a process running.
+
+        A grandchild inherits the child's stdout, so killing only the direct
+        child leaves the read loop parked for the grandchild's whole lifetime —
+        the dispatch overruns its deadline while holding a semaphore slot.
+        The child is spawned in its own process group and the timer kills the
+        group, so the pipe reaches EOF on time.
+        """
+        cli = self._fake_cli(
+            tmp_path,
+            "import json, subprocess, sys\n"
+            # full default inheritance: the grandchild holds fd 1 and fd 2
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "print(json.dumps({'type': 'result', 'is_error': False, "
+            "'result': 'ANSWER', 'session_id': 's4'}), flush=True)\n"
+            "sys.exit(0)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=1)
+        started = time.monotonic()
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch_stream("test", "hello", agent, Settings())
+        elapsed = time.monotonic() - started
+        assert result.success
+        assert result.result == "ANSWER"
+        assert elapsed < 10, f"overran its 1s timeout by {elapsed:.1f}s — the tree was not killed"
+
+    def test_stderr_is_reported_when_no_result_line_arrives(self, tmp_path: Path):
+        cli = self._fake_cli(
+            tmp_path,
+            "import sys\nsys.stderr.write('boom: everything is on fire\\n')\nsys.exit(3)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch_stream("test", "hello", agent, Settings())
+        assert not result.success
+        assert "everything is on fire" in result.error
+
+
+class TestDispatchPayloadRobustness:
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_exit_zero_with_no_output_is_a_failure(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="   \n", stderr=""
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        # Reporting success here would hand back an empty answer AND cache it.
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert result.session_id  # resumable
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_exit_zero_with_no_output_reports_stderr(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="model overloaded"
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert not result.success
+        assert "model overloaded" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_non_object_json_falls_back_to_text(self, mock_run, _which):
+        # Valid JSON but not the CLI's result object — every data.get() below
+        # would raise AttributeError out of the runner.
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='"just a bare string"', stderr=""
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert result.result == '"just a bare string"'
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_non_string_result_field_is_coerced(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"is_error": False, "result": {"nested": 1}}),
+            stderr="",
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.success
+        assert isinstance(result.result, str)
+        assert "nested" in result.result
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_task_named_like_a_flag_does_not_corrupt_argv(self, mock_popen, _which):
+        # cmd[2] is the caller-supplied prompt; searching the whole list for
+        # "--output-format" would match it and rewrite the prompt instead.
+        mock_popen.return_value = _FakePopen(
+            [json.dumps({"type": "result", "is_error": False, "result": "ok"})]
+        )
+        result = dispatch_stream("test", "--output-format", self.agent, self.settings)
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[2] == "--output-format"  # prompt untouched
+        assert cmd[cmd.index("--output-format", 3) + 1] == "stream-json"
         assert result.success

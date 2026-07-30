@@ -34,6 +34,11 @@ def _reset_globals(tmp_path: Path, monkeypatch):
     server._running_procs.clear()
     # Isolate job storage per test
     monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "_jobs"))
+    # ...and the config path. Tests that need a real file on disk set this
+    # themselves, but a mutation tool that bails early (unknown agent) still
+    # takes config_lock() first — without this it would create a lock file next
+    # to the developer's REAL ~/.config/agent-dispatch/agents.yaml.
+    monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "_isolated.yaml"))
     yield
     server._cache = None
     server._semaphore = None
@@ -2689,3 +2694,311 @@ class TestGroups:
         imembers = {m["agent"]: m for m in inspected["members"]}
         assert imembers["infra"]["healthy"] == "UNREADABLE"
         assert imembers["db"]["healthy"] is True
+
+
+class TestBrokenConfigSurface:
+    """A malformed agents.yaml must come back as the documented error envelope.
+
+    Before this, _get_config() raised straight through every tool — including
+    the read-only ones an agent would reach for to diagnose the problem.
+    """
+
+    @pytest.fixture()
+    def broken_config(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "agents.yaml"
+        cfg.write_text("agents:\n  bad:\n    directory: 123\n")
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        return cfg
+
+    @pytest.mark.asyncio
+    async def test_list_agents_returns_error_envelope(self, broken_config):
+        data = json.loads(await server.list_agents(ctx=None))
+        assert "could not be loaded" in data["error"]
+        assert "hint" in data
+
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_error_envelope(self, broken_config):
+        data = json.loads(await server.dispatch("infra", "task", ctx=None))
+        assert "could not be loaded" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_yaml_returns_error_envelope(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "agents.yaml"
+        cfg.write_text("agents: [unclosed\n")
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        data = json.loads(await server.list_groups(ctx=None))
+        assert "could not be loaded" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_tools_are_still_registered(self):
+        # functools.wraps must keep the signature FastMCP introspects intact.
+        tools = await server.mcp.list_tools()
+        assert len(tools) == 21
+        assert {"list_agents", "dispatch", "update_agent"} <= {t.name for t in tools}
+
+
+class TestReturnRefOnCacheHit:
+    @pytest.mark.asyncio
+    async def test_cache_hit_still_returns_a_ref(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        big_text = "Y" * 5000
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(name)
+            return DispatchResult(agent=name, success=True, result=big_text)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            first = json.loads(
+                await server.dispatch("infra", "audit", return_ref=True, summary_chars=50)
+            )
+            second = json.loads(
+                await server.dispatch("infra", "audit", return_ref=True, summary_chars=50)
+            )
+
+        assert len(calls) == 1  # second call was served from cache
+        assert second.get("cached") is True
+        # The whole point of return_ref is to keep the big text OUT of the
+        # response — a cache hit must not inline it.
+        assert "ref" in second
+        assert second["size"] == 5000
+        assert len(second["summary"]) == 50
+        assert second["ref"] != first["ref"]
+
+        with patch.object(server, "_get_config", return_value=config):
+            fetched = json.loads(await server.fetch_result(second["ref"]))
+        assert fetched["result"] == big_text
+
+
+class TestConfigMutationInvalidatesCache:
+    @pytest.mark.asyncio
+    async def test_update_agent_drops_that_agents_cached_results(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(name)
+            return DispatchResult(agent=name, success=True, result=f"run {len(calls)}")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "task")
+            cached = json.loads(await server.dispatch("infra", "task"))
+            assert cached.get("cached") is True
+            assert len(calls) == 1
+
+        # Repointing / re-permissioning the agent invalidates its answers: the
+        # cache key knows the NAME, not the directory or permission set.
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            await server.update_agent("infra", permission_mode="bypassPermissions")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            fresh = json.loads(await server.dispatch("infra", "task"))
+        assert fresh.get("cached") is None
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_other_agents_keep_their_cache(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("db", "task")
+
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            await server.update_agent("infra", timeout=600)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            still_cached = json.loads(await server.dispatch("db", "task"))
+        assert still_cached.get("cached") is True
+
+
+class TestTimeoutValidationAtToolBoundary:
+    @pytest.mark.asyncio
+    async def test_update_agent_rejects_negative_timeout(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import load_config, save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            data = json.loads(await server.update_agent("infra", timeout=-5))
+            assert "timeout" in data["error"]
+            # A negative timeout reaches subprocess.run() and bricks the agent.
+            assert load_config(cfg_file).agents["infra"].timeout != -5
+
+    @pytest.mark.asyncio
+    async def test_add_agent_rejects_negative_timeout(self, tmp_path: Path):
+        cfg_file = tmp_path / "agents.yaml"
+        project = tmp_path / "proj"
+        project.mkdir()
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            data = json.loads(await server.add_agent("new", str(project), timeout=-1))
+        assert "timeout" in data["error"]
+        assert not cfg_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_zero_timeout_still_means_unchanged(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import load_config, save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            data = json.loads(await server.update_agent("infra", timeout=0, description="d"))
+        assert data["fields"] == ["description"]
+        assert load_config(cfg_file).agents["infra"].timeout == 300
+
+
+class TestParallelItemTypeValidation:
+    @pytest.mark.asyncio
+    async def test_non_string_agent_returns_error_envelope(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            # An unhashable value would raise TypeError out of `name in config.agents`.
+            raw = await server.dispatch_parallel(json.dumps([{"agent": ["infra"], "task": "t"}]))
+        data = json.loads(raw)
+        assert "must be strings" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_non_string_task_returns_error_envelope(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        with patch.object(server, "_get_config", return_value=config):
+            raw = await server.dispatch_parallel(json.dumps([{"agent": "infra", "task": 42}]))
+        assert "must be strings" in json.loads(raw)["error"]
+
+
+class TestAggregationWithRefItems:
+    @pytest.mark.asyncio
+    async def test_aggregator_receives_the_summary_not_an_empty_body(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        seen_context = {}
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            if name == "backend":  # the aggregator
+                seen_context["ctx"] = context
+                return DispatchResult(agent=name, success=True, result="summary")
+            return DispatchResult(agent=name, success=True, result="A" * 3000)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch_parallel(
+                json.dumps(
+                    [{"agent": "infra", "task": "audit", "return_ref": True, "summary_chars": 40}]
+                ),
+                aggregate="backend",
+            )
+
+        ctx = seen_context["ctx"]
+        # A ref payload has no "result" key — without the summary fallback the
+        # aggregator was paid to synthesize an empty section.
+        assert "AAAA" in ctx
+        assert "preview of 3000 chars" in ctx
+
+
+class TestBudgetValidationAtToolBoundary:
+    @pytest.mark.asyncio
+    async def test_add_agent_rejects_negative_budget(self, tmp_path: Path):
+        # AgentConfig.max_budget_usd is ge=0 — without a boundary check this
+        # escaped as a raw pydantic ValidationError instead of an envelope.
+        cfg_file = tmp_path / "agents.yaml"
+        project = tmp_path / "proj"
+        project.mkdir()
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            data = json.loads(await server.add_agent("new", str(project), max_budget_usd=-1))
+        assert "max_budget_usd" in data["error"]
+        assert not cfg_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_add_agent_accepts_zero_budget(self, tmp_path: Path):
+        cfg_file = tmp_path / "agents.yaml"
+        project = tmp_path / "proj"
+        project.mkdir()
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            data = json.loads(await server.add_agent("new", str(project), max_budget_usd=0))
+        assert data["added"] == "new"
+
+
+class TestUpdateAgentLockDiscipline:
+    @pytest.mark.asyncio
+    async def test_no_await_inside_the_config_lock(self, tmp_path: Path):
+        """Every tool coroutine shares one event-loop thread and ProcessLock's
+        inner guard is a per-thread RLock: suspending inside the critical
+        section lets a second update re-enter it and lose one of the two edits.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        for tool in (server.update_agent, server.add_agent, server.remove_agent):
+            fn = inspect.unwrap(tool)
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.With):
+                    continue
+                is_config_lock = any(
+                    isinstance(item.context_expr, ast.Call)
+                    and getattr(item.context_expr.func, "id", "") == "config_lock"
+                    for item in node.items
+                )
+                if not is_config_lock:
+                    continue
+                awaits = [n for n in ast.walk(node) if isinstance(n, (ast.Await, ast.AsyncFor))]
+                assert not awaits, f"{fn.__name__} suspends inside config_lock()"
+
+        assert not inspect.iscoroutinefunction(server._apply_agent_updates)
+
+    @pytest.mark.asyncio
+    async def test_permission_warning_still_reaches_the_caller(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+        ctx = AsyncMock()
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            await server.update_agent("infra", permission_mode="typoMode", ctx=ctx)
+        messages = [c.args[0] for c in ctx.info.call_args_list]
+        assert any("Unknown permission_mode" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_updates_both_land(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import load_config, save_config
+
+        cfg_file = tmp_path / "agents.yaml"
+        save_config(config, cfg_file)
+        with patch.dict("os.environ", {"AGENT_DISPATCH_CONFIG": str(cfg_file)}):
+            await asyncio.gather(
+                server.update_agent("infra", description="from-A", ctx=AsyncMock()),
+                server.update_agent("db", description="from-B", ctx=AsyncMock()),
+            )
+        saved = load_config(cfg_file)
+        assert saved.agents["infra"].description == "from-A"
+        assert saved.agents["db"].description == "from-B"

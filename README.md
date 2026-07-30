@@ -318,7 +318,7 @@ Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
 Same as `dispatch` but shows live progress while the agent works. Use for long-running tasks. Not cached.
 
-Parameters are the same as `dispatch` except `return_ref`/`summary_chars` (streaming is incompatible with ref-mode).
+Parameters are the same as `dispatch` except `return_ref`/`summary_chars` (streaming is incompatible with ref-mode) and `group` (group context injection is supported only on `dispatch` and per-item in `dispatch_parallel`).
 
 ### `dispatch_dialogue`
 
@@ -363,6 +363,8 @@ Register a new project directory as an agent. Description is auto-generated from
 | `permission_mode` | string | no | Permission mode (e.g. `default`, `plan`, `bypassPermissions`) |
 | `allowed_tools` | string | no | Comma-separated allowed tools (e.g. `"Bash,Read,Edit"`) |
 | `disallowed_tools` | string | no | Comma-separated disallowed tools |
+| `capabilities` | string | no | Comma-separated capability labels (e.g. `"docker_logs,deploy_debug"`) |
+| `risky_capabilities` | string | no | Comma-separated high-risk labels (e.g. `"restart_services"`) |
 
 ### `update_agent`
 
@@ -378,6 +380,10 @@ Update an existing agent's configuration. Only non-empty fields are changed. Pas
 | `permission_mode` | string | no | Permission mode. `"none"` to clear |
 | `allowed_tools` | string | no | Comma-separated. `"none"` to clear |
 | `disallowed_tools` | string | no | Comma-separated. `"none"` to clear |
+| `capabilities` | string | no | Comma-separated. `"none"` to clear |
+| `risky_capabilities` | string | no | Comma-separated. `"none"` to clear |
+
+Changing an agent's config drops that agent's cached results — the cache key holds the agent *name*, so a re-pointed or re-permissioned agent would otherwise keep answering from the previous config for the rest of the TTL. The same applies to `add_agent` and `remove_agent`.
 
 ### `remove_agent`
 
@@ -470,7 +476,7 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 | `error_type` | Meaning | Recovery |
 |--------------|---------|----------|
 | `permission` | A tool call was denied | `update_agent(name, allowed_tools="Bash,Read")` (least privilege) or `update_agent(name, permission_mode="bypassPermissions")`, then re-dispatch. The `error` text includes a hint with the exact fix. |
-| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=`, or use `dispatch_async`. |
+| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=`, or use `dispatch_async`. A *streaming* dispatch that produced its answer before the deadline returns that answer with a `hint` instead of failing. |
 | `not_found` | Agent directory or `claude` CLI missing | `list_agents()` → check `healthy`. Re-add the agent with an existing path, or run `agent-dispatch doctor` to find what's missing. |
 | `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
 | `budget` | The `claude` CLI ended the session at the `max_budget_usd` spend cap — the answer is incomplete | Raise the cap (`update_agent(name, max_budget_usd=2.0)`), switch to a cheaper `model`, or split the task. The partial session is resumable: `dispatch_session(agent, "Continue where you left off", session_id=<from the result>)`. |
@@ -597,8 +603,9 @@ agent-dispatch MCP server
 - **Owner-only state** — job files (`0o600`) and `agents.yaml` (`0o600`) are written for the owner only; their directories are `0o700`.
 - **Cost control** — `max_budget_usd` per agent or globally is passed to the `claude` CLI as `--max-budget-usd`, so a runaway dispatch is stopped at the cap and comes back as `error_type: "budget"` with a resumable `session_id`. An overshoot that lands over budget without stopping is flagged post-hoc with `budget_exceeded: true` + a hint.
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
-- **Timeout** — per-agent or global (default: 300s). Orphaned processes are cleaned up.
-- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only successes are cached. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
+- **Timeout** — per-agent or global (default: 300s). A streaming dispatch runs the agent in its own process group, so the deadline kills the whole tree: a process the agent left running in the background can't hold the dispatch (and its concurrency slot) open past the timeout.
+- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, and results flagged `budget_exceeded` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
+- **Durable config** — `agents.yaml` is written atomically (temp file + rename), and every mutation path (CLI and MCP server alike) holds a cross-process advisory lock, so concurrent edits cannot truncate the file or silently drop one another's agents.
 
 See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
 
@@ -618,7 +625,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
 | `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
 | `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |
-| `agent-dispatch gc [--days]` | Purge terminal jobs older than N days (default 7) |
+| `agent-dispatch gc [--days N \| --all]` | Purge terminal jobs older than N days (default 7; `--all` purges every age) |
 | `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
 
 ## Requirements

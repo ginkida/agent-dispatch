@@ -523,3 +523,82 @@ class TestDefaultJobsDir:
         monkeypatch.delenv("AGENT_DISPATCH_JOBS_DIR", raising=False)
         monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "cfg" / "agents.yaml"))
         assert default_jobs_dir() == tmp_path / "cfg" / "jobs"
+
+
+class TestRecoverStalePending:
+    """A job whose worker never started must not stay pending forever.
+
+    gc() only deletes terminal jobs, so a stuck pending job is both an eternal
+    poll target for dispatch_wait and permanent disk growth.
+    """
+
+    def test_stale_pending_is_failed(self, tmp_path: Path):
+        store = JobStore(tmp_path / "jobs")
+        job = store.create("infra", "task")
+        # Pretend it was queued days ago and the server died. Pending uses a
+        # much longer threshold than running: the jobs directory is shared by
+        # every `agent-dispatch serve`, so a merely hours-old pending job may
+        # still be queued in another live server.
+        stale = store.get(job.id)
+        stale.created_at = time.time() - 3600 * 24 * 2
+        store._write(stale)
+
+        assert store.recover_stale(3600) == 1
+        recovered = store.get(job.id)
+        assert recovered.status == "failed"
+        assert "pending" in recovered.error
+        assert recovered.is_terminal()  # so gc() can reclaim it
+
+    def test_fresh_pending_is_left_alone(self, tmp_path: Path):
+        store = JobStore(tmp_path / "jobs")
+        job = store.create("infra", "task")
+        assert store.recover_stale(3600) == 0
+        assert store.get(job.id).status == "pending"
+
+    def test_pending_queued_in_another_live_server_is_left_alone(self, tmp_path: Path):
+        """Two hours queued is normal behind a saturated job semaphore."""
+        store = JobStore(tmp_path / "jobs")
+        job = store.create("infra", "task")
+        queued = store.get(job.id)
+        queued.created_at = time.time() - 7200
+        store._write(queued)
+        assert store.recover_stale(3600) == 0
+        assert store.get(job.id).status == "pending"
+
+    def test_running_and_pending_are_both_recovered(self, tmp_path: Path):
+        store = JobStore(tmp_path / "jobs")
+        old = time.time() - 7200
+        pending = store.create("infra", "queued")
+        p = store.get(pending.id)
+        p.created_at = time.time() - 3600 * 24 * 2
+        store._write(p)
+
+        running = store.create("infra", "in flight")
+        store.mark_running(running.id)
+        r = store.get(running.id)
+        r.started_at = old
+        store._write(r)
+
+        assert store.recover_stale(3600) == 2
+        assert store.get(pending.id).status == "failed"
+        assert store.get(running.id).status == "failed"
+
+    def test_recovered_pending_is_then_collectable(self, tmp_path: Path):
+        store = JobStore(tmp_path / "jobs")
+        job = store.create("infra", "task")
+        stale = store.get(job.id)
+        stale.created_at = time.time() - 3600 * 24 * 2
+        store._write(stale)
+        store.recover_stale(3600)
+        assert store.gc(max_age_seconds=0) == 1
+        assert store.get(job.id) is None
+
+
+class TestJobStoreLocking:
+    def test_lock_file_is_not_listed_as_a_job(self, tmp_path: Path):
+        store = JobStore(tmp_path / "jobs")
+        store.create("infra", "task")
+        with store._lock:
+            pass
+        assert (tmp_path / "jobs" / ".jobs.lock").exists()
+        assert len(store.list()) == 1  # the .lock file is not a *.json job

@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import threading
+import time
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import yaml
 
 from .models import DispatchConfig
+
+try:  # pragma: no cover - platform dependent
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +30,124 @@ DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "agents.yaml"
 def config_path() -> Path:
     """Return config path, respecting AGENT_DISPATCH_CONFIG env var."""
     return Path(os.environ.get("AGENT_DISPATCH_CONFIG", str(DEFAULT_CONFIG_PATH)))
+
+
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.02
+
+
+def _acquire_lock(lock_path: Path) -> int | None:
+    """Take an exclusive advisory lock, or return None if that's not possible."""
+    if fcntl is None:  # pragma: no cover - Windows
+        return None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:  # pragma: no cover - unwritable dir; caller still proceeds
+        logger.debug("Could not open lock file %s: %s", lock_path, e)
+        return None
+    # Bounded, non-blocking retry rather than a plain blocking LOCK_EX: the MCP
+    # server takes this lock on its event-loop thread, so one wedged holder
+    # (a stopped CLI process, a stale NFS lock) would freeze every tool in the
+    # server indefinitely. After the deadline we proceed unlocked — a possible
+    # lost update is a far smaller failure than a permanent freeze — and say so.
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Could not acquire %s within %ss — proceeding without it; "
+                    "a concurrent edit could be lost.",
+                    lock_path,
+                    _LOCK_TIMEOUT_SECONDS,
+                )
+                os.close(fd)
+                return None
+            time.sleep(_LOCK_POLL_SECONDS)
+
+
+def _release_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[union-attr]
+    except OSError as e:  # pragma: no cover - best effort
+        logger.debug("Could not unlock fd %s: %s", fd, e)
+    finally:
+        os.close(fd)
+
+
+class ProcessLock:
+    """Re-entrant lock that serializes a read-modify-write across threads *and* processes.
+
+    ``agents.yaml`` and the job files are edited by two independent programs —
+    the MCP server and the ``agent-dispatch`` CLI — and every mutation is a
+    load / mutate / save-whole-file cycle. A ``threading.RLock`` only orders
+    writers inside one process, so without this the later writer silently
+    discards the earlier one's change (add two agents concurrently and one
+    disappears). Uses ``flock`` on *path*; where flock is unavailable (Windows,
+    exotic filesystems) it degrades to thread-only locking rather than failing
+    the operation, exactly like ``_chmod_quiet``.
+
+    Re-entrant on purpose: ``JobStore.recover_stale`` holds the lock while
+    calling ``fail()``, and a second ``flock`` on a fresh descriptor in the same
+    process would block forever.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+        self._thread_lock = threading.RLock()
+        self._fd: int | None = None
+        self._depth = 0
+
+    def __enter__(self) -> ProcessLock:
+        self._thread_lock.acquire()
+        if self._depth == 0:
+            self._fd = _acquire_lock(self._path)
+        self._depth += 1
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            _release_lock(self._fd)
+            self._fd = None
+        self._thread_lock.release()
+
+
+_config_locks: dict[str, ProcessLock] = {}
+_config_locks_guard = threading.Lock()
+
+
+def config_lock() -> ProcessLock:
+    """Lock guarding the active config file — wrap load+mutate+save in it.
+
+    One instance per config path: two ``ProcessLock`` objects for the same file
+    inside one process would each take their own descriptor and deadlock if
+    nested, so the instance is memoized.
+    """
+    key = str(config_path())
+    with _config_locks_guard:
+        lock = _config_locks.get(key)
+        if lock is None:
+            if len(_config_locks) > 32:  # tests churn through temp config paths
+                _config_locks.clear()
+            lock = ProcessLock(Path(f"{key}.lock"))
+            _config_locks[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """One-shot advisory lock on ``<path>.lock`` (non-re-entrant helper)."""
+    fd = _acquire_lock(Path(f"{path}.lock"))
+    try:
+        yield
+    finally:
+        _release_lock(fd)
 
 
 def load_config(path: Path | None = None) -> DispatchConfig:
@@ -46,6 +174,11 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
     p = path or config_path()
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _chmod_quiet(p.parent, 0o700)
+    # Follow a symlinked config to its target. os.replace() below swaps the
+    # *link itself*, so writing through it (as the old write_text did) is what
+    # users pointing agents.yaml at a dotfiles repo expect; the temp file also
+    # has to sit next to the real file to keep the rename same-filesystem.
+    p = Path(os.path.realpath(p))
     data = config.model_dump(mode="json", exclude_none=True)
     # capabilities/risky_capabilities default to [] (not None), so exclude_none
     # won't drop them — prune empties so agents that never declare capabilities
@@ -63,11 +196,23 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
             group_data.pop("members", None)
     if not data.get("groups"):
         data.pop("groups", None)
-    p.write_text(
-        yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
-    _chmod_quiet(p, 0o600)
+    rendered = yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    # Atomic replace, like JobStore._write. Writing in place would truncate the
+    # live file first: an interrupted write (ENOSPC, quota, SIGKILL) would leave
+    # a half-written agents.yaml that no longer parses — losing every agent and
+    # group at once. The temp name is unique per write so a concurrent writer
+    # (CLI vs MCP server) can never publish an interleaved file.
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(rendered, encoding="utf-8")
+        _chmod_quiet(tmp, 0o600)  # owner-only before it becomes visible
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best effort
+            logger.debug("Failed to clean up temp config %s", tmp)
+        raise
 
 
 def _collect_mcp_servers(directory: Path) -> list[str]:

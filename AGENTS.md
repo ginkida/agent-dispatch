@@ -28,10 +28,10 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 495 tests, ~2s — all subprocess calls are mocked
+python3 -m pytest tests/ -v   # 561 tests, ~4s
 ```
 
-Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`.
+Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`. The one exception is `TestStreamPipeHandling`, which spawns a short-lived *python* subprocess: a pipe deadlock lives in the OS pipe buffer, so a mocked `Popen` structurally cannot reproduce it.
 
 ## Non-obvious invariants (violating these breaks real behavior)
 
@@ -46,6 +46,21 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - Cancelling a *running* job requires the in-memory `_running_procs` registry (server.py) — the job is marked `cancelled` **before** the subprocess is killed. Don't persist PIDs to disk (PID reuse after restart could kill an unrelated process).
 - `max_budget_usd` is enforced **by the claude CLI** (`_build_command` passes `--max-budget-usd`): a run stopped at the cap comes back `is_error` with no `result` text, and `_build_error_result` turns it into `error_type="budget"` + `budget_exceeded=True` + a resumable `session_id`. `_apply_budget` is the *secondary*, post-hoc signal for an overshoot that didn't stop the run; it never fails a dispatch.
 - A CLI error payload can have no `result` field at all — the reason lives in `errors` / `subtype`. Read it via `_cli_error_details`, never assume `result` is populated on failure.
+- **Both subprocess pipes must be drained concurrently.** `dispatch_stream` reads stdout in a loop while a daemon thread drains stderr; reading stderr only after the loop deadlocks any child that writes more than ~64 KiB to it (the child blocks in `write(2)`, never emits its result, and the dispatch dies at the timeout). `dispatch()` is immune only because `subprocess.run(capture_output=True)` uses `communicate()`.
+- **A received `result` event outranks the timeout flag.** The agent finished and was billed; a lingering process is a cleanup problem, reported as a `hint`, not a failure.
+- **The timeout must kill the process *tree*, not the child.** `dispatch_stream` spawns with `start_new_session=True` and `_kill_process_tree` sends SIGKILL to the group: a grandchild that inherited stdout keeps the read loop parked long past the deadline otherwise. `killpg` is guarded on a positive pid — `killpg(0)` would signal the dispatcher's own group.
+- **Never `close()` a pipe another thread may still be reading.** `close()` waits on the reader's buffer lock with *no timeout*, so it would hang the dispatch forever — the bounded `join()` before it buys nothing. `dispatch_stream` skips the stderr close while the drain thread is alive and lets the daemon reader + Popen finalizer release the fd. This is not hypothetical: a stdio MCP server inherits the child's `stderr`, so the pipe often has no EOF even after `claude` exits cleanly.
+- **No `await` inside `config_lock()`.** `ProcessLock`'s in-process guard is a `threading.RLock` — re-entrant per *thread* — and every MCP tool coroutine runs on the one event-loop thread. Suspending in the critical section lets a second coroutine re-enter the "held" lock and interleave its own load/mutate/save. Collect warnings as data, emit them after the `with` block (`test_no_await_inside_the_config_lock` enforces this by AST).
+- Cross-process locks are acquired with a **bounded** wait, never a blocking `flock`: the server takes them on its event-loop thread, so a wedged holder would freeze every tool. After the deadline it proceeds unlocked and logs — a possible lost update beats a permanent freeze.
+- `recover_stale` sweeps `pending` on a **much longer** threshold than `running`: the jobs directory is shared by every `agent-dispatch serve`, so an hours-old pending job may still be queued behind another live server's semaphore.
+- Pydantic does **not** validate on assignment. `Field(ge=...)` guards only the *load* path; every mutation surface (CLI `add`/`update`, MCP `add_agent`/`update_agent`) needs its own boundary check, or the bound escapes as a raw `ValidationError`.
+- Every state file (`agents.yaml`, job files) is written **temp file + `os.replace`**, never in place, and every load/mutate/save is wrapped in `config.ProcessLock` — the CLI and the MCP server are separate processes writing the same files, so a thread lock alone loses updates.
+- Anything that changes an agent's config must call `_invalidate_agent_cache` — the cache key holds the agent *name*, not its directory or permissions.
+- Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, and `budget_exceeded` results, so the documented "grant access, then re-dispatch" recovery is never short-circuited.
+- Remediation text is a contract: a hint that names a flag must name one that exists (`test_printed_budget_hint_is_a_runnable_command` feeds the printed flags back into the CLI). Run the command you print.
+- MCP tools that load config carry `@_config_guard` under `@mcp.tool()` so a broken `agents.yaml` returns the `{"error": ...}` envelope instead of a raw traceback.
+
+- Tests must not touch anything outside `tmp_path`. `test_server.py`'s autouse `_reset_globals` and `test_cli.py`'s `_isolated_config` redirect **both** `AGENT_DISPATCH_CONFIG` and `AGENT_DISPATCH_JOBS_DIR`: a mutation tool that bails out early (unknown agent) still takes `config_lock()` first, which would otherwise create a lock file beside the developer's real config.
 
 ## Deliberately not built
 
@@ -61,4 +76,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 495 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 561 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

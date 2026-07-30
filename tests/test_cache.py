@@ -102,17 +102,26 @@ class TestCacheBasics:
     def test_caller_and_goal_combined(self):
         cache = DispatchCache(ttl=60)
         cache.put(
-            "a", "task", _ok_result(text="A"),
-            caller="frontend", goal="debug",
+            "a",
+            "task",
+            _ok_result(text="A"),
+            caller="frontend",
+            goal="debug",
         )
         # Same caller, different goal → miss
         assert cache.get("a", "task", caller="frontend", goal="optimize") is None
         # Same goal, different caller → miss
         assert cache.get("a", "task", caller="backend", goal="debug") is None
         # Both match → hit
-        assert cache.get(
-            "a", "task", caller="frontend", goal="debug",
-        ).result == "A"
+        assert (
+            cache.get(
+                "a",
+                "task",
+                caller="frontend",
+                goal="debug",
+            ).result
+            == "A"
+        )
 
     def test_caller_none_vs_empty_string_collide(self):
         """caller=None and caller="" canonicalize the same — both mean
@@ -130,8 +139,8 @@ class TestCacheTTL:
         cache.put("a", "task", _ok_result())
         # Pretend time has passed
         key = cache._make_key("a", "task", None)
-        ts, result = cache._store[key]
-        cache._store[key] = (ts - 2, result)  # 2 seconds in the past
+        ts, agent, result = cache._store[key]
+        cache._store[key] = (ts - 2, agent, result)  # 2 seconds in the past
         assert cache.get("a", "task") is None
 
     def test_evict_expired(self):
@@ -140,8 +149,8 @@ class TestCacheTTL:
         cache.put("a", "task2", _ok_result())
         # Expire one entry
         key1 = cache._make_key("a", "task1", None)
-        ts, result = cache._store[key1]
-        cache._store[key1] = (ts - 2, result)
+        ts, agent, result = cache._store[key1]
+        cache._store[key1] = (ts - 2, agent, result)
         evicted = cache.evict_expired()
         assert evicted == 1
         assert cache.get("a", "task2") is not None
@@ -171,18 +180,78 @@ class TestCacheStats:
         cache = DispatchCache(ttl=120, max_size=500)
         stats = cache.stats()
         assert stats == {
-            "size": 0, "max_size": 500, "hits": 0, "misses": 0,
-            "evictions": 0, "hit_rate": 0.0, "ttl": 120,
+            "size": 0,
+            "max_size": 500,
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "hit_rate": 0.0,
+            "ttl": 120,
         }
 
     def test_stats_after_operations(self):
         cache = DispatchCache(ttl=60)
         cache.put("a", "task", _ok_result())
-        cache.get("a", "task")   # hit
-        cache.get("a", "task")   # hit
+        cache.get("a", "task")  # hit
+        cache.get("a", "task")  # hit
         cache.get("a", "other")  # miss
         stats = cache.stats()
         assert stats["size"] == 1
         assert stats["hits"] == 2
         assert stats["misses"] == 1
         assert stats["hit_rate"] == round(2 / 3, 3)
+
+
+class TestInvalidateAgent:
+    def test_drops_only_that_agents_entries(self):
+        cache = DispatchCache(ttl=60)
+        cache.put("infra", "task", _ok_result("infra"))
+        cache.put("infra", "other", _ok_result("infra"))
+        cache.put("db", "task", _ok_result("db"))
+
+        assert cache.invalidate_agent("infra") == 2
+        assert cache.get("infra", "task") is None
+        assert cache.get("infra", "other") is None
+        assert cache.get("db", "task") is not None
+
+    def test_unknown_agent_is_a_noop(self):
+        cache = DispatchCache(ttl=60)
+        cache.put("infra", "task", _ok_result("infra"))
+        assert cache.invalidate_agent("nope") == 0
+        assert cache.get("infra", "task") is not None
+
+
+class TestDegradedResultsAreNotCached:
+    def test_denied_tools_result_is_not_cached(self):
+        cache = DispatchCache(ttl=60)
+        degraded = DispatchResult(
+            agent="infra",
+            success=True,
+            result="I need permission to run Bash",
+            denied_tools=["Bash"],
+            hint="1 tool call(s) were denied",
+        )
+        cache.put("infra", "task", degraded)
+        # Caching it would make the documented "grant access, then re-dispatch"
+        # recovery a no-op for the whole TTL.
+        assert cache.get("infra", "task") is None
+
+    def test_budget_exceeded_result_is_not_cached(self):
+        cache = DispatchCache(ttl=60)
+        over = DispatchResult(
+            agent="infra", success=True, result="partial", cost_usd=2.0, budget_exceeded=True
+        )
+        cache.put("infra", "task", over)
+        assert cache.get("infra", "task") is None
+
+
+class TestCacheIsolation:
+    def test_get_returns_a_copy_not_the_shared_entry(self):
+        cache = DispatchCache(ttl=60)
+        cache.put("infra", "task", _ok_result("infra", "original"))
+
+        first = cache.get("infra", "task")
+        first.result = "MUTATED BY CALLER"
+
+        second = cache.get("infra", "task")
+        assert second.result == "original"

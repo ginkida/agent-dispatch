@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-29
+
+Reliability pass over the streaming path, config durability, and the tool
+boundary — found by an exhaustive audit of every module.
+
+### Fixed
+- **`mcp` is capped below 2.0.** The dependency was declared as
+  `mcp[cli]>=1.2.0` with no upper bound, and `mcp` 2.0 removed
+  `mcp.server.fastmcp` (FastMCP became `mcp.server.mcpserver.MCPServer`). Any
+  fresh install therefore resolved 2.x and died with
+  `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` the moment
+  `agent-dispatch serve` started — i.e. **0.11.0 was broken for new installs**.
+  Pinned to `>=1.2.0,<2` (verified against 1.29.0); the cap lifts when
+  `server.py` is ported to the 2.x API.
+- **A timeout now actually bounds a streaming dispatch.** The timer killed only
+  the direct `claude` process. Any grandchild that inherited its stdout — a
+  backgrounded dev server, a `run_in_background` Bash call, a watcher — kept
+  that pipe from reaching EOF, so the read loop stayed parked for the
+  grandchild's entire lifetime: the deadline was ignored, the concurrency slot
+  stayed held, and `dispatch_cancel` could not free it. The child is now spawned
+  in its own process group and the timeout kills the whole tree (measured on a
+  reproduction: 20.4s → 3.0s for a 3s timeout).
+- **Streaming no longer deadlocks on a chatty agent.** `dispatch_stream` opened
+  `stderr` as a pipe but only read it *after* the stdout loop finished. Once the
+  child wrote more than one pipe buffer (~64 KiB) of stderr — node deprecation
+  warnings, MCP server startup noise, a tool dumping a stack trace — it blocked
+  in `write(2)`, never emitted its result line, and the dispatch burned its
+  entire timeout before coming back as a bogus `error_type: "timeout"`. stderr
+  is now drained concurrently by a daemon reader. This affected the
+  `dispatch_stream` tool, `agent-dispatch test --stream`, **and every async job**
+  (the worker dispatches through the streaming runner). The pipe is never closed
+  while that reader is still blocked on it — a stdio MCP server inherits the
+  child's `stderr` and can outlive it, and `close()` waits on the reader's buffer
+  lock *without a timeout*, which would hang the dispatch outright.
+- **A completed streaming result is no longer thrown away.** `dispatch_stream`
+  checked the timeout flag before the received result, so an agent that
+  answered — and was billed — but whose process lingered past the deadline came
+  back as a failed timeout. The result now wins; when the process had to be
+  killed after answering, that is reported as a `hint`, not a failure.
+- **`dispatch(return_ref=True)` now honors `return_ref` on a cache hit.** It
+  returned the full cached result text inline instead of a compact ref —
+  exactly the context blow-up the caller asked to avoid. (`dispatch_parallel`
+  already handled this correctly.)
+- **`agents.yaml` is written atomically.** `save_config` truncated the live file
+  and rewrote it in place, so an interrupted write (disk full, quota, SIGKILL)
+  left a half-written config that no longer parses — losing every agent and
+  group at once. It now writes a temp file and renames, like `JobStore`.
+- **Concurrent config edits no longer lose each other.** Every mutation is a
+  load / mutate / save-whole-file cycle, and the CLI and the MCP server edit the
+  same file: two overlapping writers each saved their own stale snapshot, so one
+  agent silently disappeared. All mutation sites now hold a cross-process
+  advisory lock (`flock`, degrading to thread-only where unavailable). The same
+  lock now guards job-file transitions, so a CLI `cancel` can no longer be
+  overwritten by the server's `finish`. The lock is taken with a bounded wait
+  (10s) rather than a blocking `flock`, because the MCP server acquires it on
+  its event-loop thread — one wedged holder would otherwise freeze every tool;
+  no mutation suspends while holding it (the in-process guard is re-entrant per
+  *thread*, so an `await` inside the critical section would let a second
+  coroutine walk straight through it).
+- **A symlinked `agents.yaml` keeps its symlink.** The atomic rename would have
+  replaced the link itself, silently orphaning the real file in a dotfiles repo;
+  the link is resolved before the swap.
+- **A malformed `agents.yaml` no longer crashes every MCP tool.** A YAML syntax
+  error or a schema violation escaped as a raw protocol-level exception with no
+  remediation — including from the read-only tools an agent would use to
+  diagnose it. Tools now return the documented `{"error": ..., "hint": ...}`
+  envelope. A non-path `directory:` value raised a bare `TypeError` out of the
+  field validator (breaking the CLI too); it is now a normal validation error.
+- **Stale results are no longer served after an agent's config changes.** The
+  cache key contains the agent *name*, not its directory, permission set or
+  model — so the documented remove-and-re-add flow kept serving the previous
+  project's answers for the rest of the TTL. `add_agent` / `update_agent` /
+  `remove_agent` now invalidate that agent's cached results.
+- **Successful-but-degraded results are no longer cached.** A dispatch that
+  answered with `denied_tools` (or over budget) was cached for the full TTL,
+  which made the documented "grant access, then re-dispatch" recovery a no-op.
+- **`agent-dispatch gc --days 0` (or negative) no longer silently purges every
+  terminal job** — including `return_ref` results a caller was about to fetch.
+  It is rejected, matching the `dispatch_gc` MCP tool; use the new `--all` flag
+  to purge everything on purpose.
+- **The budget hints now name a flag that exists.** Both the runner's
+  `error_type: "budget"` hint and `agent-dispatch test` told the user to run
+  `agent-dispatch update <name> --max-budget-usd`, but the option was
+  `--max-budget`, so the copy-pasted command failed. `--max-budget-usd` is now
+  an accepted alias on `add` and `update`.
+- **A negative timeout can no longer brick an agent.** `-5` was written straight
+  to `agents.yaml`, reached `subprocess.run(timeout=-5)`, and made every
+  dispatch fail instantly with a nonsensical "timed out after -5s". Rejected now
+  at the model, the MCP tool, and the CLI; negative budgets likewise, on both
+  `add` and `update` (they put a token starting with `-` on the `claude` command
+  line, and pydantic does not validate on assignment — the boundary checks are
+  what actually guard the mutation paths).
+- **Jobs stuck in `pending` are recovered.** `recover_stale` only swept
+  `running`, and `gc` only deletes terminal jobs — so a job whose worker never
+  started (server killed while it was queued) stayed pending forever: an eternal
+  poll target and permanent disk growth. Pending uses a far longer threshold
+  (24×) than running: the jobs directory is shared by every `agent-dispatch
+  serve`, and an hours-old pending job may still be queued in another live
+  server.
+- **`dispatch` survives an unexpected CLI payload.** A non-object JSON body, or
+  a `result` field that is not a string, raised out of the runner instead of
+  returning a `DispatchResult`. Exit code 0 with no output at all is now a
+  failure rather than a cached empty success.
+- **`dispatch_parallel` returns an error envelope for a non-string `agent` or
+  `task`** instead of raising `TypeError`, and the aggregator now receives a
+  `return_ref` item's summary (labelled as a preview) instead of an empty body.
+- The prompt is no longer scanned when locating flags: a task whose text is
+  exactly `--output-format` or `--session-id` rewrote the prompt instead of the
+  flag. The cache also hands back a copy, so a caller mutating a result cannot
+  corrupt the entry for everyone else.
+
+### Added
+- `agent-dispatch gc --all` — purge every terminal job regardless of age.
+- `--max-budget-usd` as an alias for `--max-budget` on `add` and `update`.
+- `DispatchCache.invalidate_agent(name)` and `config.ProcessLock` /
+  `config.config_lock()`.
+- 66 tests (561 total), including real-subprocess regression tests for the
+  stderr deadlock, the inherited-pipe hang and the process-tree timeout — a
+  mocked `Popen` structurally cannot reproduce any of them.
+
 ## [0.11.0] - 2026-07-27
 
 The spend cap was already real — now the result says so.
@@ -426,7 +546,8 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ginkida/agent-dispatch/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ginkida/agent-dispatch/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ginkida/agent-dispatch/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ginkida/agent-dispatch/compare/v0.8.0...v0.9.0

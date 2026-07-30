@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from pydantic import ValidationError
 
 from agent_dispatch.cli import cli
 from agent_dispatch.config import load_config
@@ -1308,3 +1310,127 @@ class TestGroup:
         res = runner.invoke(cli, ["group", "list"])
         assert res.exit_code == 0
         assert "No groups configured" in res.output
+
+
+class TestGcGuards:
+    """`gc --days 0` used to purge every terminal job while the MCP twin refused."""
+
+    def _finished_job(self, store):
+        return store.create_completed(
+            "infra", "task", DispatchResult(agent="infra", success=True, result="done")
+        )
+
+    def test_days_zero_is_rejected(self, jobs_env):
+        job = self._finished_job(jobs_env)
+        result = runner.invoke(cli, ["gc", "--days", "0"])
+        assert result.exit_code == 1
+        assert "must be > 0" in result.output
+        assert jobs_env.get(job.id) is not None  # nothing deleted
+
+    def test_negative_days_is_rejected(self, jobs_env):
+        job = self._finished_job(jobs_env)
+        result = runner.invoke(cli, ["gc", "--days", "-5"])
+        assert result.exit_code == 1
+        assert jobs_env.get(job.id) is not None
+
+    def test_all_flag_purges_everything_explicitly(self, jobs_env):
+        job = self._finished_job(jobs_env)
+        result = runner.invoke(cli, ["gc", "--all"])
+        assert result.exit_code == 0
+        assert "all ages" in result.output
+        assert jobs_env.get(job.id) is None
+
+    def test_normal_gc_keeps_fresh_jobs(self, jobs_env):
+        job = self._finished_job(jobs_env)
+        result = runner.invoke(cli, ["gc", "--days", "7"])
+        assert result.exit_code == 0
+        assert jobs_env.get(job.id) is not None
+
+
+class TestTimeoutGuards:
+    def test_add_rejects_negative_timeout(self, tmp_path: Path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        result = runner.invoke(cli, ["add", "proj", str(agent_dir), "--timeout", "-5"])
+        assert result.exit_code == 1
+        assert "--timeout" in result.output
+        assert not _isolated_config.exists()
+
+    def test_update_rejects_negative_timeout(self, tmp_path: Path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "d"])
+        result = runner.invoke(cli, ["update", "proj", "--timeout", "-1"])
+        assert result.exit_code == 1
+        # A negative timeout makes every dispatch fail instantly with a bogus
+        # "timed out after -1s".
+        assert load_config(_isolated_config).agents["proj"].timeout == 300
+
+    def test_update_rejects_negative_budget(self, tmp_path: Path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "d"])
+        result = runner.invoke(cli, ["update", "proj", "--max-budget", "-2"])
+        assert result.exit_code == 1
+        assert load_config(_isolated_config).agents["proj"].max_budget_usd is None
+
+
+class TestMaxBudgetUsdAlias:
+    """The budget hints printed by `test` and by runner._budget_error_hint name
+    `--max-budget-usd`; that flag must actually exist."""
+
+    def test_update_accepts_max_budget_usd(self, tmp_path: Path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "d"])
+        result = runner.invoke(cli, ["update", "proj", "--max-budget-usd", "2.0"])
+        assert result.exit_code == 0
+        assert load_config(_isolated_config).agents["proj"].max_budget_usd == 2.0
+
+    def test_add_accepts_max_budget_usd(self, tmp_path: Path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        result = runner.invoke(
+            cli, ["add", "proj", str(agent_dir), "-d", "d", "--max-budget-usd", "1.5"]
+        )
+        assert result.exit_code == 0
+        assert load_config(_isolated_config).agents["proj"].max_budget_usd == 1.5
+
+    def test_printed_budget_hint_is_a_runnable_command(self, tmp_path: Path, _isolated_config):
+        """Feed the hint's flag back into the CLI — it must not be a usage error."""
+        from agent_dispatch.runner import _budget_error_hint
+
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "d"])
+        hint = _budget_error_hint("proj", 1.0, None)
+        flags = re.findall(r"--[a-z0-9-]+", hint)
+        assert flags, hint
+        for flag in flags:
+            result = runner.invoke(cli, ["update", "proj", flag, "3.0"])
+            assert result.exit_code == 0, f"{flag} is not a real flag: {result.output}"
+
+
+class TestBrokenConfigMessages:
+    def test_invalid_schema_is_reported_not_traced(self, _isolated_config):
+        # directory: 123 used to raise a raw TypeError out of the validator.
+        _isolated_config.write_text("agents:\n  bad:\n    directory: 123\n")
+        result = runner.invoke(cli, ["list"])
+        assert result.exit_code == 1
+        assert "invalid schema" in result.output
+        assert not isinstance(result.exception, TypeError)
+
+
+class TestAddBudgetGuard:
+    def test_add_rejects_negative_budget(self, tmp_path: Path, _isolated_config):
+        # AgentConfig.max_budget_usd is ge=0 — the CLI must not leak the
+        # pydantic ValidationError as a traceback.
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        result = runner.invoke(
+            cli, ["add", "proj", str(agent_dir), "-d", "d", "--max-budget", "-1"]
+        )
+        assert result.exit_code == 1
+        assert "--max-budget" in result.output
+        assert not isinstance(result.exception, ValidationError)
+        assert not _isolated_config.exists()

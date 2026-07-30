@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import uuid
@@ -311,6 +312,81 @@ def _session_flag_unsupported(stderr_text: str) -> bool:
     )
 
 
+# Streaming reads stdout line by line while the child also writes stderr. Both
+# are pipes, so stderr must be drained concurrently: once its ~64 KiB buffer
+# fills the child blocks in write(2), never emits its stdout result line, and
+# the parent blocks reading stdout until the timeout kills it — a successful run
+# reported as a timeout. Keep the HEAD of stderr (the first error is the useful
+# one, and _session_flag_unsupported looks for an option-parsing error that the
+# CLI prints first) but keep reading past the cap so the child never blocks.
+_MAX_STDERR_CAPTURE = 64 * 1024
+_STDERR_CHUNK = 8192
+_STDERR_JOIN_SECONDS = 5  # wait for stderr we still need (no result arrived)
+_STDERR_GRACE_SECONDS = 0.2  # the agent already answered — stderr is unused
+
+_STREAM_KILLED_AFTER_RESULT = (
+    "The agent produced its final result but the process had not exited by the "
+    "timeout and was killed. The result is complete — only cleanup was cut short."
+)
+
+
+def _drain_stream(stream: object, into: list[str]) -> None:
+    """Read *stream* to EOF, keeping at most _MAX_STDERR_CAPTURE chars in *into*."""
+    read = getattr(stream, "read", None)
+    if read is None:
+        return
+    kept = 0
+    try:
+        while True:
+            chunk = read(_STDERR_CHUNK)
+            if not chunk:
+                break
+            if kept < _MAX_STDERR_CAPTURE:
+                into.append(chunk[: _MAX_STDERR_CAPTURE - kept])
+                kept += len(chunk)
+    except (OSError, ValueError):  # pipe closed under us (kill / orphan cleanup)
+        logger.debug("stderr drain ended early")
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the dispatched process *and everything it spawned*.
+
+    Killing only the direct child is not enough to enforce a timeout: a
+    grandchild that inherited the child's stdout/stderr keeps those pipes from
+    reaching EOF, so the reader stays blocked for the grandchild's whole
+    lifetime — the dispatch overruns its deadline (holding a semaphore slot) no
+    matter what the timer does. The child is spawned with ``start_new_session``,
+    so it leads its own process group and its pid *is* the group id.
+    """
+    pid = getattr(proc, "pid", None)
+    killpg = getattr(os, "killpg", None)
+    # pid must be a real, positive id: killpg(0) would signal *our own* process
+    # group and take the dispatcher down with the agent.
+    if killpg is not None and isinstance(pid, int) and pid > 0:
+        try:
+            killpg(pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            # Already reaped, or no new session (Windows / start_new_session
+            # unsupported) — fall through to the plain kill.
+            logger.debug("killpg(%s) failed: %s", pid, e)
+    try:
+        proc.kill()
+    except OSError as e:  # pragma: no cover - already gone
+        logger.debug("kill failed: %s", e)
+
+
+def _close_quiet(stream: object) -> None:
+    """Close a subprocess pipe if it has a close(); ignore anything it raises."""
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except (OSError, ValueError):  # pragma: no cover - best effort
+        logger.debug("Failed to close subprocess stream")
+
+
 def _timeout_error(agent_name: str, timeout: int, session_uuid: str | None) -> str:
     """Actionable timeout message: how to retry, extend, or resume."""
     msg = (
@@ -588,7 +664,8 @@ def dispatch(
                 "claude CLI does not support --session-id; retrying without it "
                 "(timed-out dispatches will not be resumable — upgrade claude)"
             )
-            idx = cmd.index("--session-id")
+            # From index 3 — cmd[2] is the prompt (see dispatch_stream).
+            idx = cmd.index("--session-id", 3)
             del cmd[idx : idx + 2]
             new_session = None
             session_uuid = session_id
@@ -611,10 +688,17 @@ def dispatch(
     # Parse JSON output
     try:
         data = json.loads(proc.stdout)
+        if not isinstance(data, dict):
+            # Valid JSON but not the CLI's result object (a bare string/array).
+            # Every field access below assumes a mapping — fall through to the
+            # plain-text tier instead of raising out of the runner.
+            raise json.JSONDecodeError("payload is not an object", proc.stdout, 0)
     except json.JSONDecodeError:
         # Fallback: treat stdout as plain text
-        success = proc.returncode == 0
         text = proc.stdout.strip()
+        # rc=0 with no output at all is a swallowed failure, not an empty
+        # answer — reporting success would also cache "" for the whole TTL.
+        success = proc.returncode == 0 and bool(text)
         if success:
             parsed = _parse_structured_response(text) if response_format == "json" else None
             return DispatchResult(
@@ -624,7 +708,11 @@ def dispatch(
                 parsed_result=parsed,
                 session_id=session_uuid,
             )
-        error_text = text or f"claude exited with code {proc.returncode} (non-JSON output)"
+        error_text = (
+            text
+            or proc.stderr.strip()
+            or f"claude exited with code {proc.returncode} and produced no output"
+        )
         error_type = _classify_error(error_text)
         if error_type == "permission":
             error_text += _permission_hint(agent_name)
@@ -632,6 +720,9 @@ def dispatch(
             agent=agent_name,
             success=False,
             result=text,
+            # Keep the run resumable: the session exists even when the CLI
+            # returned nothing parseable.
+            session_id=session_uuid,
             error=error_text,
             error_type=error_type,
         )
@@ -650,7 +741,11 @@ def dispatch(
             exit_code=proc.returncode,
         )
 
-    result_text = data.get("result", "")
+    # Coerce like _build_error_result does: a malformed/again-changed CLI payload
+    # can carry a null, number or object here, which would raise a ValidationError
+    # out of the runner instead of coming back as a DispatchResult.
+    raw_result = data.get("result", "")
+    result_text = str(raw_result) if raw_result else ""
     parsed: object | None = None
     if response_format == "json":
         parsed = _parse_structured_response(result_text)
@@ -754,7 +849,10 @@ def dispatch_stream(
     # Switch from json to stream-json. Current claude CLIs refuse
     # `--print --output-format stream-json` without --verbose (non-verbose
     # print mode only emits the final result, which defeats streaming).
-    fmt_idx = cmd.index("--output-format")
+    # Search from index 3: cmd[2] is the caller-supplied prompt, and a task whose
+    # text is exactly "--output-format" would otherwise match it and rewrite the
+    # prompt instead of the flag.
+    fmt_idx = cmd.index("--output-format", 3)
     cmd[fmt_idx + 1] = "stream-json"
     cmd.append("--verbose")
 
@@ -772,6 +870,11 @@ def dispatch_stream(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            # Own process group, so the timeout can take the whole tree down
+            # (see _kill_process_tree). Without it a backgrounded grandchild
+            # holds the inherited stdout pipe open and the read loop below
+            # outlives the deadline by the grandchild's entire lifetime.
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         return DispatchResult(
@@ -801,12 +904,23 @@ def dispatch_stream(
     if on_proc is not None:
         on_proc(proc)
 
+    # Drain stderr concurrently — see _MAX_STDERR_CAPTURE for why this cannot
+    # wait until the stdout loop is done.
+    stderr_chunks: list[str] = []
+    stderr_reader = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, stderr_chunks),
+        daemon=True,
+        name="dispatch-stderr",
+    )
+    stderr_reader.start()
+
     # Kill the process if it exceeds the timeout
     timed_out = threading.Event()
 
     def _kill() -> None:
         timed_out.set()
-        proc.kill()
+        _kill_process_tree(proc)
 
     timer = threading.Timer(timeout, _kill)
     timer.start()
@@ -840,19 +954,35 @@ def dispatch_stream(
         timer.cancel()
         # Ensure the process is not left orphaned on any exit path
         if proc.poll() is None:
-            proc.kill()
+            _kill_process_tree(proc)
             proc.wait()
+        # Usually the child is gone and the drain thread hits EOF at once. Not
+        # always: EOF needs *every* holder of the write end to close it, and a
+        # stdio MCP server (or any grandchild) inherits fd 2 and can outlive
+        # `claude`. Only the no-result path below reads this text, so wait for
+        # it just long enough to be useful and never longer.
+        stderr_reader.join(timeout=_STDERR_GRACE_SECONDS if result_data else _STDERR_JOIN_SECONDS)
+        stderr = "".join(stderr_chunks)
+        _close_quiet(proc.stdout)
+        if stderr_reader.is_alive():
+            # NEVER close a pipe another thread is still reading: close() waits
+            # on the BufferedReader lock that the blocked read() holds, and that
+            # wait is untimed — it would hang dispatch_stream forever (and with
+            # it the caller's semaphore slot), which is exactly what the bounded
+            # join above exists to prevent. The daemon thread and Popen's
+            # finalizer release the fd once the last writer goes away.
+            logger.log(
+                logging.DEBUG if result_data else logging.WARNING,
+                "stderr of %s still open (a grandchild likely inherited it); "
+                "leaving the pipe to the daemon reader",
+                agent_name,
+            )
+        else:
+            _close_quiet(proc.stderr)
 
-    if timed_out.is_set():
-        return DispatchResult(
-            agent=agent_name,
-            success=False,
-            result="",
-            session_id=new_session,
-            error=_timeout_error(agent_name, timeout, new_session),
-            error_type="timeout",
-        )
-
+    # A received `result` event beats the clock: the agent finished (and was
+    # billed) — only its exit lagged past the deadline. Reporting a timeout here
+    # would throw away a complete, paid-for answer.
     if result_data:
         denied = _extract_denied_tools(result_data)
         is_error = result_data.get("is_error", False)
@@ -865,8 +995,12 @@ def dispatch_stream(
                 settings,
                 session_fallback=new_session,
             )
-        result_text = result_data.get("result", "")
+        raw_result = result_data.get("result", "")
+        result_text = str(raw_result) if raw_result else ""
         parsed = _parse_structured_response(result_text) if response_format == "json" else None
+        hint = _denial_hint(agent_name, denied) if denied else None
+        if timed_out.is_set():
+            hint = f"{hint} {_STREAM_KILLED_AFTER_RESULT}" if hint else _STREAM_KILLED_AFTER_RESULT
         return _apply_budget(
             DispatchResult(
                 agent=agent_name,
@@ -878,14 +1012,23 @@ def dispatch_stream(
                 num_turns=result_data.get("num_turns"),
                 parsed_result=parsed,
                 denied_tools=denied,
-                hint=_denial_hint(agent_name, denied) if denied else None,
+                hint=hint,
             ),
             agent,
             settings,
         )
 
+    if timed_out.is_set():
+        return DispatchResult(
+            agent=agent_name,
+            success=False,
+            result="",
+            session_id=new_session,
+            error=_timeout_error(agent_name, timeout, new_session),
+            error_type="timeout",
+        )
+
     # Fallback: no result line received
-    stderr = proc.stderr.read() if proc.stderr else ""
     if new_session and _session_flag_unsupported(stderr):
         # Old claude CLI rejected --session-id before doing any work —
         # retry once without the flag (bounded: the retry passes

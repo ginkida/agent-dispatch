@@ -5,12 +5,20 @@ from __future__ import annotations
 import json
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 import yaml
 
-from agent_dispatch.config import auto_describe, collect_mcp_servers, load_config, save_config
+from agent_dispatch.config import (
+    auto_describe,
+    collect_mcp_servers,
+    config_lock,
+    load_config,
+    save_config,
+)
 from agent_dispatch.models import (
     AgentConfig,
     DispatchConfig,
@@ -249,3 +257,140 @@ def test_save_config_prunes_empty_members(tmp_path: Path):
     save_config(config, f)
     assert "members" not in yaml.safe_load(f.read_text())["groups"]["solo"]
     assert load_config(f).groups["solo"].members == []
+
+
+class TestAtomicSave:
+    """agents.yaml is the whole registry — a partial write must never be visible."""
+
+    def test_failed_write_leaves_the_original_config_intact(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "agents.yaml"
+        original = DispatchConfig(agents={"keep": AgentConfig(directory=tmp_path)})
+        save_config(original, cfg)
+        before = cfg.read_text()
+
+        real_write_text = Path.write_text
+
+        def explode(self, *args, **kwargs):
+            if self.name.endswith(".tmp"):
+                raise OSError(28, "No space left on device")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", explode)
+        bigger = DispatchConfig(
+            agents={
+                "keep": AgentConfig(directory=tmp_path),
+                "new": AgentConfig(directory=tmp_path),
+            }
+        )
+        with pytest.raises(OSError):
+            save_config(bigger, cfg)
+
+        monkeypatch.undo()
+        assert cfg.read_text() == before  # not truncated
+        assert load_config(cfg).agents.keys() == {"keep"}
+        assert not list(tmp_path.glob("*.tmp"))  # temp file cleaned up
+
+    def test_no_temp_files_left_after_a_normal_save(self, tmp_path: Path):
+        cfg = tmp_path / "agents.yaml"
+        save_config(DispatchConfig(agents={"a": AgentConfig(directory=tmp_path)}), cfg)
+        assert cfg.exists()
+        assert not list(tmp_path.glob("*.tmp"))
+
+
+class TestConfigLock:
+    def test_lock_is_reentrant(self, tmp_path: Path, monkeypatch):
+        # Nesting must not deadlock: mutation sites take the lock and may call
+        # helpers that take it again.
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        lock = config_lock()
+        with lock, lock:
+            save_config(DispatchConfig(), tmp_path / "agents.yaml")
+        assert (tmp_path / "agents.yaml").exists()
+
+    def test_same_path_returns_the_same_lock(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        assert config_lock() is config_lock()
+
+    def test_serializes_concurrent_writers(self, tmp_path: Path, monkeypatch):
+        # Two threads each add one agent; with an unlocked read-modify-write one
+        # of them is silently lost.
+        cfg = tmp_path / "agents.yaml"
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        save_config(DispatchConfig(), cfg)
+        barrier = threading.Barrier(2)
+
+        def add(name: str) -> None:
+            barrier.wait()
+            with config_lock():
+                config = load_config(cfg)
+                time.sleep(0.01)  # widen the read-modify-write window
+                config.agents[name] = AgentConfig(directory=tmp_path)
+                save_config(config, cfg)
+
+        threads = [threading.Thread(target=add, args=(n,)) for n in ("one", "two")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert load_config(cfg).agents.keys() == {"one", "two"}
+
+
+class TestSymlinkedConfig:
+    def test_save_writes_through_a_symlink(self, tmp_path: Path):
+        """Dotfiles setups symlink agents.yaml; os.replace would eat the link."""
+        real = tmp_path / "dotfiles" / "agents.yaml"
+        real.parent.mkdir()
+        save_config(DispatchConfig(agents={"a": AgentConfig(directory=tmp_path)}), real)
+
+        link = tmp_path / "agents.yaml"
+        link.symlink_to(real)
+
+        save_config(DispatchConfig(agents={"b": AgentConfig(directory=tmp_path)}), link)
+
+        assert link.is_symlink(), "the symlink was replaced by a regular file"
+        assert load_config(real).agents.keys() == {"b"}, "the real file stopped receiving writes"
+        assert not list(tmp_path.glob("*.tmp"))
+        assert not list(real.parent.glob("*.tmp"))
+
+
+class TestLockDoesNotBlockForever:
+    def test_acquire_gives_up_and_proceeds(self, tmp_path: Path, monkeypatch):
+        """A wedged holder must not freeze the caller (the MCP server takes this
+        lock on its event-loop thread)."""
+        import subprocess
+        import sys
+
+        from agent_dispatch.config import _acquire_lock, _release_lock
+
+        monkeypatch.setattr("agent_dispatch.config._LOCK_TIMEOUT_SECONDS", 0.3)
+        lock_path = tmp_path / "held.lock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                f"import fcntl, time; f = open({str(lock_path)!r}, 'w'); "
+                "fcntl.flock(f, fcntl.LOCK_EX); time.sleep(30)",
+            ]
+        )
+        try:
+            # Wait for the child to actually hold it.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                fd = _acquire_lock(lock_path)
+                if fd is None:
+                    break  # contended: gave up as designed
+                _release_lock(fd)
+                time.sleep(0.05)
+            else:
+                pytest.fail("holder never acquired the lock")
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_uncontended_acquire_succeeds(self, tmp_path: Path):
+        from agent_dispatch.config import _acquire_lock, _release_lock
+
+        fd = _acquire_lock(tmp_path / "free.lock")
+        assert fd is not None
+        _release_lock(fd)

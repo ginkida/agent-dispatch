@@ -41,8 +41,12 @@ class AgentConfig(BaseModel):
 
     directory: Path
     description: str = ""
-    timeout: int = 300
-    max_budget_usd: float | None = None
+    # 0 keeps its historical meaning "inherit settings.default_timeout" (see
+    # runner: `agent.timeout or settings.default_timeout`). Negative values are
+    # rejected: they reach subprocess.run(timeout=-5), which raises
+    # TimeoutExpired instantly and bricks the agent with a nonsense error.
+    timeout: int = Field(default=300, ge=0)
+    max_budget_usd: float | None = Field(default=None, ge=0)
     model: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
@@ -53,7 +57,16 @@ class AgentConfig(BaseModel):
     @field_validator("directory", mode="before")
     @classmethod
     def expand_home(cls, v: str | Path) -> Path:
-        return Path(v).expanduser().resolve()
+        # Reject non-path input as a ValueError, not whatever Path() raises:
+        # pydantic wraps ValueError into a ValidationError (which the CLI and the
+        # MCP server both turn into an actionable message), but lets a TypeError
+        # escape as a raw traceback from every command.
+        if not isinstance(v, (str, Path)):
+            raise ValueError(f"directory must be a path string, got {type(v).__name__}")
+        try:
+            return Path(v).expanduser().resolve()
+        except (OSError, RuntimeError) as e:  # e.g. unresolvable "~unknown-user"
+            raise ValueError(f"invalid directory {v!r}: {e}") from e
 
 
 class CacheSettings(BaseModel):
@@ -74,8 +87,10 @@ class CacheSettings(BaseModel):
 class Settings(BaseModel):
     """Global settings for agent-dispatch."""
 
-    default_timeout: int = 300
-    default_max_budget_usd: float | None = None
+    # ge=1, not ge=0: this is the value an agent falls back to, so 0 would make
+    # every dispatch time out instantly with no way to override it per agent.
+    default_timeout: int = Field(default=300, ge=1)
+    default_max_budget_usd: float | None = Field(default=None, ge=0)
     default_permission_mode: str | None = None
     default_allowed_tools: list[str] = Field(default_factory=list)
     default_disallowed_tools: list[str] = Field(default_factory=list)

@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .config import ProcessLock
 from .models import DispatchResult
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,11 @@ class JobStore:
         # that may contain secrets — keep them off other local users' radar.
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         _chmod_quiet(self.directory, 0o700)
-        self._lock = threading.RLock()
+        # Cross-process: the CLI (cancel/gc) and the MCP server mutate the same
+        # job files, and every mutation is a read-modify-write. A thread-only
+        # lock would let the CLI's cancel be silently overwritten by the
+        # server's finish(). ".lock" is not "*.json", so list()/gc() skip it.
+        self._lock = ProcessLock(self.directory / ".jobs.lock")
 
     def _path(self, job_id: str) -> Path:
         # Defense-in-depth: validate before building any path so a crafted
@@ -274,31 +278,55 @@ class JobStore:
             self._write(job)
             return job, "cancelled"
 
+    # A pending job may legitimately be queued behind the job semaphore in a
+    # DIFFERENT, still-running server (the jobs directory is shared by every
+    # `agent-dispatch serve` process). Recovering one would silently drop work
+    # that was about to run — mark_running refuses a non-pending job, so its
+    # worker just skips it. We cannot prove ownership, so use a threshold no
+    # real queue wait reaches instead of the running-job one.
+    _PENDING_STALE_MULTIPLIER = 24
+
     def recover_stale(self, stale_threshold_seconds: float = 3600) -> int:
-        """Mark jobs stuck in 'running' beyond the threshold as failed.
+        """Mark jobs abandoned in 'running' or 'pending' beyond the threshold as failed.
 
         Async workers are daemon threads — if the server dies mid-dispatch the
-        job file is left in ``running`` forever. Call this on startup to flip
-        such orphans to ``failed`` so callers don't poll them indefinitely.
-        Returns the count recovered.
+        job file is left in ``running`` forever, and a job killed while still
+        queued on the job semaphore is left in ``pending`` forever. Neither is
+        ever cleaned up otherwise: ``gc`` only deletes *terminal* jobs, so a
+        stuck job is both an eternal poll target and permanent disk growth.
+        Call this on startup to flip such orphans to ``failed``. Returns the
+        count recovered.
+
+        ``pending`` jobs use a much longer threshold (see
+        ``_PENDING_STALE_MULTIPLIER``) because they may belong to another live
+        server sharing this directory. Even then nothing is executed twice:
+        ``mark_running`` refuses a non-pending job, so that worker skips it.
         """
         now = time.time()
+        pending_threshold = stale_threshold_seconds * self._PENDING_STALE_MULTIPLIER
         recovered = 0
+        stale: list[tuple[Job, float, str]] = []
         with self._lock:
             for job in self.list(status="running"):
                 age = now - (job.started_at or job.created_at)
                 if age > stale_threshold_seconds:
-                    # Count only jobs we actually transitioned (fail() returns
-                    # None for a missing/malformed id, e.g. a planted file).
-                    if (
-                        self.fail(
-                            job.id,
-                            f"Abandoned in 'running' for {age:.0f}s — likely a "
-                            "server restart. Re-dispatch if still needed.",
-                        )
-                        is not None
-                    ):
-                        recovered += 1
+                    stale.append((job, age, "running"))
+            for job in self.list(status="pending"):
+                age = now - job.created_at
+                if age > pending_threshold:
+                    stale.append((job, age, "pending"))
+            for job, age, state in stale:
+                # Count only jobs we actually transitioned (fail() returns
+                # None for a missing/malformed id, e.g. a planted file).
+                if (
+                    self.fail(
+                        job.id,
+                        f"Abandoned in {state!r} for {age:.0f}s — likely a "
+                        "server restart. Re-dispatch if still needed.",
+                    )
+                    is not None
+                ):
+                    recovered += 1
         return recovered
 
     def finish(

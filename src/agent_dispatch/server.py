@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -10,15 +11,20 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+import yaml
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import ValidationError
 
 from . import runner
 from .cache import DispatchCache
 from .config import (
     auto_describe,
     collect_mcp_servers,
+    config_lock,
+    config_path,
     detect_dbs,
     detect_stacks,
     load_config,
@@ -109,9 +115,45 @@ _JOB_PROGRESS_MAX_LINES = 20  # rolling tail kept in the job file
 _JOB_PROGRESS_WRITE_INTERVAL = 1.0  # seconds between progress file writes
 
 
+class ConfigLoadError(RuntimeError):
+    """agents.yaml could not be read — reported to callers as a JSON error."""
+
+
 def _get_config() -> DispatchConfig:
     """Load config fresh each call so new agents are picked up immediately."""
-    return load_config()
+    try:
+        return load_config()
+    except (ValidationError, yaml.YAMLError, OSError) as e:
+        raise ConfigLoadError(f"Config at {config_path()} could not be loaded: {e}") from e
+
+
+def _config_guard(
+    fn: Callable[..., Awaitable[str]],
+) -> Callable[..., Awaitable[str]]:
+    """Return the documented ``{"error": ...}`` envelope for an unreadable config.
+
+    Every tool loads the config on entry, so a YAML syntax error or a schema
+    violation used to escape as a protocol-level exception with no remediation —
+    including from the read-only tools an agent would reach for to diagnose it.
+    ``functools.wraps`` keeps the signature FastMCP introspects intact.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            return await fn(*args, **kwargs)
+        except ConfigLoadError as e:
+            logger.warning("%s: %s", fn.__name__, e)
+            return json.dumps(
+                {
+                    "error": str(e),
+                    "hint": "Fix the YAML (or restore a backup), then retry. "
+                    "'agent-dispatch doctor' points at the offending section.",
+                },
+                indent=2,
+            )
+
+    return wrapper
 
 
 def _get_cache(config: DispatchConfig) -> DispatchCache | None:
@@ -193,6 +235,50 @@ def _ref_payload(
         # the caller can use it without a fetch round-trip.
         payload["parsed_result"] = result.parsed_result
     return payload
+
+
+def _validate_timeout(timeout: int) -> str | None:
+    """Reject a timeout that would brick the agent. 0 means "leave unchanged/default".
+
+    A negative timeout reaches ``subprocess.run(timeout=...)``, which raises
+    TimeoutExpired immediately — every dispatch to that agent then fails with a
+    nonsensical "timed out after -5s" until someone edits the YAML by hand.
+    """
+    if timeout and timeout < 1:
+        return json.dumps(
+            {
+                "error": f"timeout must be a positive number of seconds (got {timeout}); pass 0 to "
+                "keep the agent's current value."
+            }
+        )
+    return None
+
+
+def _validate_budget(max_budget_usd: float) -> str | None:
+    """Reject a negative spend cap. 0 means "no limit" (add) / "unchanged" (update).
+
+    ``AgentConfig.max_budget_usd`` is ``ge=0``, but pydantic does not validate on
+    assignment — and a negative value would reach the command line as
+    ``--max-budget-usd -1``, a token the claude CLI parses as another flag.
+    """
+    if max_budget_usd < 0:
+        return json.dumps(
+            {"error": f"max_budget_usd must be >= 0 (got {max_budget_usd}); 0 means no limit."}
+        )
+    return None
+
+
+def _invalidate_agent_cache(config: DispatchConfig, name: str) -> None:
+    """Drop cached dispatch results for an agent whose config just changed.
+
+    The cache key is (agent, task, context, caller, goal, response_format) — it
+    cannot tell that the *name* now points at a different directory, permission
+    set or model. Without this, remove_agent + add_agent under the same name
+    keeps serving the previous project's answers for the rest of the TTL.
+    """
+    cache = _get_cache(config)
+    if cache and (dropped := cache.invalidate_agent(name)):
+        logger.info("Dropped %d cached result(s) for agent %r after a config change", dropped, name)
 
 
 def _validate_agent(config: DispatchConfig, name: str) -> str | None:
@@ -303,6 +389,7 @@ def _get_job_semaphore(config: DispatchConfig) -> threading.BoundedSemaphore:
 
 
 @mcp.tool()
+@_config_guard
 async def list_agents(ctx: Context | None = None) -> str:
     """List all configured agents with descriptions and health status.
 
@@ -392,6 +479,7 @@ def _read_preview(path, max_lines: int, max_chars: int) -> tuple[str, bool]:
 
 
 @mcp.tool()
+@_config_guard
 async def inspect_agent(
     name: str,
     preview_lines: int = 40,
@@ -480,6 +568,7 @@ async def inspect_agent(
 
 
 @mcp.tool()
+@_config_guard
 async def list_groups(ctx: Context | None = None) -> str:
     """List configured agent groups — cross-project working sets.
 
@@ -531,6 +620,7 @@ async def list_groups(ctx: Context | None = None) -> str:
 
 
 @mcp.tool()
+@_config_guard
 async def inspect_group(name: str, ctx: Context | None = None) -> str:
     """Inspect one group: its orchestration brief, shared facts, and members.
 
@@ -581,6 +671,7 @@ async def inspect_group(name: str, ctx: Context | None = None) -> str:
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch(
     agent: str,
     task: str,
@@ -653,6 +744,23 @@ async def dispatch(
         if cached:
             if ctx:
                 await ctx.info(f"Cache hit for {agent} — returning cached result")
+            if return_ref:
+                # A cache hit must still honor return_ref, or the caller that
+                # asked for a compact ref gets the full text inlined instead —
+                # exactly the context blow-up it was avoiding (dispatch_parallel
+                # already does this; see _run_one).
+                store = _get_job_store()
+                job = store.create_completed(
+                    agent,
+                    task,
+                    cached,
+                    context=effective_context,
+                    caller=caller or None,
+                    goal=goal or None,
+                )
+                payload = _ref_payload(job.id, cached, summary_chars)
+                payload["cached"] = True
+                return json.dumps(payload, indent=2)
             cached_dict = json.loads(cached.model_dump_json(indent=2, exclude_none=True))
             cached_dict["cached"] = True
             return json.dumps(cached_dict, indent=2)
@@ -702,6 +810,7 @@ async def dispatch(
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch_session(
     agent: str,
     task: str,
@@ -761,6 +870,7 @@ async def dispatch_session(
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch_parallel(
     dispatches: str,
     aggregate: str = "",
@@ -816,6 +926,11 @@ async def dispatch_parallel(
             )
         if "agent" not in item or "task" not in item:
             return json.dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
+        # Type-check before _validate_agent: an unhashable value (list/dict)
+        # would raise TypeError out of the `in` test, breaking the "tools always
+        # return a JSON string" contract.
+        if not isinstance(item["agent"], str) or not isinstance(item["task"], str):
+            return json.dumps({"error": f"dispatches[{i}].agent and .task must be strings"})
         if err := _validate_agent(config, item["agent"]):
             return err
         # Group membership is validated up front too — keeps the documented
@@ -959,8 +1074,14 @@ async def dispatch_parallel(
     parts = []
     for item, res in zip(items, output, strict=True):
         status = "OK" if res.get("success") else "FAILED"
-        body = res.get("result") or res.get("error", "")
-        parts.append(f"## Agent: {item['agent']} [{status}]\n{body}")
+        body = res.get("result")
+        if not body and (summary := res.get("summary")):
+            # A return_ref item carries no "result" — only a summary preview.
+            # Without this the aggregator would be paid to synthesize empty
+            # sections. Label it so it knows it is reading a truncated preview.
+            status = f"{status}, preview of {res.get('size', len(summary))} chars"
+            body = summary
+        parts.append(f"## Agent: {item['agent']} [{status}]\n{body or res.get('error', '')}")
     summary = "\n\n".join(parts)
 
     if ctx:
@@ -993,6 +1114,7 @@ async def dispatch_parallel(
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch_stream(
     agent: str,
     task: str,
@@ -1093,6 +1215,7 @@ _DIALOGUE_REPLY = (
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch_dialogue(
     requester: str,
     responder: str,
@@ -1250,6 +1373,7 @@ async def dispatch_dialogue(
 
 
 @mcp.tool()
+@_config_guard
 async def add_agent(
     name: str,
     directory: str,
@@ -1299,9 +1423,10 @@ async def add_agent(
     if not dir_path.is_dir():
         return json.dumps({"error": f"Directory does not exist: {dir_path}"})
 
-    config = _get_config()
-    if name in config.agents:
-        return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
+    if err := _validate_timeout(timeout):
+        return err
+    if err := _validate_budget(max_budget_usd):
+        return err
 
     desc = description or auto_describe(dir_path)
     parsed_allowed = _parse_csv(allowed_tools) if allowed_tools else None
@@ -1312,18 +1437,27 @@ async def add_agent(
     if ctx and (warning := check_permission_mode(permission_mode or None)):
         await ctx.info(f"Warning: {warning}")
 
-    config.agents[name] = AgentConfig(
-        directory=dir_path,
-        description=desc,
-        timeout=timeout or 300,
-        max_budget_usd=max_budget_usd or None,
-        permission_mode=permission_mode or None,
-        allowed_tools=parsed_allowed,
-        disallowed_tools=parsed_disallowed,
-        capabilities=parsed_capabilities,
-        risky_capabilities=parsed_risky_capabilities,
-    )
-    save_config(config)
+    # Load + mutate + save under the lock: the CLI and other MCP calls rewrite
+    # the whole file, so an unlocked read-modify-write silently drops one of two
+    # concurrent additions.
+    with config_lock():
+        config = _get_config()
+        if name in config.agents:
+            return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
+
+        config.agents[name] = AgentConfig(
+            directory=dir_path,
+            description=desc,
+            timeout=timeout or 300,
+            max_budget_usd=max_budget_usd or None,
+            permission_mode=permission_mode or None,
+            allowed_tools=parsed_allowed,
+            disallowed_tools=parsed_disallowed,
+            capabilities=parsed_capabilities,
+            risky_capabilities=parsed_risky_capabilities,
+        )
+        save_config(config)
+    _invalidate_agent_cache(config, name)
 
     if ctx:
         await ctx.info(f"Added agent '{name}' -> {dir_path}")
@@ -1348,6 +1482,7 @@ async def add_agent(
 
 
 @mcp.tool()
+@_config_guard
 async def remove_agent(
     name: str,
     ctx: Context | None = None,
@@ -1357,13 +1492,15 @@ async def remove_agent(
     Args:
         name: Agent name to remove.
     """
-    config = _get_config()
-    if name not in config.agents:
-        available = ", ".join(config.agents.keys()) or "(none)"
-        return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+    with config_lock():
+        config = _get_config()
+        if name not in config.agents:
+            available = ", ".join(config.agents.keys()) or "(none)"
+            return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
 
-    del config.agents[name]
-    save_config(config)
+        del config.agents[name]
+        save_config(config)
+    _invalidate_agent_cache(config, name)
 
     if ctx:
         await ctx.info(f"Removed agent '{name}'")
@@ -1372,6 +1509,7 @@ async def remove_agent(
 
 
 @mcp.tool()
+@_config_guard
 async def update_agent(
     name: str,
     description: str = "",
@@ -1405,13 +1543,70 @@ async def update_agent(
         risky_capabilities: Comma-separated risky capabilities. Pass "none"
             to clear.
     """
-    config = _get_config()
-    if name not in config.agents:
-        available = ", ".join(config.agents.keys()) or "(none)"
-        return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+    if err := _validate_timeout(timeout):
+        return err
 
-    agent = config.agents[name]
+    with config_lock():
+        config = _get_config()
+        if name not in config.agents:
+            available = ", ".join(config.agents.keys()) or "(none)"
+            return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+
+        agent = config.agents[name]
+        # No await inside the lock. Every tool coroutine runs on the same
+        # event-loop thread and ProcessLock's inner guard is a threading.RLock —
+        # which is re-entrant *per thread*, so a second update_agent suspended
+        # here would sail straight through the "held" lock and interleave its
+        # own load/mutate/save, losing one of the two edits. Warnings are
+        # collected as data and emitted after the critical section.
+        updated, warnings = _apply_agent_updates(
+            agent,
+            description=description,
+            timeout=timeout,
+            max_budget_usd=max_budget_usd,
+            model=model,
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            capabilities=capabilities,
+            risky_capabilities=risky_capabilities,
+        )
+
+        if not updated:
+            return json.dumps({"error": "Nothing to update. Pass at least one non-empty field."})
+
+        save_config(config)
+    _invalidate_agent_cache(config, name)
+
+    if ctx:
+        for warning in warnings:
+            await ctx.info(f"Warning: {warning}")
+        await ctx.info(f"Updated agent '{name}': {', '.join(updated)}")
+
+    return json.dumps({"updated": name, "fields": updated}, indent=2)
+
+
+def _apply_agent_updates(
+    agent: AgentConfig,
+    *,
+    description: str,
+    timeout: int,
+    max_budget_usd: float,
+    model: str,
+    permission_mode: str,
+    allowed_tools: str,
+    disallowed_tools: str,
+    capabilities: str,
+    risky_capabilities: str,
+) -> tuple[list[str], list[str]]:
+    """Apply update_agent's non-empty fields in place.
+
+    Returns ``(fields_touched, warnings)``. Deliberately synchronous: the caller
+    runs it inside ``config_lock()``, and an await there would let a second
+    coroutine re-enter the per-thread lock and lose an update.
+    """
     updated: list[str] = []
+    warnings: list[str] = []
 
     if description:
         agent.description = description
@@ -1428,8 +1623,8 @@ async def update_agent(
     if permission_mode:
         effective = None if permission_mode.lower() == "none" else permission_mode
         agent.permission_mode = effective
-        if ctx and (warning := check_permission_mode(effective)):
-            await ctx.info(f"Warning: {warning}")
+        if warning := check_permission_mode(effective):
+            warnings.append(warning)
         updated.append("permission_mode")
     if allowed_tools:
         if allowed_tools.lower() == "none":
@@ -1452,15 +1647,7 @@ async def update_agent(
         )
         updated.append("risky_capabilities")
 
-    if not updated:
-        return json.dumps({"error": "Nothing to update. Pass at least one non-empty field."})
-
-    save_config(config)
-
-    if ctx:
-        await ctx.info(f"Updated agent '{name}': {', '.join(updated)}")
-
-    return json.dumps({"updated": name, "fields": updated}, indent=2)
+    return updated, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1551,6 +1738,7 @@ def _run_job(
 
 
 @mcp.tool()
+@_config_guard
 async def dispatch_async(
     agent: str,
     task: str,
@@ -1871,6 +2059,7 @@ async def dispatch_gc(
 
 
 @mcp.tool()
+@_config_guard
 async def cache_stats(ctx: Context | None = None) -> str:
     """Show dispatch cache statistics: size, hit rate, TTL."""
     config = _get_config()
@@ -1882,6 +2071,7 @@ async def cache_stats(ctx: Context | None = None) -> str:
 
 
 @mcp.tool()
+@_config_guard
 async def cache_clear(ctx: Context | None = None) -> str:
     """Clear all cached dispatch results."""
     config = _get_config()

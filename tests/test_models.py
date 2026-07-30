@@ -254,3 +254,44 @@ class TestGroups:
             {"groups": {"g": {"members": [{"agent": "ghost"}]}}}
         )
         assert cfg.groups["g"].members[0].agent == "ghost"
+
+
+class TestNumericBounds:
+    """A negative timeout reaches subprocess.run() and bricks the agent."""
+
+    def test_negative_agent_timeout_rejected(self, tmp_path):
+        with pytest.raises(ValidationError):
+            AgentConfig(directory=tmp_path, timeout=-5)
+
+    def test_zero_agent_timeout_allowed(self, tmp_path):
+        # 0 keeps its historical meaning: inherit settings.default_timeout.
+        assert AgentConfig(directory=tmp_path, timeout=0).timeout == 0
+
+    def test_negative_default_timeout_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(default_timeout=-1)
+
+    def test_zero_default_timeout_rejected(self):
+        # Nothing could override it — every dispatch would time out instantly.
+        with pytest.raises(ValidationError):
+            Settings(default_timeout=0)
+
+    def test_negative_budget_rejected(self, tmp_path):
+        # str(-1) would land on the command line as a token starting with "-".
+        with pytest.raises(ValidationError):
+            AgentConfig(directory=tmp_path, max_budget_usd=-1)
+        with pytest.raises(ValidationError):
+            Settings(default_max_budget_usd=-1)
+
+
+class TestDirectoryValidation:
+    def test_non_path_directory_raises_validation_error(self):
+        # Must be a ValidationError, not the raw TypeError from Path(123):
+        # a TypeError escapes as a traceback from every CLI command and MCP tool.
+        with pytest.raises(ValidationError):
+            AgentConfig(directory=123)
+
+    def test_non_path_directory_in_config_is_reported_per_field(self):
+        with pytest.raises(ValidationError) as exc:
+            DispatchConfig.model_validate({"agents": {"bad": {"directory": ["a", "b"]}}})
+        assert "directory" in str(exc.value)

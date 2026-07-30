@@ -13,7 +13,7 @@ import click
 import yaml
 from pydantic import ValidationError
 
-from .config import auto_describe, config_path, load_config, save_config
+from .config import auto_describe, config_lock, config_path, load_config, save_config
 from .jobs import JobStore, default_jobs_dir, is_valid_job_id
 from .models import (
     AgentConfig,
@@ -29,6 +29,38 @@ def _parse_csv(value: str | None) -> list[str] | None:
     return [t.strip() for t in value.split(",") if t.strip()] if value else None
 
 
+def _check_budget_or_exit(max_budget: float | None) -> None:
+    """Reject a negative spend cap before it reaches `AgentConfig` (ge=0).
+
+    Without this the pydantic ValidationError escapes Click as a raw traceback.
+    """
+    if max_budget is not None and max_budget < 0:
+        click.echo(
+            click.style(
+                f"Error: --max-budget must be >= 0 (got {max_budget}); use 0 to clear the limit.",
+                fg="red",
+            )
+        )
+        raise SystemExit(1)
+
+
+def _check_timeout_or_exit(timeout: int | None) -> None:
+    """Reject a non-positive timeout before it reaches agents.yaml.
+
+    A negative timeout is passed straight to ``subprocess.run(timeout=...)``,
+    which raises TimeoutExpired instantly — every dispatch to that agent then
+    fails with a nonsensical "timed out after -5s" until the YAML is hand-edited.
+    """
+    if timeout is not None and timeout < 1:
+        click.echo(
+            click.style(
+                f"Error: --timeout must be a positive number of seconds (got {timeout}).",
+                fg="red",
+            )
+        )
+        raise SystemExit(1)
+
+
 def _load_or_exit() -> DispatchConfig:
     """Load config, exiting with a friendly error on malformed YAML or schema."""
     try:
@@ -41,6 +73,10 @@ def _load_or_exit() -> DispatchConfig:
         raise SystemExit(1) from None
     except yaml.YAMLError as e:
         click.echo(click.style(f"Error: config at {config_path()} is not valid YAML:", fg="red"))
+        click.echo(str(e))
+        raise SystemExit(1) from None
+    except OSError as e:
+        click.echo(click.style(f"Error: config at {config_path()} could not be read:", fg="red"))
         click.echo(str(e))
         raise SystemExit(1) from None
 
@@ -115,7 +151,14 @@ def init() -> None:
 )
 @click.option("--timeout", default=300, help="Timeout in seconds (default: 300).")
 @click.option("--model", default=None, help="Model override for this agent.")
-@click.option("--max-budget", default=None, type=float, help="Max cost in USD per dispatch.")
+@click.option(
+    "--max-budget",
+    "--max-budget-usd",
+    "max_budget",
+    default=None,
+    type=float,
+    help="Max cost in USD per dispatch.",
+)
 @click.option(
     "--permission-mode",
     default=None,
@@ -161,33 +204,39 @@ def add(
         click.echo(f"Error: {e}")
         raise SystemExit(1) from None
 
-    config = _load_or_exit()
+    _check_timeout_or_exit(timeout)
+    _check_budget_or_exit(max_budget)
     dir_path = Path(directory).resolve()
-
-    if name in config.agents:
-        click.echo(f"Agent '{name}' already exists. Use 'agent-dispatch remove {name}' first.")
-        raise SystemExit(1)
 
     if description is None:
         description = auto_describe(dir_path)
         click.echo(f"Auto-generated description: {description}")
 
-    config.agents[name] = AgentConfig(
-        directory=dir_path,
-        description=description,
-        timeout=timeout,
-        model=model,
-        max_budget_usd=max_budget,
-        permission_mode=permission_mode,
-        allowed_tools=_parse_csv(allowed_tools),
-        disallowed_tools=_parse_csv(disallowed_tools),
-        capabilities=_parse_csv(capabilities) or [],
-        risky_capabilities=_parse_csv(risky_capabilities) or [],
-    )
-    if warning := check_permission_mode(permission_mode):
-        click.echo(click.style(f"Warning: {warning}", fg="yellow"))
+    # Load + mutate + save under the lock — the MCP server rewrites the same
+    # file, and an unlocked read-modify-write silently drops one of two
+    # concurrent additions.
+    with config_lock():
+        config = _load_or_exit()
+        if name in config.agents:
+            click.echo(f"Agent '{name}' already exists. Use 'agent-dispatch remove {name}' first.")
+            raise SystemExit(1)
 
-    save_config(config)
+        config.agents[name] = AgentConfig(
+            directory=dir_path,
+            description=description,
+            timeout=timeout,
+            model=model,
+            max_budget_usd=max_budget,
+            permission_mode=permission_mode,
+            allowed_tools=_parse_csv(allowed_tools),
+            disallowed_tools=_parse_csv(disallowed_tools),
+            capabilities=_parse_csv(capabilities) or [],
+            risky_capabilities=_parse_csv(risky_capabilities) or [],
+        )
+        if warning := check_permission_mode(permission_mode):
+            click.echo(click.style(f"Warning: {warning}", fg="yellow"))
+
+        save_config(config)
     click.echo(f"Added agent '{name}' -> {dir_path}")
 
 
@@ -195,13 +244,14 @@ def add(
 @click.argument("name")
 def remove(name: str) -> None:
     """Remove an agent."""
-    config = _load_or_exit()
-    if name not in config.agents:
-        click.echo(f"Agent '{name}' not found.")
-        raise SystemExit(1)
+    with config_lock():
+        config = _load_or_exit()
+        if name not in config.agents:
+            click.echo(f"Agent '{name}' not found.")
+            raise SystemExit(1)
 
-    del config.agents[name]
-    save_config(config)
+        del config.agents[name]
+        save_config(config)
     click.echo(f"Removed agent '{name}'.")
 
 
@@ -254,7 +304,16 @@ def list_agents() -> None:
 @click.option("-d", "--description", default=None, help="New description.")
 @click.option("--timeout", default=None, type=int, help="Timeout in seconds.")
 @click.option("--model", default=None, help="Model override.")
-@click.option("--max-budget", default=None, type=float, help="Max cost in USD. Use 0 to clear.")
+@click.option(
+    # --max-budget-usd is an alias, not decoration: it is the flag the budget
+    # hints in runner.py and `test` tell the user to run.
+    "--max-budget",
+    "--max-budget-usd",
+    "max_budget",
+    default=None,
+    type=float,
+    help="Max cost in USD. Use 0 to clear.",
+)
 @click.option(
     "--permission-mode",
     default=None,
@@ -295,12 +354,51 @@ def update(
     risky_capabilities: str | None,
 ) -> None:
     """Update an existing agent's configuration."""
-    config = _load_or_exit()
-    if name not in config.agents:
-        click.echo(f"Agent '{name}' not found. Run 'agent-dispatch list' to see agents.")
-        raise SystemExit(1)
+    _check_timeout_or_exit(timeout)
+    _check_budget_or_exit(max_budget)
 
-    agent = config.agents[name]
+    with config_lock():
+        config = _load_or_exit()
+        if name not in config.agents:
+            click.echo(f"Agent '{name}' not found. Run 'agent-dispatch list' to see agents.")
+            raise SystemExit(1)
+
+        agent = config.agents[name]
+        updated = _apply_cli_updates(
+            agent,
+            description=description,
+            timeout=timeout,
+            model=model,
+            max_budget=max_budget,
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            capabilities=capabilities,
+            risky_capabilities=risky_capabilities,
+        )
+
+        if not updated:
+            click.echo("Nothing to update. Pass at least one option (see --help).")
+            raise SystemExit(1)
+
+        save_config(config)
+    click.echo(f"Updated agent '{name}': {', '.join(updated)}")
+
+
+def _apply_cli_updates(
+    agent: AgentConfig,
+    *,
+    description: str | None,
+    timeout: int | None,
+    model: str | None,
+    max_budget: float | None,
+    permission_mode: str | None,
+    allowed_tools: str | None,
+    disallowed_tools: str | None,
+    capabilities: str | None,
+    risky_capabilities: str | None,
+) -> list[str]:
+    """Apply `update`'s explicitly-passed options in place; return the fields touched."""
     updated: list[str] = []
 
     if description is not None:
@@ -347,12 +445,7 @@ def update(
             agent.risky_capabilities = _parse_csv(risky_capabilities) or []
         updated.append("risky_capabilities")
 
-    if not updated:
-        click.echo("Nothing to update. Pass at least one option (see --help).")
-        raise SystemExit(1)
-
-    save_config(config)
-    click.echo(f"Updated agent '{name}': {', '.join(updated)}")
+    return updated
 
 
 @cli.command()
@@ -520,32 +613,33 @@ def group_add(name: str, description: str, shared_context: str, members: tuple[s
         click.echo(f"Error: {e}")
         raise SystemExit(1) from None
 
-    config = _load_or_exit()
-    if name in config.groups:
-        click.echo(
-            f"Group '{name}' already exists. Use 'agent-dispatch group remove {name}' first."
-        )
-        raise SystemExit(1)
-
-    member_objs: list[GroupMember] = []
-    for agent_name in members:
-        if agent_name not in config.agents:
+    with config_lock():
+        config = _load_or_exit()
+        if name in config.groups:
             click.echo(
-                click.style(
-                    f"Error: agent '{agent_name}' not found. "
-                    "Add it first ('agent-dispatch add') or check the name.",
-                    fg="red",
-                )
+                f"Group '{name}' already exists. Use 'agent-dispatch group remove {name}' first."
             )
             raise SystemExit(1)
-        member_objs.append(GroupMember(agent=agent_name))
 
-    config.groups[name] = DispatchGroup(
-        description=description,
-        shared_context=shared_context,
-        members=member_objs,
-    )
-    save_config(config)
+        member_objs: list[GroupMember] = []
+        for agent_name in members:
+            if agent_name not in config.agents:
+                click.echo(
+                    click.style(
+                        f"Error: agent '{agent_name}' not found. "
+                        "Add it first ('agent-dispatch add') or check the name.",
+                        fg="red",
+                    )
+                )
+                raise SystemExit(1)
+            member_objs.append(GroupMember(agent=agent_name))
+
+        config.groups[name] = DispatchGroup(
+            description=description,
+            shared_context=shared_context,
+            members=member_objs,
+        )
+        save_config(config)
     click.echo(f"Added group '{name}' ({len(member_objs)} member(s)).")
     if not member_objs:
         click.echo(
@@ -624,25 +718,26 @@ def group_update(name: str, description: str | None, shared_context: str | None)
     string to clear). Edit members by recreating the group or editing
     agents.yaml.
     """
-    config = _load_or_exit()
-    if name not in config.groups:
-        click.echo(f"Group '{name}' not found. Run 'agent-dispatch group list' to see groups.")
-        raise SystemExit(1)
+    with config_lock():
+        config = _load_or_exit()
+        if name not in config.groups:
+            click.echo(f"Group '{name}' not found. Run 'agent-dispatch group list' to see groups.")
+            raise SystemExit(1)
 
-    grp = config.groups[name]
-    updated: list[str] = []
-    if description is not None:
-        grp.description = description
-        updated.append("description")
-    if shared_context is not None:
-        grp.shared_context = shared_context
-        updated.append("shared_context")
+        grp = config.groups[name]
+        updated: list[str] = []
+        if description is not None:
+            grp.description = description
+            updated.append("description")
+        if shared_context is not None:
+            grp.shared_context = shared_context
+            updated.append("shared_context")
 
-    if not updated:
-        click.echo("Nothing to update. Pass --description and/or --shared-context.")
-        raise SystemExit(1)
+        if not updated:
+            click.echo("Nothing to update. Pass --description and/or --shared-context.")
+            raise SystemExit(1)
 
-    save_config(config)
+        save_config(config)
     click.echo(f"Updated group '{name}': {', '.join(updated)}")
 
 
@@ -650,13 +745,14 @@ def group_update(name: str, description: str | None, shared_context: str | None)
 @click.argument("name")
 def group_remove(name: str) -> None:
     """Remove a group (does not touch the underlying agents)."""
-    config = _load_or_exit()
-    if name not in config.groups:
-        click.echo(f"Group '{name}' not found.")
-        raise SystemExit(1)
+    with config_lock():
+        config = _load_or_exit()
+        if name not in config.groups:
+            click.echo(f"Group '{name}' not found.")
+            raise SystemExit(1)
 
-    del config.groups[name]
-    save_config(config)
+        del config.groups[name]
+        save_config(config)
     click.echo(f"Removed group '{name}'.")
 
 
@@ -942,9 +1038,31 @@ def job_cancel(job_id: str) -> None:
 
 @cli.command("gc")
 @click.option("--days", default=7, type=int, help="Delete terminal jobs older than N days.")
-def jobs_gc(days: int) -> None:
+@click.option(
+    "--all",
+    "purge_all",
+    is_flag=True,
+    help="Purge every terminal job regardless of age (what --days 0 used to do silently).",
+)
+def jobs_gc(days: int, purge_all: bool) -> None:
     """Purge old terminal async jobs (done/failed/cancelled)."""
-    deleted = _job_store().gc(max(0, days) * 86400)
+    if purge_all:
+        deleted = _job_store().gc(0)
+        click.echo(f"Deleted {deleted} terminal job(s) (all ages).")
+        return
+    # `--days 0` used to clamp to a cutoff of "now" and wipe every terminal job,
+    # including return_ref results a caller was about to fetch — while the
+    # dispatch_gc MCP tool rejected the same input. Reject it here too.
+    if days <= 0:
+        click.echo(
+            click.style(
+                f"Error: --days must be > 0 (got {days}). "
+                "Use --all to purge every terminal job on purpose.",
+                fg="red",
+            )
+        )
+        raise SystemExit(1)
+    deleted = _job_store().gc(days * 86400)
     click.echo(f"Deleted {deleted} job(s) older than {days} day(s).")
 
 
