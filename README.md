@@ -358,8 +358,8 @@ Register a new project directory as an agent. Description is auto-generated from
 | `name` | string | yes | Agent name (letters, digits, hyphens, underscores) |
 | `directory` | string | yes | Path to an existing project directory (`~` is expanded, relative paths resolved) |
 | `description` | string | no | What this agent can do — auto-generated if empty |
-| `timeout` | int | no | Timeout in seconds (0 = use global default) |
-| `max_budget_usd` | float | no | Max cost in USD per dispatch (0 = no limit) |
+| `timeout` | int | no | Timeout in seconds (0 = 300; this is a literal default, not `settings.default_timeout`) |
+| `max_budget_usd` | float | no | Max cost in USD per dispatch (0 = inherit `settings.default_max_budget_usd`; no cap only when that is unset too) |
 | `permission_mode` | string | no | Permission mode (e.g. `default`, `plan`, `bypassPermissions`) |
 | `allowed_tools` | string | no | Comma-separated allowed tools (e.g. `"Bash,Read,Edit"`) |
 | `disallowed_tools` | string | no | Comma-separated disallowed tools |
@@ -375,7 +375,7 @@ Update an existing agent's configuration. Only non-empty fields are changed. Pas
 | `name` | string | yes | Agent name to update |
 | `description` | string | no | New description |
 | `timeout` | int | no | New timeout (0 = don't change) |
-| `max_budget_usd` | float | no | New budget limit (0 = don't change, negative = clear the limit) |
+| `max_budget_usd` | float | no | New budget limit (0 = don't change; negative clears the *per-agent* cap, after which `settings.default_max_budget_usd` applies) |
 | `model` | string | no | Model override. `"none"` to clear |
 | `permission_mode` | string | no | Permission mode. `"none"` to clear |
 | `allowed_tools` | string | no | Comma-separated. `"none"` to clear |
@@ -444,7 +444,7 @@ Async workers run with streaming under the hood: the job file keeps a rolling ta
 
 `dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
 
-Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server marks jobs left in `running` by a crashed instance as `failed` once they are stale (stuck for over an hour).
+Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server recovers jobs a crashed instance abandoned: `running` ones stuck over an hour, and `pending` ones over 24 hours, are marked `failed` so they stop being polled forever and become collectable by `dispatch_gc`. (The `pending` threshold is deliberately long — the jobs directory is shared by every running server, so a job queued behind another server's concurrency limit must not be swept.)
 
 | When to use async | When to use `dispatch` |
 |-------------------|------------------------|
@@ -605,7 +605,7 @@ agent-dispatch MCP server
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). A streaming dispatch runs the agent in its own process group, so the deadline kills the whole tree: a process the agent left running in the background can't hold the dispatch (and its concurrency slot) open past the timeout.
 - **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, and results flagged `budget_exceeded` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
-- **Durable config** — `agents.yaml` is written atomically (temp file + rename), and every mutation path (CLI and MCP server alike) holds a cross-process advisory lock, so concurrent edits cannot truncate the file or silently drop one another's agents.
+- **Durable config** — `agents.yaml` is written atomically (temp file + rename), so an interrupted write can never truncate it. Every mutation path (CLI and MCP server alike) also takes a cross-process advisory lock, so concurrent edits don't drop one another's agents. The lock is best-effort by design: after waiting 10 seconds it logs a warning and proceeds anyway, because a wedged lock holder must not freeze the MCP server — so on a heavily contended config a lost update is possible, while a truncated one is not.
 
 See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
 

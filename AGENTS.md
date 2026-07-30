@@ -28,7 +28,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 561 tests, ~4s
+python3 -m pytest tests/ -v   # 578 tests, ~5s
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`. The one exception is `TestStreamPipeHandling`, which spawns a short-lived *python* subprocess: a pipe deadlock lives in the OS pipe buffer, so a mocked `Popen` structurally cannot reproduce it.
@@ -58,7 +58,7 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - Anything that changes an agent's config must call `_invalidate_agent_cache` — the cache key holds the agent *name*, not its directory or permissions.
 - Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, and `budget_exceeded` results, so the documented "grant access, then re-dispatch" recovery is never short-circuited.
 - Remediation text is a contract: a hint that names a flag must name one that exists (`test_printed_budget_hint_is_a_runnable_command` feeds the printed flags back into the CLI). Run the command you print.
-- MCP tools that load config carry `@_config_guard` under `@mcp.tool()` so a broken `agents.yaml` returns the `{"error": ...}` envelope instead of a raw traceback.
+- MCP tools that load config carry `@_config_guard` under `@mcp.tool()` so a broken `agents.yaml` — or a failed *write* — returns the `{"error": ...}` envelope instead of a raw traceback. The set of load errors lives in one place (`config.CONFIG_LOAD_ERRORS`) because three surfaces handle it: **`UnicodeDecodeError` is a `ValueError`, not an `OSError`**, and listing types per-site is exactly how a cp1251 config slipped past all three.
 
 - Tests must not touch anything outside `tmp_path`. `test_server.py`'s autouse `_reset_globals` and `test_cli.py`'s `_isolated_config` redirect **both** `AGENT_DISPATCH_CONFIG` and `AGENT_DISPATCH_JOBS_DIR`: a mutation tool that bails out early (unknown agent) still takes `config_lock()` first, which would otherwise create a lock file beside the developer's real config.
 
@@ -76,4 +76,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 561 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 578 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

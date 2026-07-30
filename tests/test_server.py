@@ -3002,3 +3002,101 @@ class TestUpdateAgentLockDiscipline:
         saved = load_config(cfg_file)
         assert saved.agents["infra"].description == "from-A"
         assert saved.agents["db"].description == "from-B"
+
+
+class TestNonUtf8Config:
+    """UnicodeDecodeError is a ValueError, not an OSError — it slipped past every
+    handler and crashed all 21 tools (and `doctor`, the diagnosis command)."""
+
+    @pytest.fixture()
+    def cp1251_config(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "agents.yaml"
+        cfg.write_bytes(
+            'agents:\n  infra:\n    directory: /tmp\n    description: "Инфраструктура"\n'.encode(
+                "cp1251"
+            )
+        )
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        return cfg
+
+    @pytest.mark.asyncio
+    async def test_list_agents_returns_error_envelope(self, cp1251_config):
+        data = json.loads(await server.list_agents(ctx=None))
+        assert "could not be loaded" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_error_envelope(self, cp1251_config):
+        data = json.loads(await server.dispatch("infra", "task", ctx=None))
+        assert "could not be loaded" in data["error"]
+
+
+class TestWriteFailureEnvelope:
+    """The load half of the contract was fixed first; a failed *write* (full
+    disk, read-only volume) escaped the same tools as a raw OSError."""
+
+    @pytest.mark.asyncio
+    async def test_add_agent_reports_io_failure_as_json(self, tmp_path: Path, monkeypatch):
+        project = tmp_path / "proj"
+        project.mkdir()
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        boom = OSError(28, "No space left on device")
+        with patch.object(server, "save_config", side_effect=boom):
+            raw = await server.add_agent("new", str(project))
+        data = json.loads(raw)
+        assert "I/O" in data["error"]
+        assert "No space left" in data["error"]
+        assert "hint" in data
+
+    @pytest.mark.asyncio
+    async def test_update_agent_reports_io_failure_as_json(self, tmp_path: Path, monkeypatch):
+        config = _make_config(tmp_path)
+        from agent_dispatch.config import save_config as real_save
+
+        cfg = tmp_path / "agents.yaml"
+        real_save(config, cfg)
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        with patch.object(server, "save_config", side_effect=OSError("read-only file system")):
+            data = json.loads(await server.update_agent("infra", description="x"))
+        assert "I/O" in data["error"]
+
+
+class TestJobToolsIoGuard:
+    """The six job tools never load config, so @_config_guard was not applied —
+    leaving their I/O failures escaping raw."""
+
+    @pytest.mark.asyncio
+    async def test_unusable_jobs_dir_returns_envelope(self, tmp_path: Path, monkeypatch):
+        blocked = tmp_path / "blocked"
+        blocked.write_text("this is a file, not a directory")
+        monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(blocked / "jobs"))
+        server._job_store = None
+        data = json.loads(await server.dispatch_jobs())
+        assert "I/O" in data["error"]
+        assert "hint" in data
+
+    @pytest.mark.asyncio
+    async def test_all_job_tools_are_guarded(self):
+        import inspect
+
+        for name in (
+            "dispatch_status",
+            "dispatch_wait",
+            "dispatch_cancel",
+            "dispatch_jobs",
+            "fetch_result",
+            "dispatch_gc",
+        ):
+            fn = getattr(server, name)
+            src = inspect.getsource(inspect.unwrap(fn))
+            assert hasattr(fn, "__wrapped__"), f"{name} is not wrapped by a guard"
+            assert src  # sanity
+
+
+class TestAddAgentBadDirectory:
+    @pytest.mark.asyncio
+    async def test_unresolvable_home_returns_envelope(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        # expanduser raises RuntimeError for an unknown user — not a
+        # directory-missing error, and it used to escape the tool.
+        data = json.loads(await server.add_agent("z", "~nonexistentuser12345/proj"))
+        assert "Invalid directory" in data["error"]

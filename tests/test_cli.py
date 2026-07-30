@@ -1434,3 +1434,61 @@ class TestAddBudgetGuard:
         assert "--max-budget" in result.output
         assert not isinstance(result.exception, ValidationError)
         assert not _isolated_config.exists()
+
+
+class TestNonUtf8Config:
+    def _write_cp1251(self, path: Path) -> None:
+        path.write_bytes(
+            'agents:\n  infra:\n    directory: /tmp\n    description: "Инфраструктура"\n'.encode(
+                "cp1251"
+            )
+        )
+
+    def test_list_reports_encoding_not_traceback(self, _isolated_config):
+        self._write_cp1251(_isolated_config)
+        result = runner.invoke(cli, ["list"])
+        assert result.exit_code == 1
+        assert "UTF-8" in result.output
+        assert not isinstance(result.exception, UnicodeDecodeError)
+
+    def test_doctor_diagnoses_instead_of_crashing(self, _isolated_config):
+        # doctor is the command you reach for when the config is broken — it
+        # must never be the one that crashes on it.
+        self._write_cp1251(_isolated_config)
+        result = runner.invoke(cli, ["doctor"])
+        assert not isinstance(result.exception, UnicodeDecodeError)
+        assert "not valid UTF-8" in result.output
+        assert "Re-save the file as UTF-8" in result.output
+
+    def test_unreadable_config_is_reported_by_doctor(self, _isolated_config, monkeypatch):
+        _isolated_config.write_text("agents: {}\n")
+        monkeypatch.setattr(
+            "agent_dispatch.cli.load_config",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("permission denied")),
+        )
+        result = runner.invoke(cli, ["doctor"])
+        assert not isinstance(result.exception, OSError)
+        assert "could not be read" in result.output
+
+
+class TestWriteFailureMessages:
+    def test_add_reports_write_failure_without_traceback(self, tmp_path: Path, _isolated_config):
+        project = tmp_path / "proj"
+        project.mkdir()
+        with patch(
+            "agent_dispatch.cli.save_config", side_effect=OSError(28, "No space left on device")
+        ):
+            result = runner.invoke(cli, ["add", "proj", str(project), "-d", "t"])
+        assert result.exit_code == 1
+        assert "could not write" in result.output
+        assert "previous config is intact" in result.output
+        assert not isinstance(result.exception, OSError)
+
+    def test_previous_config_survives_a_failed_write(self, tmp_path: Path, _isolated_config):
+        project = tmp_path / "proj"
+        project.mkdir()
+        runner.invoke(cli, ["add", "keep", str(project), "-d", "t"])
+        with patch("agent_dispatch.cli.save_config", side_effect=OSError("disk full")):
+            runner.invoke(cli, ["remove", "keep"])
+        # The write is atomic, so the agent must still be there.
+        assert "keep" in load_config(_isolated_config).agents

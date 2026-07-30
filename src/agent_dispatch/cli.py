@@ -29,6 +29,27 @@ def _parse_csv(value: str | None) -> list[str] | None:
     return [t.strip() for t in value.split(",") if t.strip()] if value else None
 
 
+def _save_or_exit(config: DispatchConfig) -> None:
+    """Persist the config, turning an I/O failure into a message, not a traceback.
+
+    A full disk or a read-only volume makes `save_config` raise OSError. The
+    write is atomic, so the previous config survives — say so, since that is the
+    one thing the user needs to know.
+    """
+    try:
+        save_config(config)
+    except OSError as e:
+        click.echo(
+            click.style(
+                f"Error: could not write {config_path()}: {e}\n"
+                "Nothing was changed — the previous config is intact "
+                "(the write is atomic). Check free space and permissions.",
+                fg="red",
+            )
+        )
+        raise SystemExit(1) from None
+
+
 def _check_budget_or_exit(max_budget: float | None) -> None:
     """Reject a negative spend cap before it reaches `AgentConfig` (ge=0).
 
@@ -73,6 +94,15 @@ def _load_or_exit() -> DispatchConfig:
         raise SystemExit(1) from None
     except yaml.YAMLError as e:
         click.echo(click.style(f"Error: config at {config_path()} is not valid YAML:", fg="red"))
+        click.echo(str(e))
+        raise SystemExit(1) from None
+    except UnicodeDecodeError as e:
+        click.echo(
+            click.style(
+                f"Error: config at {config_path()} is not valid UTF-8 (re-save it as UTF-8):",
+                fg="red",
+            )
+        )
         click.echo(str(e))
         raise SystemExit(1) from None
     except OSError as e:
@@ -236,7 +266,7 @@ def add(
         if warning := check_permission_mode(permission_mode):
             click.echo(click.style(f"Warning: {warning}", fg="yellow"))
 
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Added agent '{name}' -> {dir_path}")
 
 
@@ -251,7 +281,7 @@ def remove(name: str) -> None:
             raise SystemExit(1)
 
         del config.agents[name]
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Removed agent '{name}'.")
 
 
@@ -381,7 +411,7 @@ def update(
             click.echo("Nothing to update. Pass at least one option (see --help).")
             raise SystemExit(1)
 
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Updated agent '{name}': {', '.join(updated)}")
 
 
@@ -639,7 +669,7 @@ def group_add(name: str, description: str, shared_context: str, members: tuple[s
             shared_context=shared_context,
             members=member_objs,
         )
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Added group '{name}' ({len(member_objs)} member(s)).")
     if not member_objs:
         click.echo(
@@ -737,7 +767,7 @@ def group_update(name: str, description: str | None, shared_context: str | None)
             click.echo("Nothing to update. Pass --description and/or --shared-context.")
             raise SystemExit(1)
 
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Updated group '{name}': {', '.join(updated)}")
 
 
@@ -752,7 +782,7 @@ def group_remove(name: str) -> None:
             raise SystemExit(1)
 
         del config.groups[name]
-        save_config(config)
+        _save_or_exit(config)
     click.echo(f"Removed group '{name}'.")
 
 
@@ -806,6 +836,15 @@ def doctor() -> None:
             click.echo(f"    {e}")
         except yaml.YAMLError as e:
             fail(f"Config not valid YAML: {cp}")
+            click.echo(f"    {e}")
+        except UnicodeDecodeError as e:
+            # A ValueError, not an OSError — it slipped past both handlers above
+            # and crashed the one command meant to diagnose a broken config.
+            fail(f"Config is not valid UTF-8: {cp}")
+            click.echo(f"    {e}")
+            click.echo("    Re-save the file as UTF-8.")
+        except OSError as e:
+            fail(f"Config could not be read: {cp}")
             click.echo(f"    {e}")
 
     section("MCP registration")

@@ -14,13 +14,12 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import yaml
 from mcp.server.fastmcp import Context, FastMCP
-from pydantic import ValidationError
 
 from . import runner
 from .cache import DispatchCache
 from .config import (
+    CONFIG_LOAD_ERRORS,
     auto_describe,
     collect_mcp_servers,
     config_lock,
@@ -123,8 +122,38 @@ def _get_config() -> DispatchConfig:
     """Load config fresh each call so new agents are picked up immediately."""
     try:
         return load_config()
-    except (ValidationError, yaml.YAMLError, OSError) as e:
+    except CONFIG_LOAD_ERRORS as e:
         raise ConfigLoadError(f"Config at {config_path()} could not be loaded: {e}") from e
+
+
+def _io_guard(
+    fn: Callable[..., Awaitable[str]],
+) -> Callable[..., Awaitable[str]]:
+    """Return the documented ``{"error": ...}`` envelope for a filesystem failure.
+
+    Reading a broken config is not the only way a tool fails on I/O: a full disk,
+    a read-only volume or an uncreatable jobs directory makes ``save_config`` and
+    ``JobStore`` raise, and that used to escape as a raw exception. Runner-level
+    I/O never reaches here — it is already turned into a ``DispatchResult``.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            return await fn(*args, **kwargs)
+        except OSError as e:
+            logger.warning("%s: I/O error: %s", fn.__name__, e)
+            return json.dumps(
+                {
+                    "error": f"{fn.__name__} failed on I/O: {e}",
+                    "hint": "Check free space and permissions on the config and jobs "
+                    "directories (~/.config/agent-dispatch, or AGENT_DISPATCH_CONFIG / "
+                    "AGENT_DISPATCH_JOBS_DIR).",
+                },
+                indent=2,
+            )
+
+    return wrapper
 
 
 def _config_guard(
@@ -153,7 +182,8 @@ def _config_guard(
                 indent=2,
             )
 
-    return wrapper
+    # The I/O arm is identical for every tool — reuse it instead of duplicating.
+    return _io_guard(wrapper)
 
 
 def _get_cache(config: DispatchConfig) -> DispatchCache | None:
@@ -1399,7 +1429,9 @@ async def add_agent(
         directory: Absolute path to the project directory.
         description: What this agent can do. Leave empty for auto-generation.
         timeout: Timeout in seconds (0 uses global default of 300).
-        max_budget_usd: Max cost in USD per dispatch (0 or omitted = no limit).
+        max_budget_usd: Max cost in USD per dispatch. 0 or omitted inherits
+            settings.default_max_budget_usd — that is "no limit" only when the
+            setting is unset too.
         permission_mode: Permission mode for the claude CLI
             (e.g. default, plan, bypassPermissions). Leave empty for default.
         allowed_tools: Comma-separated list of allowed tools
@@ -1419,7 +1451,13 @@ async def add_agent(
 
     from pathlib import Path
 
-    dir_path = Path(directory).expanduser().resolve()
+    try:
+        # expanduser raises RuntimeError for an unresolvable "~unknown-user",
+        # and resolve() can raise OSError — neither is a directory-missing error,
+        # and both used to escape the tool as a raw exception.
+        dir_path = Path(directory).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        return json.dumps({"error": f"Invalid directory {directory!r}: {e}"})
     if not dir_path.is_dir():
         return json.dumps({"error": f"Directory does not exist: {dir_path}"})
 
@@ -1533,8 +1571,9 @@ async def update_agent(
         name: Agent name to update.
         description: New description.
         timeout: New timeout in seconds (0 = don't change).
-        max_budget_usd: New max cost in USD per dispatch (0 = don't change;
-            pass a negative number to clear the limit).
+        max_budget_usd: New max cost in USD per dispatch (0 = don't change).
+            A negative number clears the *per-agent* cap, after which
+            settings.default_max_budget_usd applies (if set).
         model: Model override. Pass "none" to clear.
         permission_mode: Permission mode. Pass "none" to clear.
         allowed_tools: Comma-separated allowed tools. Pass "none" to clear.
@@ -1813,6 +1852,7 @@ async def dispatch_async(
 
 
 @mcp.tool()
+@_io_guard
 async def dispatch_status(
     job_id: str,
     ctx: Context | None = None,
@@ -1836,6 +1876,7 @@ async def dispatch_status(
 
 
 @mcp.tool()
+@_io_guard
 async def dispatch_wait(
     job_id: str,
     timeout_seconds: int = 60,
@@ -1876,6 +1917,7 @@ async def dispatch_wait(
 
 
 @mcp.tool()
+@_io_guard
 async def dispatch_cancel(
     job_id: str,
     ctx: Context | None = None,
@@ -1935,6 +1977,7 @@ async def dispatch_cancel(
 
 
 @mcp.tool()
+@_io_guard
 async def dispatch_jobs(
     status: str = "",
     limit: int = 50,
@@ -1991,6 +2034,7 @@ async def dispatch_jobs(
 
 
 @mcp.tool()
+@_io_guard
 async def fetch_result(
     ref: str,
     max_chars: int = 0,
@@ -2030,6 +2074,7 @@ async def fetch_result(
 
 
 @mcp.tool()
+@_io_guard
 async def dispatch_gc(
     max_age_days: float = 7,
     ctx: Context | None = None,

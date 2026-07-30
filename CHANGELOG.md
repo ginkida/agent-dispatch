@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-30
+
+Two holes in 0.12.0's own "tools always return a clean error" fix.
+
+### Fixed
+- **A non-UTF-8 `agents.yaml` no longer crashes every surface.** `UnicodeDecodeError`
+  is a `ValueError`, not an `OSError`, so a config saved as cp1251/UTF-16 slipped
+  past all three handlers added in 0.12.0 and raised a bare traceback out of every
+  MCP tool, `agent-dispatch list` — and `doctor`, the command you run *because*
+  the config is broken. The set of load errors is now declared once
+  (`config.CONFIG_LOAD_ERRORS`) and shared by all three, and `doctor` reports the
+  encoding (and an unreadable file) as a normal FAIL with a fix. The shared set
+  lives in `config.CONFIG_LOAD_ERRORS`; the CLI still branches per type because
+  each one deserves a different remediation line.
+- **An undecodable byte from the `claude` CLI no longer kills a paid-for
+  dispatch.** `text=True` decodes strictly, so one invalid byte on stdout raised
+  `UnicodeDecodeError` — a `ValueError`, caught by nothing in the runner — out of
+  `dispatch`, `dispatch_stream`, the MCP tools and `agent-dispatch test`. Both
+  spawn sites now decode with `errors="replace"`, so a mangled byte becomes
+  U+FFFD instead of discarding the run. (Present since the initial commit.)
+- **`dispatch` classifies spawn failures like `dispatch_stream` already did.**
+  A directory that passes `is_dir()` but cannot be entered — or that vanishes
+  between the check and the spawn — made `subprocess.run` raise straight through
+  the `except subprocess.TimeoutExpired`. It now returns `not_found` /
+  `permission` / `cli_error` like the streaming path.
+- **The six job tools got the I/O envelope too.** `dispatch_status`, `_wait`,
+  `_cancel`, `_jobs`, `fetch_result` and `dispatch_gc` never load config, so they
+  carried no guard — an unwritable or misconfigured jobs directory raised out of
+  them. The guard is now split (`_io_guard` / `_config_guard`) and both halves
+  are applied where each is needed.
+- **`add_agent` reports an unresolvable path** (`~unknown-user`) as an error
+  envelope instead of raising `RuntimeError`.
+- **A failed config *write* is reported, not raised.** The same contract had the
+  other half missing: a full disk or a read-only volume made `save_config`
+  raise OSError straight out of `add_agent`/`update_agent`/`remove_agent` and out
+  of the matching CLI commands. Both surfaces now report it — the CLI adds that
+  the previous config is intact, which the atomic write guarantees.
+
+### Changed
+- Docs corrected against the code: stale-job recovery now documents the
+  `pending` sweep and its 24h threshold; the config-lock guarantee is stated as
+  best-effort (it proceeds unlocked after 10s rather than freezing the server);
+  `add_agent(timeout=0)` documents that it stores the literal 300, not
+  `settings.default_timeout`.
+
 ## [0.12.0] - 2026-07-29
 
 Reliability pass over the streaming path, config durability, and the tool
@@ -546,7 +591,8 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/ginkida/agent-dispatch/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/ginkida/agent-dispatch/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ginkida/agent-dispatch/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ginkida/agent-dispatch/compare/v0.9.0...v0.10.0

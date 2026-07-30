@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from .models import DispatchConfig
 
@@ -148,6 +149,14 @@ def file_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         _release_lock(fd)
+
+
+# Everything load_config() can raise for a config a human can plausibly produce.
+# Listed once because three surfaces handle it independently (server._get_config,
+# cli._load_or_exit, cli.doctor) and they must not drift: UnicodeDecodeError, in
+# particular, is a ValueError — NOT an OSError — so a file saved in cp1251 or
+# UTF-16 used to escape every one of them as a raw traceback.
+CONFIG_LOAD_ERRORS = (ValidationError, yaml.YAMLError, UnicodeDecodeError, OSError)
 
 
 def load_config(path: Path | None = None) -> DispatchConfig:

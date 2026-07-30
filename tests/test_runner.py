@@ -1866,3 +1866,73 @@ class TestDispatchPayloadRobustness:
         assert cmd[2] == "--output-format"  # prompt untouched
         assert cmd[cmd.index("--output-format", 3) + 1] == "stream-json"
         assert result.success
+
+
+class TestUndecodableOutput:
+    """`text=True` decodes strictly: one bad byte used to raise UnicodeDecodeError
+    (a ValueError — caught by nothing) out of an already-billed dispatch."""
+
+    @staticmethod
+    def _cli(tmp_path: Path, body: str) -> Path:
+        script = tmp_path / "bad_cli.py"
+        script.write_text(body)
+        launcher = tmp_path / "bad_cli"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        launcher.chmod(0o755)
+        return launcher
+
+    def test_dispatch_survives_an_undecodable_byte(self, tmp_path: Path):
+        cli = self._cli(
+            tmp_path,
+            "import sys\n"
+            "sys.stdout.buffer.write(b'{\"result\":\"caf\\xe9 ok\",\"is_error\":false}')\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch("test", "hello", agent, Settings())
+        assert result.success
+        assert "ok" in result.result  # the bad byte became U+FFFD, nothing raised
+
+    def test_stream_survives_an_undecodable_byte(self, tmp_path: Path):
+        cli = self._cli(
+            tmp_path,
+            "import sys\n"
+            "sys.stdout.buffer.write(b'{\"type\":\"result\",\"is_error\":false,"
+            "\"result\":\"caf\\xe9 ok\"}\\n')\n",
+        )
+        agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
+        with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+            result = dispatch_stream("test", "hello", agent, Settings())
+        assert result.success
+        assert "ok" in result.result
+
+
+class TestSpawnFailureClassification:
+    """dispatch_stream classified spawn errors; dispatch let them escape raw."""
+
+    def setup_method(self):
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run", side_effect=FileNotFoundError("gone"))
+    def test_missing_cwd_at_spawn_is_not_found(self, _run, _which):
+        # is_dir() passing does not prove the child can chdir there, and the
+        # directory can vanish between the check and the spawn.
+        result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
+        assert not result.success
+        assert result.error_type == "not_found"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run", side_effect=PermissionError("denied"))
+    def test_unexecutable_cwd_is_permission(self, _run, _which):
+        result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
+        assert not result.success
+        assert result.error_type == "permission"
+        assert "Hint" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run", side_effect=OSError("too many open files"))
+    def test_other_oserror_is_cli_error(self, _run, _which):
+        result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"

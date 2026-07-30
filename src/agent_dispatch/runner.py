@@ -638,6 +638,13 @@ def dispatch(
                 cwd=str(agent.directory),
                 capture_output=True,
                 text=True,
+                # Decoding must be total. `text=True` alone decodes strictly, so
+                # a single undecodable byte on stdout/stderr raises
+                # UnicodeDecodeError — a ValueError, caught by nothing here — and
+                # an already-billed dispatch escapes as a raw exception instead
+                # of a DispatchResult. Same rule as _read_preview.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 env=env,
             )
@@ -649,6 +656,25 @@ def dispatch(
                 session_id=session_uuid,
                 error=_timeout_error(agent_name, timeout, session_uuid),
                 error_type="timeout",
+            )
+        # Spawn failures, classified exactly as dispatch_stream does — the
+        # is_dir() check above does not prove the child can chdir into it, and
+        # the directory can vanish between the check and the spawn.
+        except FileNotFoundError as e:
+            return DispatchResult(
+                agent=agent_name, success=False, result="", error=str(e), error_type="not_found"
+            )
+        except PermissionError as e:
+            return DispatchResult(
+                agent=agent_name,
+                success=False,
+                result="",
+                error=f"{e}{_permission_hint(agent_name)}",
+                error_type="permission",
+            )
+        except OSError as e:
+            return DispatchResult(
+                agent=agent_name, success=False, result="", error=str(e), error_type="cli_error"
             )
         # Self-heal on old claude CLIs that don't know --session-id: strip the
         # flag and retry once. Timed-out dispatches lose resumability, but
@@ -869,6 +895,8 @@ def dispatch_stream(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",  # see dispatch(): strict decoding raises mid-stream
             env=env,
             # Own process group, so the timeout can take the whole tree down
             # (see _kill_process_tree). Without it a backgrounded grandchild
