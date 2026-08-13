@@ -26,5 +26,12 @@ jobs:
           pip install build
           python -m build
 
+      # Keep this current with the build backend. The pinned action bundles its
+      # own twine, and twine rejects a Metadata-Version it does not know: the
+      # v0.13.0 publish failed because hatchling 1.32 emits `Metadata-Version:
+      # 2.5` while the previous pin (Feb 2026) shipped twine 6.1.0 / packaging
+      # 25.0. `python -m build` resolves the newest hatchling at build time, so
+      # this drifts on its own with no repo change — see the release checklist's
+      # `twine check` step, which catches it before a tag is cut.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

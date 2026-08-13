@@ -69,6 +69,7 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 
 - `mcp` is pinned **`>=1.2.0,<2`** deliberately: 2.0 removed `mcp.server.fastmcp`, which `server.py` imports, so an unbounded range gives every fresh install a dead `agent-dispatch serve`. Lifting the cap means porting to `mcp.server.mcpserver.MCPServer` — it is not a dependency bump.
 - Verify packaging in a **clean venv**, never the dev machine: build the wheel, install it fresh, import the server. A stale pin in local site-packages hides exactly the failure a new user hits first.
+- Run **`twine check dist/*`** before cutting the tag, with a *current* twine. The clean-venv check does not cover this: it proves the wheel installs, not that PyPI's uploader will accept its metadata. `python -m build` pulls the newest hatchling at build time, so the emitted `Metadata-Version` climbs on its own, and `pypa/gh-action-pypi-publish` is pinned to a SHA that bundles a fixed twine — v0.13.0's publish failed on exactly that mismatch (hatchling 1.32 → metadata 2.5; pinned twine 6.1.0 → "not a valid metadata version"). When it happens, bump the action pin rather than pinning the backend down.
 
 ## Deliberately not built
 
