@@ -1492,3 +1492,28 @@ class TestWriteFailureMessages:
             runner.invoke(cli, ["remove", "keep"])
         # The write is atomic, so the agent must still be there.
         assert "keep" in load_config(_isolated_config).agents
+
+
+class TestConfigWriteFailureIsAMessage:
+    """`_save_or_exit` caught only OSError, so an unrenderable value tracebacked."""
+
+    def test_update_reports_a_serialization_failure(self, tmp_path: Path):
+        import yaml
+
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "Original"])
+
+        def boom(*_a, **_kw):
+            raise yaml.representer.RepresenterError("cannot represent object")
+
+        with patch.object(yaml, "dump", side_effect=boom):
+            result = runner.invoke(cli, ["update", "proj", "-d", "New"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "could not serialize" in result.output
+        assert "previous config is intact" in result.output
+
+        # The original is still readable and unchanged.
+        listing = runner.invoke(cli, ["list"])
+        assert "Original" in listing.output

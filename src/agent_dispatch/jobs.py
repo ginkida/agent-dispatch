@@ -286,6 +286,17 @@ class JobStore:
     # real queue wait reaches instead of the running-job one.
     _PENDING_STALE_MULTIPLIER = 24
 
+    def _touched_after(self, job_id: str, cutoff: float) -> bool:
+        """True if the job file's mtime is newer than *cutoff* (someone is live).
+
+        Best-effort: an unreadable or vanished file reports False so recovery
+        falls back to the timestamp check rather than skipping silently.
+        """
+        try:
+            return self._path(job_id).stat().st_mtime > cutoff
+        except (OSError, ValueError):  # pragma: no cover - racing unlink
+            return False
+
     def recover_stale(self, stale_threshold_seconds: float = 3600) -> int:
         """Mark jobs abandoned in 'running' or 'pending' beyond the threshold as failed.
 
@@ -307,14 +318,35 @@ class JobStore:
         recovered = 0
         stale: list[tuple[Job, float, str]] = []
         with self._lock:
-            for job in self.list(status="running"):
-                age = now - (job.started_at or job.created_at)
-                if age > stale_threshold_seconds:
-                    stale.append((job, age, "running"))
-            for job in self.list(status="pending"):
-                age = now - job.created_at
-                if age > pending_threshold:
-                    stale.append((job, age, "pending"))
+            # ONE scan, not one per status. list() reads and json-parses every
+            # file in the directory (~85ms for 300 jobs), and this runs at the
+            # start of every `serve` process — of which there is one per open
+            # Claude Code session, routinely 14+.
+            for job in self.list():
+                if job.status == "running":
+                    age = now - (job.started_at or job.created_at)
+                    if age <= stale_threshold_seconds:
+                        continue
+                    # `started_at` alone does not prove abandonment: a dispatch
+                    # may legitimately run up to the 7200s timeout ceiling, so
+                    # any other server starting up would flip a live 2-hour job
+                    # to 'failed' — and finish() then refuses it, losing an
+                    # already-paid-for result. A live worker rewrites the file
+                    # at least once per progress interval, so a recently
+                    # *modified* file means someone is still on it. This can
+                    # only ever skip a recovery (a genuinely abandoned job is
+                    # picked up on a later start), never add one. Only 'running'
+                    # gets this check: nothing rewrites a pending job's file, so
+                    # there its mtime is just created_at by another name.
+                    if self._touched_after(job.id, now - stale_threshold_seconds):
+                        continue
+                elif job.status == "pending":
+                    age = now - job.created_at
+                    if age <= pending_threshold:
+                        continue
+                else:
+                    continue
+                stale.append((job, age, job.status))
             for job, age, state in stale:
                 # Count only jobs we actually transitioned (fail() returns
                 # None for a missing/malformed id, e.g. a planted file).

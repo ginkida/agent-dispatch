@@ -544,6 +544,7 @@ settings:
   #   - Edit
   max_dispatch_depth: 3     # recursion protection
   max_concurrency: 5        # max parallel claude -p processes (per dispatch path)
+  # job_retention_days: 30  # 0 (default) = never prune. See "Job retention" below.
   cache:
     enabled: true
     ttl: 300                # seconds
@@ -551,6 +552,30 @@ settings:
 ```
 
 Config is reloaded on every tool call — add agents without restarting.
+
+### Job retention
+
+Every `dispatch_async` **and** every `dispatch(..., return_ref=True)` writes a
+record to `~/.config/agent-dispatch/jobs/`, and nothing deletes it on its own —
+`dispatch_gc` has to be run by hand. The directory therefore grows without
+bound, and `dispatch_jobs` plus the stale-job recovery that runs at every server
+start read and parse *every* file in it.
+
+Set `job_retention_days` to prune terminal (done/failed/cancelled) records older
+than N days when a server starts:
+
+```yaml
+settings:
+  job_retention_days: 30
+```
+
+It defaults to `0` — **off** — because those records are your own history of
+past dispatches and deleting them cannot be undone. Pending and running jobs are
+never touched.
+
+`agent-dispatch gc --days N` and the `dispatch_gc` tool apply the same rule as a
+one-off. Both *delete* immediately and report the count; neither previews, so
+check what is there first with `agent-dispatch jobs`.
 
 ### Auto-Description
 

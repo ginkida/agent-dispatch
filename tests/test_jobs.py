@@ -19,6 +19,20 @@ def store(tmp_path: Path) -> JobStore:
     return JobStore(tmp_path / "jobs")
 
 
+def _abandon(store: JobStore, job_id: str, seconds_ago: float) -> None:
+    """Age a job file's mtime, as an abandoned job's really would be.
+
+    ``recover_stale`` treats a *running* job whose file was written recently as
+    still alive, because a live worker rewrites it on every progress flush.
+    Backdating only ``started_at`` in the model therefore describes a state
+    production never produces (a file written now that claims to have started
+    an hour ago) — tests must age the file too.
+    """
+    path = store.directory / f"{job_id}.json"
+    old = time.time() - seconds_ago
+    os.utime(path, (old, old))
+
+
 class TestJobStoreCreateGet:
     def test_create_persists_pending_job(self, store: JobStore):
         job = store.create("infra", "check pods")
@@ -378,12 +392,30 @@ class TestRecoverStale:
         updated = store.get(job.id)
         updated.started_at = time.time() - 7200
         store._write(updated)
+        _abandon(store, job.id, 7200)
 
         recovered = store.recover_stale(stale_threshold_seconds=3600)
         assert recovered == 1
         after = store.get(job.id)
         assert after.status == "failed"
         assert "Abandoned" in (after.error or "")
+
+    def test_long_running_job_with_a_live_worker_is_left_alone(self, store: JobStore):
+        """A dispatch may legitimately run past the threshold (timeouts go to 7200s).
+
+        Its worker keeps rewriting the job file with progress, so the file is
+        fresh even though started_at is old. Recovering it would mark a live,
+        already-billed dispatch 'failed' — and finish() then refuses the real
+        result. Only the *file's* age proves abandonment.
+        """
+        job = store.create("infra", "long build")
+        store.mark_running(job.id)
+        updated = store.get(job.id)
+        updated.started_at = time.time() - 7200
+        store._write(updated)  # rewritten now, as a progress flush would
+
+        assert store.recover_stale(stale_threshold_seconds=3600) == 0
+        assert store.get(job.id).status == "running"
 
     def test_leaves_recent_running_job(self, store: JobStore):
         job = store.create("infra", "task")
@@ -578,6 +610,7 @@ class TestRecoverStalePending:
         r = store.get(running.id)
         r.started_at = old
         store._write(r)
+        _abandon(store, running.id, 7200)
 
         assert store.recover_stale(3600) == 2
         assert store.get(pending.id).status == "failed"

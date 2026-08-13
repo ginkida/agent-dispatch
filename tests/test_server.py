@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -3100,3 +3101,252 @@ class TestAddAgentBadDirectory:
         # directory-missing error, and it used to escape the tool.
         data = json.loads(await server.add_agent("z", "~nonexistentuser12345/proj"))
         assert "Invalid directory" in data["error"]
+
+
+class TestNonAsciiIsNotEscaped:
+    """Tool responses must carry non-ASCII text raw, not as \\uXXXX escapes.
+
+    json.dumps defaults to ensure_ascii=True, which triples the byte size of
+    Cyrillic (and any other non-Latin) text and tokenizes far worse. The stdio
+    transport serializes the JSON-RPC envelope with pydantic's
+    model_dump_json, which emits raw UTF-8, so nothing downstream needs the
+    escaping — it was pure caller-context waste.
+    """
+
+    @pytest.mark.asyncio
+    async def test_list_agents_keeps_cyrillic_raw(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        cfg = DispatchConfig(
+            agents={"ru": AgentConfig(directory=proj, description="Диагностика приложения")}
+        )
+        with patch.object(server, "_get_config", return_value=cfg):
+            out = await server.list_agents(ctx=AsyncMock())
+        assert "Диагностика приложения" in out
+        assert "\\u0414" not in out
+        assert json.loads(out)[0]["description"] == "Диагностика приложения"
+
+    @pytest.mark.asyncio
+    async def test_group_listing_keeps_cyrillic_raw(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        cfg = DispatchConfig(
+            agents={"infra": AgentConfig(directory=proj)},
+            groups={
+                "news": DispatchGroup(
+                    description="Диагностика инцидента",
+                    shared_context="Стек basty",
+                    members=[GroupMember(agent="infra", use_for="логи сервисов")],
+                )
+            },
+        )
+        with patch.object(server, "_get_config", return_value=cfg):
+            listing = await server.list_groups(ctx=AsyncMock())
+            detail = await server.inspect_group("news", ctx=AsyncMock())
+        assert "Диагностика инцидента" in listing
+        assert "логи сервисов" in listing
+        assert "\\u" not in listing
+        assert "Стек basty" in detail
+        assert "\\u" not in detail
+
+    @pytest.mark.asyncio
+    async def test_error_envelopes_keep_cyrillic_raw(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        cfg = DispatchConfig(agents={})
+        with patch.object(server, "_get_config", return_value=cfg):
+            out = await server.dispatch("неизвестный", "task")
+        assert "неизвестный" in out
+        assert "\\u" not in out
+
+    @pytest.mark.asyncio
+    async def test_lone_surrogate_still_produces_an_encodable_response(self, tmp_path: Path):
+        """Dropping ensure_ascii must not make an unencodable payload crash the transport.
+
+        An agent that prints a literal \\udXXX escape in its JSON output is
+        ASCII on the wire, but _parse_structured_response's json.loads turns it
+        into a lone surrogate. That lands in parsed_result and is emitted here.
+        Unescaped, it raises UnicodeEncodeError inside the stdio TextIOWrapper —
+        after the tool returned, where no guard can turn it into an envelope.
+        """
+        surrogate = json.loads('"\\ud800"')
+        out = server._dumps({"parsed_result": surrogate, "note": "Диагностика"}, indent=2)
+        out.encode("utf-8")  # must not raise
+        assert json.loads(out)["parsed_result"] == surrogate
+
+    def test_plain_payloads_stay_unescaped(self):
+        """The fallback must only trigger for genuinely unencodable payloads."""
+        assert "Диагностика" in server._dumps({"a": "Диагностика"})
+        assert "\\u" not in server._dumps({"a": "Диагностика"})
+
+
+
+
+class TestStartupMaintenance:
+    """Job records used to accumulate forever: dispatch_gc was manual-only.
+
+    Every async dispatch AND every return_ref dispatch writes a job file, and
+    JobStore.list() — used by dispatch_jobs and by stale-job recovery on every
+    server start — parses all of them.
+    """
+
+    def _old_terminal_job(self, age_days: float):
+        store = server._get_job_store()
+        job = store.create("infra", "old task")
+        store.finish(job.id, DispatchResult(agent="infra", success=True, result="done"))
+        stale = store.get(job.id)
+        stale.completed_at = time.time() - age_days * 86400
+        store._write(stale)
+        return store, job
+
+    def test_purges_terminal_jobs_past_retention(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        store, job = self._old_terminal_job(age_days=40)
+        cfg = DispatchConfig(settings=Settings(job_retention_days=30))
+        with patch.object(server, "_get_config", return_value=cfg):
+            server._startup_maintenance()
+        assert store.get(job.id) is None
+
+    def test_keeps_jobs_inside_retention(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        store, job = self._old_terminal_job(age_days=5)
+        cfg = DispatchConfig(settings=Settings(job_retention_days=30))
+        with patch.object(server, "_get_config", return_value=cfg):
+            server._startup_maintenance()
+        assert store.get(job.id) is not None
+
+    def test_retention_zero_disables_the_sweep(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        store, job = self._old_terminal_job(age_days=400)
+        cfg = DispatchConfig(settings=Settings(job_retention_days=0))
+        with patch.object(server, "_get_config", return_value=cfg):
+            server._startup_maintenance()
+        assert store.get(job.id) is not None
+
+    def test_pending_and_running_jobs_are_never_purged(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        store = server._get_job_store()
+        pending = store.create("infra", "queued")
+        cfg = DispatchConfig(settings=Settings(job_retention_days=1))
+        with patch.object(server, "_get_config", return_value=cfg):
+            server._startup_maintenance()
+        assert store.get(pending.id) is not None
+
+    def test_sweep_is_off_by_default(self, tmp_path: Path, monkeypatch):
+        """Job records are the user's history — never delete without opt-in."""
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        assert Settings().job_retention_days == 0
+        store, job = self._old_terminal_job(age_days=400)
+        with patch.object(server, "_get_config", return_value=DispatchConfig()):
+            server._startup_maintenance()
+        assert store.get(job.id) is not None
+
+    def test_unreadable_config_never_deletes(self, tmp_path: Path, monkeypatch):
+        """An unreadable config must not be guessed into a retention policy."""
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        store, job = self._old_terminal_job(age_days=400)
+        with patch.object(server, "_get_config", side_effect=server.ConfigLoadError("broken")):
+            server._startup_maintenance()
+        assert store.get(job.id) is not None
+
+    def test_survives_an_unusable_jobs_directory(self, tmp_path: Path, monkeypatch):
+        """Startup must never be blocked by a jobs-directory problem."""
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "agents.yaml"))
+        with patch.object(server, "_get_job_store", side_effect=OSError("read-only fs")):
+            server._startup_maintenance()  # must not raise
+
+
+class TestSemaphoreOutlivesCancellation:
+    """max_concurrency must bound live subprocesses, not live coroutines.
+
+    Cancelling a coroutine does not stop the thread behind asyncio.to_thread,
+    so `async with sem:` handed the slot away while the claude subprocess was
+    still running and still being billed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_keeps_its_slot_until_the_worker_ends(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        release = threading.Event()
+        started = threading.Event()
+        calls: list[str] = []
+
+        def fake(name, task, agent_cfg, settings, context=None, session_id=None, **kw):
+            calls.append(task)
+            started.set()
+            release.wait(5)
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch", side_effect=fake),
+        ):
+            first = asyncio.ensure_future(server.dispatch("infra", "blocking"))
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            # The worker thread is still inside `fake`. The slot must still be
+            # taken, so a second dispatch cannot start a second subprocess.
+            second = asyncio.ensure_future(server.dispatch("infra", "queued"))
+            done, _pending = await asyncio.wait({second}, timeout=0.3)
+            assert not done, "second dispatch got the slot while the first worker was still live"
+            assert calls == ["blocking"]
+
+            release.set()
+            await asyncio.wait_for(second, timeout=5)
+            assert calls == ["blocking", "queued"]
+
+
+class TestConfigWriteFailureIsAnEnvelope:
+    """A config that cannot be *rendered* must not escape as a traceback.
+
+    `_get_config` wraps read-side YAML errors into ConfigLoadError, but
+    `save_config` -> `yaml.dump` raises RepresenterError (a yaml.YAMLError):
+    neither an OSError nor a ConfigLoadError, so it slipped past both arms of
+    the guard on add/update/remove_agent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_update_agent_returns_an_envelope(self, tmp_path: Path, monkeypatch):
+        import yaml
+
+        cfg = tmp_path / "agents.yaml"
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        assert json.loads(await server.add_agent("infra", str(proj), description="d"))["added"]
+
+        def boom(*_a, **_kw):
+            raise yaml.representer.RepresenterError("cannot represent object")
+
+        with patch.object(yaml, "dump", side_effect=boom):
+            out = await server.update_agent("infra", description="new")
+        data = json.loads(out)  # must be JSON, not a traceback
+        assert "could not write" in data["error"]
+        assert "previous config is intact" in data["hint"]
+
+    @pytest.mark.asyncio
+    async def test_the_previous_config_really_survives(self, tmp_path: Path, monkeypatch):
+        import yaml
+
+        cfg = tmp_path / "agents.yaml"
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(cfg))
+        await server.add_agent("infra", str(proj), description="original")
+
+        def boom(*_a, **_kw):
+            raise yaml.representer.RepresenterError("nope")
+
+        with patch.object(yaml, "dump", side_effect=boom):
+            await server.update_agent("infra", description="new")
+        # No half-written file, no lost agent, and no stray temp file.
+        from agent_dispatch.config import load_config
+
+        assert load_config(cfg).agents["infra"].description == "original"
+        assert list(tmp_path.glob("*.tmp")) == []

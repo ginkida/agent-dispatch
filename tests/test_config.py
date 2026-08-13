@@ -394,3 +394,59 @@ class TestLockDoesNotBlockForever:
         fd = _acquire_lock(tmp_path / "free.lock")
         assert fd is not None
         _release_lock(fd)
+
+
+class TestYamlLoaderChoice:
+    """agents.yaml is re-read on every single MCP tool call by design.
+
+    That parse is therefore on the hot path of all 21 tools and runs on the
+    event-loop thread. On a real 38 KB config the pure-Python SafeLoader takes
+    ~9.8 ms and libyaml's CSafeLoader ~0.6 ms.
+    """
+
+    def test_uses_the_c_loader_when_available(self):
+        import yaml
+
+        from agent_dispatch import config as config_module
+
+        if hasattr(yaml, "CSafeLoader"):
+            assert config_module._YamlLoader is yaml.CSafeLoader
+        else:  # pragma: no cover - PyYAML built without libyaml
+            assert config_module._YamlLoader is yaml.SafeLoader
+
+    def test_loader_is_a_safe_loader(self):
+        """Never a full loader: agents.yaml must not be able to construct objects."""
+        import yaml
+
+        from agent_dispatch import config as config_module
+
+        assert config_module._YamlLoader in (
+            getattr(yaml, "CSafeLoader", yaml.SafeLoader),
+            yaml.SafeLoader,
+        )
+
+    def test_rejects_python_object_tags(self, tmp_path):
+        """Proof the loader is safe: an arbitrary-object tag must not construct."""
+        import yaml
+
+        from agent_dispatch.config import load_config
+
+        p = tmp_path / "agents.yaml"
+        p.write_text("agents: !!python/object/apply:os.system ['echo pwned']\n", encoding="utf-8")
+        with pytest.raises(yaml.YAMLError):
+            load_config(p)
+
+    def test_roundtrips_non_ascii(self, tmp_path):
+        from agent_dispatch.config import load_config, save_config
+        from agent_dispatch.models import AgentConfig, DispatchConfig
+
+        p = tmp_path / "agents.yaml"
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        save_config(
+            DispatchConfig(
+                agents={"ru": AgentConfig(directory=proj, description="Диагностика приложения")}
+            ),
+            p,
+        )
+        assert load_config(p).agents["ru"].description == "Диагностика приложения"

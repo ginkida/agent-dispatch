@@ -100,6 +100,12 @@ settings:
   #   - Bash
   #   - Read
   #   - Edit
+  # job_retention_days: 30         # OFF by default (0). When > 0, terminal job records
+                                   # older than this are deleted at server start. Every
+                                   # async and every return_ref dispatch leaves a job
+                                   # file behind and nothing removes it otherwise, so
+                                   # the directory grows forever — but the records are
+                                   # your dispatch history, so pruning is opt-in.
   cache:
     enabled: true
     ttl: 300                       # seconds; identical (agent, task, context) requests are cached

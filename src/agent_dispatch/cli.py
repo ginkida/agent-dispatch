@@ -13,7 +13,14 @@ import click
 import yaml
 from pydantic import ValidationError
 
-from .config import auto_describe, config_lock, config_path, load_config, save_config
+from .config import (
+    CONFIG_SAVE_ERRORS,
+    auto_describe,
+    config_lock,
+    config_path,
+    load_config,
+    save_config,
+)
 from .jobs import JobStore, default_jobs_dir, is_valid_job_id
 from .models import (
     AgentConfig,
@@ -44,6 +51,18 @@ def _save_or_exit(config: DispatchConfig) -> None:
                 f"Error: could not write {config_path()}: {e}\n"
                 "Nothing was changed — the previous config is intact "
                 "(the write is atomic). Check free space and permissions.",
+                fg="red",
+            )
+        )
+        raise SystemExit(1) from None
+    except CONFIG_SAVE_ERRORS as e:
+        # A value YAML cannot represent — not an OSError, so the arm above never
+        # saw it and it escaped as a traceback. See config.CONFIG_SAVE_ERRORS.
+        click.echo(
+            click.style(
+                f"Error: could not serialize the config to YAML: {e}\n"
+                "Nothing was changed — the previous config is intact. "
+                "This is a bug: please report the field that failed.",
                 fg="red",
             )
         )

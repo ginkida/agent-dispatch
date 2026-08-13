@@ -22,6 +22,19 @@ try:  # pragma: no cover - platform dependent
 except ImportError:  # pragma: no cover - Windows has no fcntl
     fcntl = None  # type: ignore[assignment]
 
+# Parse with libyaml when PyYAML was built against it. Every MCP tool call
+# reloads agents.yaml from scratch (deliberately — that is how a new agent is
+# picked up without a restart), so this parse is on the hot path of all 21
+# tools. On a real 38 KB config the pure-Python SafeLoader takes ~9.8 ms and
+# CSafeLoader ~0.6 ms: a 16x saving repeated on every single call, and it runs
+# on the event-loop thread where it blocks every other tool. The fallback is
+# mandatory — a PyYAML installed from source without libyaml headers has no
+# C extension. Same semantics either way: both are the *safe* loader.
+try:  # pragma: no cover - depends on how PyYAML was built
+    from yaml import CSafeLoader as _YamlLoader
+except ImportError:  # pragma: no cover - pure-Python PyYAML
+    from yaml import SafeLoader as _YamlLoader  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "agent-dispatch"
@@ -158,13 +171,29 @@ def file_lock(path: Path) -> Iterator[None]:
 # UTF-16 used to escape every one of them as a raw traceback.
 CONFIG_LOAD_ERRORS = (ValidationError, yaml.YAMLError, UnicodeDecodeError, OSError)
 
+# The *write* half, and deliberately not a copy of the read half. `save_config`
+# can fail two ways with two different remediations: OSError (full disk,
+# read-only volume — handled separately, and the atomic rename means the old
+# file survives), or a rendering failure. `yaml.dump` raises RepresenterError —
+# a `yaml.YAMLError`, so neither an OSError nor a ValueError — for any value it
+# cannot represent. That is unreachable today because save_config only ever
+# feeds it `model_dump(mode="json")` output, i.e. JSON-native types. It becomes
+# reachable the moment a field lands whose JSON dump is not one of those, and it
+# would then escape *both* server guards and the CLI's `_save_or_exit` as a raw
+# traceback — the exact "an exception type escapes the handler meant to catch
+# it" class this codebase has been bitten by twice. Declared once, next to its
+# read-side twin, so the two surfaces that handle it cannot drift.
+CONFIG_SAVE_ERRORS = (yaml.YAMLError,)
+
 
 def load_config(path: Path | None = None) -> DispatchConfig:
     """Load config from YAML file. Returns empty config if file missing."""
     p = path or config_path()
     if not p.exists():
         return DispatchConfig()
-    raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+    # yaml.load with the safe loader == yaml.safe_load; _YamlLoader is the C
+    # one when available (see its definition for why this is worth doing).
+    raw = yaml.load(p.read_text(encoding="utf-8"), Loader=_YamlLoader)  # noqa: S506
     if raw is None:
         return DispatchConfig()
     return DispatchConfig.model_validate(raw)

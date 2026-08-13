@@ -20,6 +20,7 @@ from . import runner
 from .cache import DispatchCache
 from .config import (
     CONFIG_LOAD_ERRORS,
+    CONFIG_SAVE_ERRORS,
     auto_describe,
     collect_mcp_servers,
     config_lock,
@@ -143,7 +144,7 @@ def _io_guard(
             return await fn(*args, **kwargs)
         except OSError as e:
             logger.warning("%s: I/O error: %s", fn.__name__, e)
-            return json.dumps(
+            return _dumps(
                 {
                     "error": f"{fn.__name__} failed on I/O: {e}",
                     "hint": "Check free space and permissions on the config and jobs "
@@ -173,7 +174,7 @@ def _config_guard(
             return await fn(*args, **kwargs)
         except ConfigLoadError as e:
             logger.warning("%s: %s", fn.__name__, e)
-            return json.dumps(
+            return _dumps(
                 {
                     "error": str(e),
                     "hint": "Fix the YAML (or restore a backup), then retry. "
@@ -181,9 +182,59 @@ def _config_guard(
                 },
                 indent=2,
             )
+        except CONFIG_SAVE_ERRORS as e:
+            # Only the *write* path can get here: `_get_config` already wraps a
+            # read-side YAMLError into ConfigLoadError above. See
+            # config.CONFIG_SAVE_ERRORS for why this is not dead code.
+            logger.warning("%s: config could not be rendered: %s", fn.__name__, e)
+            return _dumps(
+                {
+                    "error": f"{fn.__name__} could not write {config_path()}: {e}",
+                    "hint": "Nothing was changed — the previous config is intact "
+                    "(the write is atomic). This is a bug: please report the "
+                    "field that could not be serialized.",
+                },
+                indent=2,
+            )
 
     # The I/O arm is identical for every tool — reuse it instead of duplicating.
     return _io_guard(wrapper)
+
+
+def _dumps(payload: Any, indent: int | None = None) -> str:
+    """Serialize a tool response. Same as ``json.dumps`` but never escapes non-ASCII.
+
+    ``json.dumps`` defaults to ``ensure_ascii=True``, which rewrites every
+    non-ASCII character as a ``\\uXXXX`` escape: 6 bytes for what UTF-8 stores
+    in 2, and a token sequence the model reads far worse than the character
+    itself. On a real config with Russian descriptions one ``list_groups()``
+    response carried **8520** such escapes and weighed 59 KB instead of 25 KB —
+    context the calling session pays for on every call.
+
+    Nothing is lost end to end: the stdio transport serializes the JSON-RPC
+    envelope with pydantic's ``model_dump_json``, which emits raw UTF-8, so the
+    unescaped text survives to the client. Pydantic is also why the dispatch
+    tools (which return ``model_dump_json``) never had this problem while every
+    ``json.dumps`` tool did — this makes the two agree.
+
+    The encodability probe is not optional. Escaping is what currently makes a
+    *lone surrogate* survivable: an agent that prints a literal ``\\udXXX``
+    escape in its JSON output gets turned into an unencodable ``str`` by
+    ``_parse_structured_response``'s ``json.loads`` (the subprocess-level
+    ``errors="replace"`` cannot help — the surrogate is manufactured from
+    perfectly ASCII input), and that value reaches here via ``parsed_result``.
+    Handing it to the stdio ``TextIOWrapper(encoding="utf-8")`` raises
+    ``UnicodeEncodeError`` *inside the transport, after the tool has already
+    returned* — breaking "a tool answers or returns {"error": ...}; it never
+    raises" at the one place no guard can catch it. Falling back to the escaped
+    form costs ~13 µs on the largest realistic payload and keeps that contract.
+    """
+    text = json.dumps(payload, indent=indent, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(payload, indent=indent)
+    return text
 
 
 def _get_cache(config: DispatchConfig) -> DispatchCache | None:
@@ -205,6 +256,34 @@ def _get_semaphore(config: DispatchConfig) -> asyncio.Semaphore:
         _semaphore = asyncio.Semaphore(limit)
         _semaphore_limit = limit
     return _semaphore
+
+
+async def _dispatch_guarded(
+    config: DispatchConfig,
+    *args: Any,
+    **kwargs: Any,
+) -> DispatchResult:
+    """Run ``runner.dispatch`` in a worker thread, holding the slot until it *ends*.
+
+    ``async with sem:`` releases when the **coroutine** unwinds — but cancelling
+    a coroutine does not stop the thread behind ``asyncio.to_thread``. So when a
+    client cancels a tool call (an interrupted turn, a closed session), the
+    ``claude`` subprocess keeps running and keeps costing money while its
+    ``max_concurrency`` slot is already handed to someone else. The cap then
+    stops bounding live processes: N cancellations mean up to N extra concurrent
+    subprocesses, and each abandoned worker also keeps a thread out of the
+    default executor (``min(32, cpu_count + 4)``) for the rest of its timeout —
+    up to 7200s — which ``to_thread`` needs for every other dispatch.
+
+    Shielding the future and releasing from its done-callback keeps the slot
+    tied to the subprocess's real lifetime. Cancellation still propagates to the
+    caller immediately; only the accounting is honest.
+    """
+    sem = _get_semaphore(config)
+    await sem.acquire()
+    future = asyncio.ensure_future(asyncio.to_thread(runner.dispatch, *args, **kwargs))
+    future.add_done_callback(lambda _f: sem.release())
+    return await asyncio.shield(future)
 
 
 def _apply_timeout(agent_config: AgentConfig, timeout_seconds: int) -> AgentConfig:
@@ -275,7 +354,7 @@ def _validate_timeout(timeout: int) -> str | None:
     nonsensical "timed out after -5s" until someone edits the YAML by hand.
     """
     if timeout and timeout < 1:
-        return json.dumps(
+        return _dumps(
             {
                 "error": f"timeout must be a positive number of seconds (got {timeout}); pass 0 to "
                 "keep the agent's current value."
@@ -292,7 +371,7 @@ def _validate_budget(max_budget_usd: float) -> str | None:
     ``--max-budget-usd -1``, a token the claude CLI parses as another flag.
     """
     if max_budget_usd < 0:
-        return json.dumps(
+        return _dumps(
             {"error": f"max_budget_usd must be >= 0 (got {max_budget_usd}); 0 means no limit."}
         )
     return None
@@ -315,7 +394,7 @@ def _validate_agent(config: DispatchConfig, name: str) -> str | None:
     """Return an error JSON string if the agent doesn't exist, else None."""
     if name not in config.agents:
         available = ", ".join(config.agents.keys()) or "(none configured)"
-        return json.dumps({"error": f"Unknown agent: {name!r}. Available: {available}"})
+        return _dumps({"error": f"Unknown agent: {name!r}. Available: {available}"})
     return None
 
 
@@ -323,7 +402,7 @@ def _validate_group(config: DispatchConfig, name: str) -> str | None:
     """Return an error JSON string if the group doesn't exist, else None."""
     if name not in config.groups:
         available = ", ".join(config.groups.keys()) or "(none configured)"
-        return json.dumps({"error": f"Unknown group: {name!r}. Available: {available}"})
+        return _dumps({"error": f"Unknown group: {name!r}. Available: {available}"})
     return None
 
 
@@ -341,13 +420,13 @@ def _validate_group_member(config: DispatchConfig, group: str, agent: str) -> st
     members = [m.agent for m in config.groups[group].members]
     if agent not in members:
         if not members:
-            return json.dumps(
+            return _dumps(
                 {
                     "error": f"Group {group!r} has no members yet. Add some with "
                     "'agent-dispatch group add' or by editing agents.yaml."
                 }
             )
-        return json.dumps(
+        return _dumps(
             {
                 "error": f"Agent {agent!r} is not a member of group {group!r}. "
                 f"Members: {', '.join(members)}"
@@ -385,9 +464,7 @@ def _validate_ref(ref: str) -> str | None:
     reach the JobStore.
     """
     if not is_valid_job_id(ref):
-        return json.dumps(
-            {"error": f"Invalid ref/job_id format: {ref!r} (expected a 32-char hex id)"}
-        )
+        return _dumps({"error": f"Invalid ref/job_id format: {ref!r} (expected a 32-char hex id)"})
     return None
 
 
@@ -428,7 +505,7 @@ async def list_agents(ctx: Context | None = None) -> str:
     """
     config = _get_config()
     if not config.agents:
-        return json.dumps(
+        return _dumps(
             {"error": "No agents configured. Run: agent-dispatch add <name> <directory>"},
             indent=2,
         )
@@ -487,7 +564,7 @@ async def list_agents(ctx: Context | None = None) -> str:
         agents.append(entry)
     if ctx:
         await ctx.info(f"Found {len(agents)} configured agents")
-    return json.dumps(agents, indent=2)
+    return _dumps(agents, indent=2)
 
 
 def _read_preview(path, max_lines: int, max_chars: int) -> tuple[str, bool]:
@@ -560,11 +637,11 @@ async def inspect_agent(
         healthy = agent.directory.is_dir()
     except OSError:
         info["healthy"] = "UNREADABLE"
-        return json.dumps(info, indent=2)
+        return _dumps(info, indent=2)
 
     info["healthy"] = healthy
     if not healthy:
-        return json.dumps(info, indent=2)
+        return _dumps(info, indent=2)
 
     try:
         info["mcp_servers"] = collect_mcp_servers(agent.directory)
@@ -594,7 +671,7 @@ async def inspect_agent(
     if ctx:
         await ctx.info(f"Inspected {name} ({agent.directory})")
 
-    return json.dumps(info, indent=2)
+    return _dumps(info, indent=2)
 
 
 @mcp.tool()
@@ -612,7 +689,7 @@ async def list_groups(ctx: Context | None = None) -> str:
     """
     config = _get_config()
     if not config.groups:
-        return json.dumps(
+        return _dumps(
             {"error": "No groups configured. Create one: agent-dispatch group add <name>"},
             indent=2,
         )
@@ -646,7 +723,7 @@ async def list_groups(ctx: Context | None = None) -> str:
         )
     if ctx:
         await ctx.info(f"Found {len(groups)} configured groups")
-    return json.dumps(groups, indent=2)
+    return _dumps(groups, indent=2)
 
 
 @mcp.tool()
@@ -697,7 +774,7 @@ async def inspect_group(name: str, ctx: Context | None = None) -> str:
     }
     if ctx:
         await ctx.info(f"Inspected group {name} ({len(members)} members)")
-    return json.dumps(info, indent=2)
+    return _dumps(info, indent=2)
 
 
 @mcp.tool()
@@ -790,27 +867,26 @@ async def dispatch(
                 )
                 payload = _ref_payload(job.id, cached, summary_chars)
                 payload["cached"] = True
-                return json.dumps(payload, indent=2)
+                return _dumps(payload, indent=2)
             cached_dict = json.loads(cached.model_dump_json(indent=2, exclude_none=True))
             cached_dict["cached"] = True
-            return json.dumps(cached_dict, indent=2)
+            return _dumps(cached_dict, indent=2)
 
     agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     if ctx:
         await ctx.info(f"Dispatching to {agent}: {task[:80]}...")
 
-    async with _get_semaphore(config):
-        result = await asyncio.to_thread(
-            runner.dispatch,
-            agent,
-            task,
-            agent_config,
-            config.settings,
-            effective_context,
-            caller=caller or None,
-            goal=goal or None,
-            response_format=rf,
-        )
+    result = await _dispatch_guarded(
+        config,
+        agent,
+        task,
+        agent_config,
+        config.settings,
+        effective_context,
+        caller=caller or None,
+        goal=goal or None,
+        response_format=rf,
+    )
 
     # Populate cache
     if cache:
@@ -834,7 +910,7 @@ async def dispatch(
             caller=caller or None,
             goal=goal or None,
         )
-        return json.dumps(_ref_payload(job.id, result, summary_chars), indent=2)
+        return _dumps(_ref_payload(job.id, result, summary_chars), indent=2)
 
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -883,19 +959,18 @@ async def dispatch_session(
         turn = "new session" if not session_id else f"resuming {session_id[:12]}..."
         await ctx.info(f"Dispatching to {agent} ({turn}): {task[:80]}...")
 
-    async with _get_semaphore(config):
-        result = await asyncio.to_thread(
-            runner.dispatch,
-            agent,
-            task,
-            agent_config,
-            config.settings,
-            context or None,
-            session_id or None,
-            caller=caller or None,
-            goal=goal or None,
-            response_format=response_format or None,
-        )
+    result = await _dispatch_guarded(
+        config,
+        agent,
+        task,
+        agent_config,
+        config.settings,
+        context or None,
+        session_id or None,
+        caller=caller or None,
+        goal=goal or None,
+        response_format=response_format or None,
+    )
     return result.model_dump_json(indent=2, exclude_none=True)
 
 
@@ -928,10 +1003,10 @@ async def dispatch_parallel(
     try:
         items = json.loads(dispatches)
     except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in dispatches: {e}"})
+        return _dumps({"error": f"Invalid JSON in dispatches: {e}"})
 
     if not isinstance(items, list) or not items:
-        return json.dumps({"error": "dispatches must be a non-empty JSON array"})
+        return _dumps({"error": "dispatches must be a non-empty JSON array"})
 
     config = _get_config()
 
@@ -939,7 +1014,7 @@ async def dispatch_parallel(
     # caller could submit thousands of items and pile up coroutines/processes.
     max_items = max(100, config.settings.max_concurrency * 20)
     if len(items) > max_items:
-        return json.dumps(
+        return _dumps(
             {
                 "error": f"Too many dispatches: {len(items)} > {max_items}. "
                 "Split into multiple calls or raise settings.max_concurrency.",
@@ -951,16 +1026,16 @@ async def dispatch_parallel(
     # Validate structure and agents up front (including aggregator)
     for i, item in enumerate(items):
         if not isinstance(item, dict):
-            return json.dumps(
+            return _dumps(
                 {"error": f"dispatches[{i}] must be an object, got {type(item).__name__}"}
             )
         if "agent" not in item or "task" not in item:
-            return json.dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
+            return _dumps({"error": f"dispatches[{i}] must have 'agent' and 'task' keys"})
         # Type-check before _validate_agent: an unhashable value (list/dict)
         # would raise TypeError out of the `in` test, breaking the "tools always
         # return a JSON string" contract.
         if not isinstance(item["agent"], str) or not isinstance(item["task"], str):
-            return json.dumps({"error": f"dispatches[{i}].agent and .task must be strings"})
+            return _dumps({"error": f"dispatches[{i}].agent and .task must be strings"})
         if err := _validate_agent(config, item["agent"]):
             return err
         # Group membership is validated up front too — keeps the documented
@@ -978,7 +1053,7 @@ async def dispatch_parallel(
                 try:
                     int(item[field])
                 except (TypeError, ValueError):
-                    return json.dumps(
+                    return _dumps(
                         {
                             "error": f"dispatches[{i}].{field} must be a number, "
                             f"got {item[field]!r}",
@@ -1041,18 +1116,17 @@ async def dispatch_parallel(
                 return d
 
         agent_config = _apply_timeout(config.agents[name], item_timeout)
-        async with _get_semaphore(config):
-            result = await asyncio.to_thread(
-                runner.dispatch,
-                name,
-                task,
-                agent_config,
-                config.settings,
-                effective_context,
-                caller=item_caller,
-                goal=item_goal,
-                response_format=item_rf,
-            )
+        result = await _dispatch_guarded(
+            config,
+            name,
+            task,
+            agent_config,
+            config.settings,
+            effective_context,
+            caller=item_caller,
+            goal=item_goal,
+            response_format=item_rf,
+        )
 
         if cache:
             cache.put(
@@ -1098,7 +1172,7 @@ async def dispatch_parallel(
 
     # ---- Aggregation ----
     if not aggregate:
-        return json.dumps(output, indent=2)
+        return _dumps(output, indent=2)
 
     # Build a summary for the aggregator agent
     parts = []
@@ -1122,19 +1196,18 @@ async def dispatch_parallel(
         "findings, note any conflicts between agents, and provide actionable conclusions."
     )
     agg_config = config.agents[aggregate]
-    async with _get_semaphore(config):
-        agg_result = await asyncio.to_thread(
-            runner.dispatch,
-            aggregate,
-            agg_task,
-            agg_config,
-            config.settings,
-            summary,
-            caller="dispatch_parallel",
-            goal="aggregate parallel dispatch results",
-        )
+    agg_result = await _dispatch_guarded(
+        config,
+        aggregate,
+        agg_task,
+        agg_config,
+        config.settings,
+        summary,
+        caller="dispatch_parallel",
+        goal="aggregate parallel dispatch results",
+    )
 
-    return json.dumps(
+    return _dumps(
         {
             "individual_results": output,
             "aggregated": json.loads(agg_result.model_dump_json(exclude_none=True)),
@@ -1299,17 +1372,16 @@ async def dispatch_dialogue(
             )
 
         resp_config = config.agents[responder]
-        async with _get_semaphore(config):
-            resp_result = await asyncio.to_thread(
-                runner.dispatch,
-                responder,
-                resp_task,
-                resp_config,
-                config.settings,
-                session_id=session_responder,
-                caller=requester,
-                goal=topic[:200],
-            )
+        resp_result = await _dispatch_guarded(
+            config,
+            responder,
+            resp_task,
+            resp_config,
+            config.settings,
+            session_id=session_responder,
+            caller=requester,
+            goal=topic[:200],
+        )
         session_responder = resp_result.session_id
         total_cost += resp_result.cost_usd or 0
         total_duration += resp_result.duration_ms or 0
@@ -1344,17 +1416,16 @@ async def dispatch_dialogue(
         )
 
         req_config = config.agents[requester]
-        async with _get_semaphore(config):
-            req_result = await asyncio.to_thread(
-                runner.dispatch,
-                requester,
-                req_task,
-                req_config,
-                config.settings,
-                session_id=session_requester,
-                caller=responder,
-                goal=topic[:200],
-            )
+        req_result = await _dispatch_guarded(
+            config,
+            requester,
+            req_task,
+            req_config,
+            config.settings,
+            session_id=session_requester,
+            caller=responder,
+            goal=topic[:200],
+        )
         session_requester = req_result.session_id
         total_cost += req_result.cost_usd or 0
         total_duration += req_result.duration_ms or 0
@@ -1384,7 +1455,7 @@ async def dispatch_dialogue(
     if not final_answer and conversation:
         final_answer = conversation[-1]["message"]
 
-    return json.dumps(
+    return _dumps(
         {
             "resolved": resolved,
             "rounds": conversation[-1]["round"] if conversation else 0,
@@ -1447,7 +1518,7 @@ async def add_agent(
     try:
         validate_agent_name(name)
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return _dumps({"error": str(e)})
 
     from pathlib import Path
 
@@ -1457,9 +1528,9 @@ async def add_agent(
         # and both used to escape the tool as a raw exception.
         dir_path = Path(directory).expanduser().resolve()
     except (OSError, RuntimeError, ValueError) as e:
-        return json.dumps({"error": f"Invalid directory {directory!r}: {e}"})
+        return _dumps({"error": f"Invalid directory {directory!r}: {e}"})
     if not dir_path.is_dir():
-        return json.dumps({"error": f"Directory does not exist: {dir_path}"})
+        return _dumps({"error": f"Directory does not exist: {dir_path}"})
 
     if err := _validate_timeout(timeout):
         return err
@@ -1481,7 +1552,7 @@ async def add_agent(
     with config_lock():
         config = _get_config()
         if name in config.agents:
-            return json.dumps({"error": f"Agent '{name}' already exists. Remove it first."})
+            return _dumps({"error": f"Agent '{name}' already exists. Remove it first."})
 
         config.agents[name] = AgentConfig(
             directory=dir_path,
@@ -1516,7 +1587,7 @@ async def add_agent(
     if parsed_risky_capabilities:
         result["risky_capabilities"] = parsed_risky_capabilities
 
-    return json.dumps(result, indent=2)
+    return _dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -1534,7 +1605,7 @@ async def remove_agent(
         config = _get_config()
         if name not in config.agents:
             available = ", ".join(config.agents.keys()) or "(none)"
-            return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+            return _dumps({"error": f"Agent '{name}' not found. Available: {available}"})
 
         del config.agents[name]
         save_config(config)
@@ -1543,7 +1614,7 @@ async def remove_agent(
     if ctx:
         await ctx.info(f"Removed agent '{name}'")
 
-    return json.dumps({"removed": name})
+    return _dumps({"removed": name})
 
 
 @mcp.tool()
@@ -1589,7 +1660,7 @@ async def update_agent(
         config = _get_config()
         if name not in config.agents:
             available = ", ".join(config.agents.keys()) or "(none)"
-            return json.dumps({"error": f"Agent '{name}' not found. Available: {available}"})
+            return _dumps({"error": f"Agent '{name}' not found. Available: {available}"})
 
         agent = config.agents[name]
         # No await inside the lock. Every tool coroutine runs on the same
@@ -1612,7 +1683,7 @@ async def update_agent(
         )
 
         if not updated:
-            return json.dumps({"error": "Nothing to update. Pass at least one non-empty field."})
+            return _dumps({"error": "Nothing to update. Pass at least one non-empty field."})
 
         save_config(config)
     _invalidate_agent_cache(config, name)
@@ -1622,7 +1693,7 @@ async def update_agent(
             await ctx.info(f"Warning: {warning}")
         await ctx.info(f"Updated agent '{name}': {', '.join(updated)}")
 
-    return json.dumps({"updated": name, "fields": updated}, indent=2)
+    return _dumps({"updated": name, "fields": updated}, indent=2)
 
 
 def _apply_agent_updates(
@@ -1845,7 +1916,7 @@ async def dispatch_async(
     if ctx:
         await ctx.info(f"Started async dispatch {job.id} to {agent}")
 
-    return json.dumps(
+    return _dumps(
         {"job_id": job.id, "status": "pending", "agent": agent},
         indent=2,
     )
@@ -1871,7 +1942,7 @@ async def dispatch_status(
     store = _get_job_store()
     job = store.get(job_id)
     if job is None:
-        return json.dumps({"error": f"Job not found: {job_id}"})
+        return _dumps({"error": f"Job not found: {job_id}"})
     return job.model_dump_json(indent=2, exclude_none=True)
 
 
@@ -1901,7 +1972,7 @@ async def dispatch_wait(
     while True:
         job = store.get(job_id)
         if job is None:
-            return json.dumps({"error": f"Job not found: {job_id}"})
+            return _dumps({"error": f"Job not found: {job_id}"})
         if job.is_terminal():
             return job.model_dump_json(indent=2, exclude_none=True)
         if time.monotonic() >= deadline:
@@ -1912,7 +1983,7 @@ async def dispatch_wait(
                     f"dispatch_wait timed out for {job_id} after {timeout}s "
                     f"(job still {job.status})"
                 )
-            return json.dumps(d, indent=2)
+            return _dumps(d, indent=2)
         await asyncio.sleep(0.25)
 
 
@@ -1959,7 +2030,7 @@ async def dispatch_cancel(
                 except OSError as e:  # already gone — job stays cancelled
                     logger.debug("Kill of job %s subprocess failed: %s", job_id, e)
     if outcome == "not_found":
-        return json.dumps({"error": f"Job not found: {job_id}"})
+        return _dumps({"error": f"Job not found: {job_id}"})
     if ctx:
         await ctx.info(f"Cancel {job_id}: {outcome}")
     payload: dict = {"job_id": job_id, "outcome": outcome}
@@ -1973,7 +2044,7 @@ async def dispatch_cancel(
             "its subprocess cannot be killed safely. Poll dispatch_status "
             "until it finishes."
         )
-    return json.dumps(payload, indent=2)
+    return _dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -1998,7 +2069,7 @@ async def dispatch_jobs(
     valid_statuses = {"pending", "running", "done", "failed", "cancelled"}
     filt = status.strip().lower() or None
     if filt and filt not in valid_statuses:
-        return json.dumps(
+        return _dumps(
             {
                 "error": f"Invalid status: {status!r}. "
                 f"Use one of: {', '.join(sorted(valid_statuses))} or empty.",
@@ -2030,7 +2101,7 @@ async def dispatch_jobs(
                 j.result.error_type if j.result and j.result.error_type else "cli_error"
             )
         summaries.append(entry)
-    return json.dumps(summaries, indent=2)
+    return _dumps(summaries, indent=2)
 
 
 @mcp.tool()
@@ -2056,7 +2127,7 @@ async def fetch_result(
     store = _get_job_store()
     job = store.get(ref)
     if job is None:
-        return json.dumps({"error": f"Ref not found: {ref}"})
+        return _dumps({"error": f"Ref not found: {ref}"})
     if job.result is None:
         # Not yet completed (e.g. async job still running) or failed before
         # producing a DispatchResult. Return the job record so the caller
@@ -2070,7 +2141,7 @@ async def fetch_result(
         payload["result"] = text[:cap]
         payload["truncated"] = True
         payload["full_size"] = len(text)
-    return json.dumps(payload, indent=2)
+    return _dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -2087,15 +2158,15 @@ async def dispatch_gc(
         max_age_days: Age threshold in days (default 7).
     """
     if max_age_days <= 0:
-        return json.dumps({"error": "max_age_days must be > 0"})
+        return _dumps({"error": "max_age_days must be > 0"})
     max_age_seconds = float(max_age_days) * 86400
     if not math.isfinite(max_age_seconds):
-        return json.dumps({"error": "max_age_days is too large (non-finite)"})
+        return _dumps({"error": "max_age_days is too large (non-finite)"})
     store = _get_job_store()
     purged = store.gc(max_age_seconds=max_age_seconds)
     if ctx:
         await ctx.info(f"Purged {purged} terminal jobs older than {max_age_days}d")
-    return json.dumps({"purged": purged, "max_age_days": max_age_days})
+    return _dumps({"purged": purged, "max_age_days": max_age_days})
 
 
 # ---------------------------------------------------------------------------
@@ -2110,9 +2181,9 @@ async def cache_stats(ctx: Context | None = None) -> str:
     config = _get_config()
     cache = _get_cache(config)
     if cache is None:
-        return json.dumps({"enabled": False, "message": "Cache is disabled in settings"})
+        return _dumps({"enabled": False, "message": "Cache is disabled in settings"})
     cache.evict_expired()
-    return json.dumps(cache.stats(), indent=2)
+    return _dumps(cache.stats(), indent=2)
 
 
 @mcp.tool()
@@ -2122,11 +2193,56 @@ async def cache_clear(ctx: Context | None = None) -> str:
     config = _get_config()
     cache = _get_cache(config)
     if cache is None:
-        return json.dumps({"enabled": False, "message": "Cache is disabled in settings"})
+        return _dumps({"enabled": False, "message": "Cache is disabled in settings"})
     count = cache.clear()
     if ctx:
         await ctx.info(f"Cleared {count} cached entries")
-    return json.dumps({"cleared": count})
+    return _dumps({"cleared": count})
+
+
+def _startup_maintenance() -> None:
+    """Prune and repair the shared jobs directory before serving.
+
+    Runs before ``mcp.run`` — never on the event loop — and is entirely
+    best-effort: a broken config or an unreadable jobs directory must not stop
+    the server from starting.
+
+    Retention first, recovery second: the sweep shrinks the set that
+    ``recover_stale`` then has to parse.
+    """
+    try:
+        store = _get_job_store()
+    except OSError as e:
+        logger.warning("Jobs directory unavailable, skipping maintenance: %s", e)
+        return
+
+    try:
+        retention_days = _get_config().settings.job_retention_days
+    except ConfigLoadError:
+        # Deleting job records is irreversible, so an unreadable config means
+        # "do nothing" — never guess at a retention the user never set.
+        retention_days = 0
+    if retention_days > 0:
+        try:
+            deleted = store.gc(retention_days * 86400)
+            if deleted:
+                logger.info(
+                    "Purged %d job record(s) older than %d days "
+                    "(settings.job_retention_days; set 0 to disable)",
+                    deleted,
+                    retention_days,
+                )
+        except OSError as e:
+            logger.warning("Job retention sweep skipped: %s", e)
+
+    # Recover jobs abandoned in 'running'/'pending' by a previous crashed or
+    # killed server so callers don't poll them forever.
+    try:
+        recovered = store.recover_stale(_STALE_RUNNING_SECONDS)
+        if recovered:
+            logger.info("Recovered %d stale job(s) from a prior run", recovered)
+    except OSError as e:
+        logger.warning("Stale-job recovery skipped: %s", e)
 
 
 def main() -> None:
@@ -2136,12 +2252,5 @@ def main() -> None:
         stream=sys.stderr,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    # Recover jobs abandoned in 'running' by a previous crashed/killed server
-    # so callers don't poll them forever.
-    try:
-        recovered = _get_job_store().recover_stale(_STALE_RUNNING_SECONDS)
-        if recovered:
-            logger.info("Recovered %d stale 'running' job(s) from a prior run", recovered)
-    except OSError as e:
-        logger.warning("Stale-job recovery skipped: %s", e)
+    _startup_maintenance()
     mcp.run(transport="stdio")

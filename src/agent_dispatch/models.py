@@ -97,6 +97,16 @@ class Settings(BaseModel):
     max_dispatch_depth: int = Field(default=3, ge=1)
     max_concurrency: int = Field(default=5, ge=1)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    # Opt-in retention sweep: when > 0, terminal jobs older than this many days
+    # are deleted at server start. Every async dispatch AND every return_ref
+    # dispatch writes a job file that nothing removes on its own — dispatch_gc
+    # has to be called by hand — so the directory only ever grows, and
+    # JobStore.list() (dispatch_jobs, stale-job recovery) parses every file in
+    # it. Defaults to 0 (**off**) on purpose: job records are the user's own
+    # history of past dispatches, and deleting them is not reversible, so it
+    # must be an explicit choice rather than something a version bump starts
+    # doing to an existing install.
+    job_retention_days: int = Field(default=0, ge=0)
 
 
 def validate_agent_name(name: str) -> str:

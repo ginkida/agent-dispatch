@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-13
+
+An efficiency round, measured against a real 38 KB config (4 agents, 6 groups),
+a 294-record jobs directory and 14 concurrently running servers — not against
+synthetic fixtures. Findings came from a five-axis audit (caller context,
+latency/IO, spend, CPU, concurrency) whose every claim was re-measured
+adversarially before implementation; most were confirmed as real but too small
+to matter next to a 10–120 s subprocess and were deliberately left alone.
+
+### Changed
+- **Tool responses no longer escape non-ASCII, cutting discovery payloads
+  roughly in half.** `json.dumps` defaults to `ensure_ascii=True`, so every
+  Cyrillic character left as a `\uXXXX` escape — 6 bytes for what UTF-8 stores
+  in 2, and a far worse token sequence. One `list_groups()` carried **8520**
+  such escapes: 59 KB where 25 KB was enough. Measured over a full discovery
+  pass (`list_agents` + `list_groups` + `inspect_group` + `inspect_agent`):
+  104 KB → 51 KB, about **13 000 tokens saved per pass**, on every call, in
+  every session. Nothing is lost: the stdio transport serializes the JSON-RPC
+  envelope with pydantic's `model_dump_json`, which already emits raw UTF-8 —
+  which is also why the `dispatch` family never had this problem while every
+  `json.dumps` tool did. All 57 call sites now go through one `_dumps` helper
+  so the two agree. `_dumps` probes encodability and falls back to the escaped
+  form for the one payload that needs it — a **lone surrogate**, which an agent
+  produces by printing a literal `\udXXX` escape in its JSON output (`json.loads`
+  manufactures it from perfectly ASCII input, so the subprocess-level
+  `errors="replace"` cannot help). Unescaped it would raise `UnicodeEncodeError`
+  inside the stdio transport *after* the tool returned — past every guard.
+  The saving is proportional to how much non-ASCII your config and results
+  carry: on an all-ASCII setup it is exactly zero.
+- **`agents.yaml` parses ~13x faster.** The config is re-read on every single
+  tool call (deliberately — that is how a new agent is picked up without a
+  restart), so the parse sits on the hot path of all 21 tools *and* runs on the
+  event-loop thread, where it blocks every other tool. Switching to libyaml's
+  `CSafeLoader` takes the real config from **9.80 ms to 0.76 ms** per call.
+  Falls back to the pure-Python safe loader when PyYAML was built without
+  libyaml; both are the *safe* loader, so a config still cannot construct
+  arbitrary objects.
+
+### Added
+- **`settings.job_retention_days`** — when > 0, terminal job records older than
+  N days are deleted at server start. Every async dispatch and every
+  `return_ref` dispatch leaves a job file that nothing removed on its own, so
+  the directory grew forever while `dispatch_jobs` and stale-job recovery
+  parsed every file in it. **Defaults to `0` (off)**: those records are the
+  user's own dispatch history and deleting them is irreversible, so it is an
+  explicit opt-in rather than something a version bump starts doing to an
+  existing install. An unreadable config is treated as `0`, never guessed.
+
+### Fixed
+- **`max_concurrency` bounds live subprocesses again, not live coroutines.**
+  `async with sem:` released the slot when the *coroutine* unwound, but
+  cancelling a coroutine does not stop the thread behind `asyncio.to_thread` —
+  so an interrupted turn or a closed session handed the slot to the next
+  dispatch while the `claude` subprocess kept running and kept being billed. N
+  cancellations meant up to N extra concurrent subprocesses, and each abandoned
+  worker also held a thread out of the default executor (`min(32, cpu_count+4)`,
+  which `to_thread` needs for *every* dispatch) for the rest of its timeout —
+  up to 7200s. The slot is now tied to the worker's real lifetime via
+  `_dispatch_guarded`; cancellation still reaches the caller immediately.
+- **A legitimately long dispatch is no longer flipped to `failed` by an
+  unrelated server starting up.** `recover_stale` judged abandonment from
+  `started_at` alone, but a dispatch may legitimately run up to the 7200s
+  timeout ceiling — so any of the (routinely 14+) other servers booting would
+  mark a live 2-hour job `failed`, after which `finish()` refuses the real,
+  already-paid-for result. A *running* job whose file was modified within the
+  threshold is now left alone: a live worker rewrites it on every progress
+  flush, so only the file's own age proves abandonment. This can only ever skip
+  a recovery — a genuinely abandoned job is picked up on a later start.
+- **A config that cannot be *rendered* now returns an error envelope instead of
+  a traceback.** `_get_config` wraps read-side YAML failures into
+  `ConfigLoadError`, but `save_config` → `yaml.dump` raises `RepresenterError` —
+  a `yaml.YAMLError`, so neither an `OSError` nor a `ConfigLoadError`. It
+  therefore slipped past *both* arms of the MCP guard on
+  `add_agent`/`update_agent`/`remove_agent` **and** past the CLI's
+  `_save_or_exit`. Unreachable today (only JSON-native types are ever dumped)
+  and closed now because it is the same "an exception type escapes the handler
+  meant to catch it" class that produced the 0.12.0 and 0.12.1 rounds. The set
+  is declared once as `config.CONFIG_SAVE_ERRORS`, next to its read-side twin,
+  so the two surfaces cannot drift.
+- **Stale-job recovery scans the jobs directory once instead of twice.** It
+  called `list()` per status, and `list()` reads and parses every file in the
+  directory (~85 ms at 294 records) — at the start of every server process.
+
 ## [0.12.1] - 2026-07-30
 
 Two holes in 0.12.0's own "tools always return a clean error" fix.
