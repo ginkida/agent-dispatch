@@ -244,6 +244,21 @@ class TestDegradedResultsAreNotCached:
         cache.put("infra", "task", over)
         assert cache.get("infra", "task") is None
 
+    def test_partial_and_blocked_outcomes_are_not_cached(self):
+        cache = DispatchCache(ttl=60)
+        for outcome in ("partial", "blocked"):
+            unfinished = DispatchResult(agent="infra", success=True, result="half", outcome=outcome)
+            cache.put("infra", f"task-{outcome}", unfinished)
+            # Whatever the agent was missing is not in the key; a retry after
+            # fixing it must not be served the same unfinished answer.
+            assert cache.get("infra", f"task-{outcome}") is None
+
+    def test_done_outcome_is_cached(self):
+        cache = DispatchCache(ttl=60)
+        done = DispatchResult(agent="infra", success=True, result="ok", outcome="done")
+        cache.put("infra", "task", done)
+        assert cache.get("infra", "task").outcome == "done"
+
 
 class TestCacheIsolation:
     def test_get_returns_a_copy_not_the_shared_entry(self):

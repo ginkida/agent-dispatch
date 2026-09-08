@@ -59,6 +59,13 @@ mcp = FastMCP(
         "6. dispatch_stream(agent, task) — live progress updates\n"
         "7. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
         "8. Always pass caller= (your project name) and goal= (why you need this)\n\n"
+        "READING A RESULT: every dispatched agent runs under a dispatch protocol "
+        "(non-interactive, leads with the outcome, ends with a STATUS line). Check "
+        "`outcome` first: done = complete; partial / blocked = the agent says the "
+        "work is unfinished and the result names what is missing — the `hint` "
+        "tells you how to continue (usually dispatch_session with the session_id). "
+        "Per-agent standing orders live in `instructions` (inspect_agent shows them; "
+        "update_agent(instructions=...) sets them).\n\n"
         "GROUPS (coordinate a set of related projects):\n"
         "- list_groups() — see configured groups (code repos + gateway agents)\n"
         "- inspect_group(name) — the group's brief + members + shared facts\n"
@@ -337,6 +344,8 @@ def _ref_payload(
         payload["error_type"] = result.error_type
     if result.denied_tools:
         payload["denied_tools"] = result.denied_tools
+    if result.outcome:
+        payload["outcome"] = result.outcome
     if result.hint:
         payload["hint"] = result.hint
     if result.parsed_result is not None:
@@ -632,6 +641,8 @@ async def inspect_agent(
         info["capabilities"] = agent.capabilities
     if agent.risky_capabilities:
         info["risky_capabilities"] = agent.risky_capabilities
+    if agent.instructions:
+        info["instructions"] = agent.instructions
 
     try:
         healthy = agent.directory.is_dir()
@@ -1178,6 +1189,10 @@ async def dispatch_parallel(
     parts = []
     for item, res in zip(items, output, strict=True):
         status = "OK" if res.get("success") else "FAILED"
+        if (outcome := res.get("outcome")) and outcome != "done":
+            # The member itself says it did not finish — the aggregator must
+            # not present a partial/blocked section as a complete answer.
+            status = f"{status}, agent reports {outcome.upper()}"
         body = res.get("result")
         if not body and (summary := res.get("summary")):
             # A return_ref item carries no "result" — only a summary preview.
@@ -1486,6 +1501,7 @@ async def add_agent(
     disallowed_tools: str = "",
     capabilities: str = "",
     risky_capabilities: str = "",
+    instructions: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Register a project directory as a dispatchable agent.
@@ -1514,6 +1530,10 @@ async def add_agent(
             inspect_agent to help callers pick the right agent.
         risky_capabilities: Comma-separated high-risk capability labels
             (e.g. "restart_services"). Descriptive only; surfaced for visibility.
+        instructions: Standing orders appended to the agent's system prompt on
+            EVERY dispatch (e.g. "Read-only: never modify files or restart
+            services. Answer with exact log lines."). Unlike `context`, which
+            is per call, these hold for every task.
     """
     try:
         validate_agent_name(name)
@@ -1564,6 +1584,7 @@ async def add_agent(
             disallowed_tools=parsed_disallowed,
             capabilities=parsed_capabilities,
             risky_capabilities=parsed_risky_capabilities,
+            instructions=instructions.strip(),
         )
         save_config(config)
     _invalidate_agent_cache(config, name)
@@ -1586,6 +1607,8 @@ async def add_agent(
         result["capabilities"] = parsed_capabilities
     if parsed_risky_capabilities:
         result["risky_capabilities"] = parsed_risky_capabilities
+    if instructions.strip():
+        result["instructions"] = instructions.strip()
 
     return _dumps(result, indent=2)
 
@@ -1630,6 +1653,7 @@ async def update_agent(
     disallowed_tools: str = "",
     capabilities: str = "",
     risky_capabilities: str = "",
+    instructions: str = "",
     ctx: Context | None = None,
 ) -> str:
     """Update an existing agent's configuration.
@@ -1652,6 +1676,8 @@ async def update_agent(
         capabilities: Comma-separated capabilities. Pass "none" to clear.
         risky_capabilities: Comma-separated risky capabilities. Pass "none"
             to clear.
+        instructions: Standing orders appended to the agent's system prompt on
+            every dispatch. Replaces the previous text. Pass "none" to clear.
     """
     if err := _validate_timeout(timeout):
         return err
@@ -1680,6 +1706,7 @@ async def update_agent(
             disallowed_tools=disallowed_tools,
             capabilities=capabilities,
             risky_capabilities=risky_capabilities,
+            instructions=instructions,
         )
 
         if not updated:
@@ -1708,6 +1735,7 @@ def _apply_agent_updates(
     disallowed_tools: str,
     capabilities: str,
     risky_capabilities: str,
+    instructions: str = "",
 ) -> tuple[list[str], list[str]]:
     """Apply update_agent's non-empty fields in place.
 
@@ -1756,6 +1784,9 @@ def _apply_agent_updates(
             [] if risky_capabilities.lower() == "none" else _parse_csv(risky_capabilities)
         )
         updated.append("risky_capabilities")
+    if instructions.strip():
+        agent.instructions = "" if instructions.strip().lower() == "none" else instructions.strip()
+        updated.append("instructions")
 
     return updated, warnings
 
@@ -2094,6 +2125,8 @@ async def dispatch_jobs(
             entry["success"] = j.result.success
             if j.result.cost_usd is not None:
                 entry["cost_usd"] = j.result.cost_usd
+            if j.result.outcome:
+                entry["outcome"] = j.result.outcome
         if j.status == "running" and j.progress:
             entry["last_progress"] = j.progress[-1]
         if j.error:

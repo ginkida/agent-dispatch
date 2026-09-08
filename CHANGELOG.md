@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-08
+
+The delegation round: what a dispatched agent is *told*, and what it tells
+back. Until now `claude -p` was launched with the task and nothing else — it
+did not know it was being driven by another agent, that nobody would answer a
+question, how long it had, or how to report an unfinished job. The failure
+mode was concrete and billed: an ambiguous task ended in *"Could you clarify
+which service you mean?"*, `success: true`, cached for the whole TTL.
+
+### Added
+- **The dispatch protocol.** Every dispatch now appends a short system prompt
+  (`--append-system-prompt`, never mixed into the task text) telling the agent
+  that it is non-interactive and dispatched by `caller`, that it must state
+  assumptions instead of asking, that a denied tool is something to report and
+  work around rather than stop on, what its time budget (and spend cap) is, to
+  lead with the outcome — which is what makes a `return_ref` summary, the
+  *head* of the text, worth reading — and to end with one line:
+  `STATUS: done | partial | blocked`. Passed on `--resume` too. Verified live
+  against claude 2.1.263 (`agent-dispatch test <agent> --stream`).
+- **`DispatchResult.outcome`** — that trailing line, lifted out of `result`
+  into a field: `done`, `partial` or `blocked`, or absent when the agent did
+  not report one. It never flips `success`. `partial`/`blocked` come with a
+  `hint` carrying the exact `dispatch_session(..., session_id=...)` call to
+  continue, ride the `return_ref` payload and `dispatch_jobs` summaries, are
+  shown by `agent-dispatch test` / `job <id>`, are labelled for the
+  `dispatch_parallel` aggregator so a blocked member is not synthesized as a
+  finished one — and are **not cached**: whatever the agent was missing is not
+  in the cache key, so a retry after fixing it must run fresh.
+- **Per-agent `instructions`** — standing orders appended after the protocol
+  on every dispatch ("read-only SQL only", "never restart a stack unless the
+  task says so"). `add_agent`/`update_agent` (`"none"` clears), CLI `add` /
+  `update --instructions` (`none` clears), shown by `inspect_agent` and
+  `describe`, pruned from YAML when empty. Changing them invalidates the
+  agent's cache entries like any other config change.
+- **`settings.dispatch_protocol`** (default `true`) — set to `false` for a raw
+  `claude -p` (a CLI that predates `--append-system-prompt`, or an A/B). The
+  protocol and the instructions share one flag, so instructions still go
+  through when set. `doctor` now probes `claude --help` for the flag and warns
+  with the exact remediation when it is missing.
+
+### Changed
+- In `response_format="json"` mode the protocol omits the "lead with the
+  outcome" and STATUS bullets — the JSON footer governs the reply shape. A
+  STATUS line that arrives anyway is still stripped before parsing, so
+  `parsed_result` survives it.
+- `dispatch` and `dispatch_stream` build their success result through one
+  `_build_success_result`, the twin of `_build_error_result`.
+
+
 ## [0.13.0] - 2026-08-13
 
 An efficiency round, measured against a real 38 KB config (4 agents, 6 groups),

@@ -3181,8 +3181,6 @@ class TestNonAsciiIsNotEscaped:
         assert "\\u" not in server._dumps({"a": "Диагностика"})
 
 
-
-
 class TestStartupMaintenance:
     """Job records used to accumulate forever: dispatch_gc was manual-only.
 
@@ -3350,3 +3348,136 @@ class TestConfigWriteFailureIsAnEnvelope:
 
         assert load_config(cfg).agents["infra"].description == "original"
         assert list(tmp_path.glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# Dispatch protocol surface: instructions + outcome
+# ---------------------------------------------------------------------------
+
+
+class TestInstructionsAndOutcome:
+    @pytest.mark.asyncio
+    async def test_add_update_clear_and_inspect_instructions(self, tmp_path: Path, monkeypatch):
+        from agent_dispatch.config import load_config
+
+        config_file = tmp_path / "agents.yaml"
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(config_file))
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+
+        added = json.loads(
+            await server.add_agent(
+                "proj", str(agent_dir), description="t", instructions="  Read-only.  "
+            )
+        )
+        assert added["instructions"] == "Read-only."
+        assert load_config(config_file).agents["proj"].instructions == "Read-only."
+        assert (
+            json.loads(await server.inspect_agent("proj", preview_lines=0))["instructions"]
+            == "Read-only."
+        )
+
+        updated = json.loads(await server.update_agent("proj", instructions="Be terse."))
+        assert updated["fields"] == ["instructions"]
+        assert load_config(config_file).agents["proj"].instructions == "Be terse."
+
+        json.loads(await server.update_agent("proj", instructions="NONE"))
+        assert load_config(config_file).agents["proj"].instructions == ""
+        assert "instructions" not in json.loads(await server.inspect_agent("proj", preview_lines=0))
+
+    @pytest.mark.asyncio
+    async def test_update_instructions_invalidates_cache(self, tmp_path: Path, monkeypatch):
+        config_file = tmp_path / "agents.yaml"
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(config_file))
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        await server.add_agent("proj", str(agent_dir), description="t")
+
+        calls = []
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            calls.append(agent_config.instructions)
+            return _ok_dispatch_result(name, "answer")
+
+        with patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch):
+            await server.dispatch("proj", "task")
+            assert json.loads(await server.dispatch("proj", "task"))["cached"] is True
+            # New standing orders change what the agent is told → the cached
+            # answer under the old orders must not be served.
+            await server.update_agent("proj", instructions="Answer in French.")
+            data = json.loads(await server.dispatch("proj", "task"))
+        assert "cached" not in data
+        assert calls == ["", "Answer in French."]
+
+    @pytest.mark.asyncio
+    async def test_outcome_and_hint_ride_the_dispatch_and_ref_payloads(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(
+                agent=name, success=True, result="half", outcome="partial", hint="resume it"
+            )
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            full = json.loads(await server.dispatch("infra", "t"))
+            ref = json.loads(await server.dispatch("infra", "t2", return_ref=True))
+        assert full["outcome"] == "partial" and full["hint"] == "resume it"
+        assert ref["outcome"] == "partial" and ref["hint"] == "resume it"
+        assert "result" not in ref
+
+    @pytest.mark.asyncio
+    async def test_unfinished_outcome_is_not_served_from_cache(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        n = 0
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            nonlocal n
+            n += 1
+            return DispatchResult(agent=name, success=True, result="half", outcome="blocked")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "t")
+            data = json.loads(await server.dispatch("infra", "t"))
+        assert n == 2 and "cached" not in data
+
+    @pytest.mark.asyncio
+    async def test_aggregator_is_told_which_members_did_not_finish(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        seen: dict[str, str] = {}
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            if name == "monitoring":
+                seen["context"] = context
+                return _ok_dispatch_result(name, "synth")
+            outcome = "blocked" if name == "db" else "done"
+            return DispatchResult(agent=name, success=True, result=f"r-{name}", outcome=outcome)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            dispatches = json.dumps([{"agent": "infra", "task": "c"}, {"agent": "db", "task": "c"}])
+            await server.dispatch_parallel(dispatches, aggregate="monitoring")
+        assert "## Agent: infra [OK]" in seen["context"]
+        assert "## Agent: db [OK, agent reports BLOCKED]" in seen["context"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_summary_carries_outcome(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return DispatchResult(agent=name, success=True, result="x", outcome="partial")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "t", return_ref=True)
+            jobs = json.loads(await server.dispatch_jobs())
+        assert jobs[0]["outcome"] == "partial"

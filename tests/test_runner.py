@@ -17,11 +17,13 @@ from agent_dispatch.runner import (
     ArgInjectionError,
     _build_command,
     _build_prompt,
+    _build_system_prompt,
     _check_recursion,
     _classify_error,
     _current_depth,
     _extract_denied_tools,
     _permission_hint,
+    _split_outcome,
     dispatch,
     dispatch_stream,
 )
@@ -1884,8 +1886,7 @@ class TestUndecodableOutput:
     def test_dispatch_survives_an_undecodable_byte(self, tmp_path: Path):
         cli = self._cli(
             tmp_path,
-            "import sys\n"
-            "sys.stdout.buffer.write(b'{\"result\":\"caf\\xe9 ok\",\"is_error\":false}')\n",
+            'import sys\nsys.stdout.buffer.write(b\'{"result":"caf\\xe9 ok","is_error":false}\')\n',
         )
         agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
         with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
@@ -1897,8 +1898,8 @@ class TestUndecodableOutput:
         cli = self._cli(
             tmp_path,
             "import sys\n"
-            "sys.stdout.buffer.write(b'{\"type\":\"result\",\"is_error\":false,"
-            "\"result\":\"caf\\xe9 ok\"}\\n')\n",
+            'sys.stdout.buffer.write(b\'{"type":"result","is_error":false,'
+            '"result":"caf\\xe9 ok"}\\n\')\n',
         )
         agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
         with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
@@ -1936,3 +1937,200 @@ class TestSpawnFailureClassification:
         result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
         assert not result.success
         assert result.error_type == "cli_error"
+
+
+class TestSplitOutcome:
+    """The trailing STATUS line the dispatch protocol asks for."""
+
+    def test_plain_marker_is_lifted_and_removed(self):
+        assert _split_outcome("All good.\n\nSTATUS: done") == ("All good.", "done")
+
+    def test_case_and_markdown_decoration_are_tolerated(self):
+        assert _split_outcome("x\n**Status: Partial**") == ("x", "partial")
+        assert _split_outcome("x\n`STATUS: blocked`") == ("x", "blocked")
+
+    def test_trailing_reason_keeps_the_line(self):
+        text = "Ran 3 of 5 checks.\nSTATUS: partial — DB unreachable"
+        assert _split_outcome(text) == (text, "partial")
+
+    def test_only_the_last_line_counts(self):
+        text = "The protocol says STATUS: done at the end.\nMore text."
+        assert _split_outcome(text) == (text, None)
+
+    def test_unknown_value_is_ignored(self):
+        assert _split_outcome("x\nSTATUS: maybe") == ("x\nSTATUS: maybe", None)
+
+    def test_empty_and_marker_only(self):
+        assert _split_outcome("") == ("", None)
+        assert _split_outcome("STATUS: done") == ("", "done")
+
+
+class TestBuildSystemPrompt:
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test")
+        self.settings = Settings()
+
+    def test_protocol_names_agent_caller_timeout_and_status(self):
+        text = _build_system_prompt("infra", self.agent, self.settings, 600, caller="taylor")
+        assert text.startswith("## Dispatch protocol")
+        assert 'agent "infra"' in text
+        assert 'dispatched by "taylor"' in text
+        assert "about 600 seconds" in text
+        assert "STATUS: done" in text and "STATUS: blocked" in text
+        assert "Never end with a clarifying question" in text
+
+    def test_json_mode_drops_the_status_and_lead_bullets(self):
+        text = _build_system_prompt("a", self.agent, self.settings, 60, response_format="json")
+        assert "STATUS:" not in text
+        assert "lead with the outcome" not in text
+        assert "non-interactively" in text  # the rest of the protocol stays
+
+    def test_spend_cap_is_mentioned_when_set(self):
+        agent = AgentConfig(directory="/tmp", max_budget_usd=1.5)
+        assert "spend cap $1.5" in _build_system_prompt("a", agent, self.settings, 60)
+        assert "spend cap" not in _build_system_prompt("a", self.agent, self.settings, 60)
+
+    def test_instructions_follow_under_their_own_header(self):
+        agent = AgentConfig(directory="/tmp", instructions="  Read-only SQL only.  ")
+        text = _build_system_prompt("analytic", agent, self.settings, 60)
+        assert text.index("## Dispatch protocol") < text.index(
+            '## Standing instructions for "analytic"\nRead-only SQL only.'
+        )
+
+    def test_protocol_off_leaves_only_instructions(self):
+        settings = Settings(dispatch_protocol=False)
+        assert _build_system_prompt("a", self.agent, settings, 60) is None
+        agent = AgentConfig(directory="/tmp", instructions="- bullet first")
+        text = _build_system_prompt("a", agent, settings, 60)
+        # Always starts with a header, never with "-": can't be parsed as a flag.
+        assert text.startswith("## Standing instructions")
+        assert "Dispatch protocol" not in text
+
+    def test_command_carries_the_flag_only_when_there_is_text(self):
+        cmd = _build_command("claude", "t", self.agent, self.settings, system_prompt="## P\nx")
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "## P\nx"
+        cmd = _build_command("claude", "t", self.agent, self.settings, system_prompt=None)
+        assert "--append-system-prompt" not in cmd
+
+    def test_flag_is_passed_on_resume_too(self):
+        cmd = _build_command(
+            "claude", "t", self.agent, self.settings, "sess-1", system_prompt="## P"
+        )
+        assert "--resume" in cmd and "--append-system-prompt" in cmd
+
+
+def _cli_json(text: str, **extra) -> str:
+    payload = {"result": text, "session_id": "sess-1", "is_error": False, "total_cost_usd": 0.01}
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+class TestOutcomeThroughDispatch:
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=42)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_dispatch_sends_the_protocol(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json("ok\nSTATUS: done"), stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings, caller="taylor")
+        cmd = mock_run.call_args[0][0]
+        system_prompt = cmd[cmd.index("--append-system-prompt") + 1]
+        assert 'agent "infra"' in system_prompt
+        assert "about 42 seconds" in system_prompt
+        assert '"taylor"' in system_prompt
+        # The protocol lives in the system prompt; the task prompt keeps its
+        # own (structured, caller-aware) shape and never contains it.
+        assert cmd[2].endswith("## Task\nhello")
+        assert "Dispatch protocol" not in cmd[2]
+        assert result.outcome == "done"
+        assert result.result == "ok"
+        assert result.hint is None
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_protocol_off_sends_no_flag(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json("ok"), stderr=""
+        )
+        dispatch("infra", "hello", self.agent, Settings(dispatch_protocol=False))
+        assert "--append-system-prompt" not in mock_run.call_args[0][0]
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_partial_and_blocked_carry_a_resume_hint(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json("Did half.\nSTATUS: partial"), stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.success and result.outcome == "partial"
+        assert "PARTIAL" in result.hint
+        assert "session_id='sess-1'" in result.hint
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json("Need DB creds.\nSTATUS: blocked"), stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.outcome == "blocked"
+        assert "BLOCKED" in result.hint
+        assert result.result == "Need DB creds."
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_outcome_hint_follows_the_denial_hint(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=_cli_json(
+                "x\nSTATUS: partial",
+                permission_denials=[{"tool_name": "Bash", "tool_input": {}}],
+            ),
+            stderr="",
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.denied_tools == ["Bash"]
+        assert result.hint.index("Bash") < result.hint.index("PARTIAL")
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_status_line_in_json_mode_does_not_break_parsing(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json('{"n": 1}\nSTATUS: done'), stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings, response_format="json")
+        assert result.parsed_result == {"n": 1}
+        assert result.outcome == "done"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_plain_text_fallback_reports_outcome(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="plain answer\nSTATUS: blocked\n", stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.success and result.result == "plain answer"
+        assert result.outcome == "blocked" and "BLOCKED" in result.hint
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_reports_outcome_and_sends_protocol(self, mock_popen, _which):
+        line = json.dumps({"type": "result", "result": "half\nSTATUS: partial", "session_id": "s"})
+        mock_popen.return_value = _FakePopen([line])
+        result = dispatch_stream("infra", "go", self.agent, self.settings, caller="x")
+        cmd = mock_popen.call_args[0][0]
+        assert "--append-system-prompt" in cmd
+        assert result.outcome == "partial" and result.result == "half"
+        assert "PARTIAL" in result.hint
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_no_status_line_means_no_outcome(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_cli_json("just text"), stderr=""
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.outcome is None
+        assert "outcome" not in result.model_dump_json(exclude_none=True)

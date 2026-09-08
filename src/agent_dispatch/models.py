@@ -53,6 +53,12 @@ class AgentConfig(BaseModel):
     disallowed_tools: list[str] | None = None
     capabilities: list[str] = Field(default_factory=list)
     risky_capabilities: list[str] = Field(default_factory=list)
+    # Standing orders for this agent whenever it is dispatched ("read-only SQL
+    # only", "never restart a stack unless the task says so"). Appended to the
+    # claude system prompt via --append-system-prompt, after the dispatch
+    # protocol — so they hold across every task, unlike `context`, which is
+    # per call. Empty = nothing appended. Pruned from YAML when empty.
+    instructions: str = ""
 
     @field_validator("directory", mode="before")
     @classmethod
@@ -107,6 +113,12 @@ class Settings(BaseModel):
     # must be an explicit choice rather than something a version bump starts
     # doing to an existing install.
     job_retention_days: int = Field(default=0, ge=0)
+    # Send every dispatched agent the dispatch protocol as an appended system
+    # prompt: it is running non-interactively, nobody will answer a question,
+    # its time/spend budget, lead with the outcome, end with a STATUS line
+    # (parsed into DispatchResult.outcome). Off = raw `claude -p` behaviour,
+    # for CLIs that predate --append-system-prompt or for A/B comparison.
+    dispatch_protocol: bool = True
 
 
 def validate_agent_name(name: str) -> str:
@@ -214,3 +226,8 @@ class DispatchResult(BaseModel):
     # default). Post-hoc only — the money is already spent, the dispatch is
     # NOT failed for it. None means: no budget configured, or within budget.
     budget_exceeded: bool | None = None
+    # The agent's own verdict on its work, from the trailing `STATUS:` line the
+    # dispatch protocol asks for: "done", "partial" or "blocked". None when the
+    # agent did not report one (protocol off, JSON mode, or it just didn't).
+    # Descriptive: never flips `success`. partial/blocked are not cached.
+    outcome: str | None = None

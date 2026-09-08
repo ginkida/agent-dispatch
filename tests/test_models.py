@@ -250,9 +250,7 @@ class TestGroups:
     def test_member_existence_not_enforced_at_load(self):
         # Dangling member refs must NOT brick config load — they are flagged at
         # read time and blocked at CLI mutation time instead.
-        cfg = DispatchConfig.model_validate(
-            {"groups": {"g": {"members": [{"agent": "ghost"}]}}}
-        )
+        cfg = DispatchConfig.model_validate({"groups": {"g": {"members": [{"agent": "ghost"}]}}})
         assert cfg.groups["g"].members[0].agent == "ghost"
 
 
@@ -295,3 +293,14 @@ class TestDirectoryValidation:
         with pytest.raises(ValidationError) as exc:
             DispatchConfig.model_validate({"agents": {"bad": {"directory": ["a", "b"]}}})
         assert "directory" in str(exc.value)
+
+
+class TestProtocolFields:
+    def test_defaults(self, tmp_path):
+        agent = AgentConfig(directory=tmp_path)
+        assert agent.instructions == ""
+        assert Settings().dispatch_protocol is True
+        assert DispatchResult(agent="a", success=True, result="").outcome is None
+
+    def test_settings_roundtrip(self):
+        assert Settings.model_validate({"dispatch_protocol": False}).dispatch_protocol is False

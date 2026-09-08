@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -25,6 +26,123 @@ _JSON_RESPONSE_FOOTER = (
     "any explanatory text before or after. If you cannot satisfy this, "
     'respond with {"error": "<reason>"}.'
 )
+
+
+# The dispatched agent's self-reported verdict, asked for by the dispatch
+# protocol below. Tolerates markdown decoration ("**STATUS: done**") and a
+# trailing reason ("STATUS: partial — DB unreachable").
+_OUTCOME_RE = re.compile(
+    r"^\s*[*_`]*\s*STATUS\s*:\s*[*_`]*\s*(done|partial|blocked)\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_OUTCOME_DECOR_RE = re.compile(r"^[\s*_`.!]*$")
+
+
+def _split_outcome(text: str) -> tuple[str, str | None]:
+    """Extract the trailing ``STATUS: done|partial|blocked`` line, if any.
+
+    Returns ``(text, outcome)``. The marker line is removed from the text when
+    it carries nothing but the marker; a line with a trailing reason
+    ("STATUS: partial — migrations pending") is kept in the text, because the
+    reason is the useful part, and only the verdict is lifted out. Only the
+    LAST non-empty line counts, so an agent quoting the protocol mid-answer
+    does not trip it.
+    """
+    if not text:
+        return text, None
+    stripped = text.rstrip()
+    nl = stripped.rfind("\n")
+    last = stripped[nl + 1 :]
+    m = _OUTCOME_RE.match(last)
+    if not m:
+        return text, None
+    outcome = m.group(1).lower()
+    if not _OUTCOME_DECOR_RE.match(m.group("rest")):
+        return text, outcome
+    body = stripped[:nl].rstrip() if nl >= 0 else ""
+    return body, outcome
+
+
+def _outcome_hint(agent_name: str, outcome: str | None, session_id: str | None) -> str | None:
+    """Advisory for a self-reported unfinished result: what to do next."""
+    if outcome not in ("partial", "blocked"):
+        return None
+    resume = (
+        f"dispatch_session(agent='{agent_name}', task='Continue where you left off', "
+        f"session_id='{session_id}')"
+        if session_id
+        else f"dispatch_session(agent='{agent_name}', ...)"
+    )
+    if outcome == "partial":
+        return (
+            "The agent reports its work is PARTIAL — read the result for what is "
+            f"missing, then continue in the same session via {resume} or "
+            "re-dispatch with what it needed."
+        )
+    return (
+        "The agent reports it is BLOCKED — the result names what it needs (context, "
+        f"access, a tool, a running service). Supply it and re-dispatch, or resume via {resume}."
+    )
+
+
+_PROTOCOL_HEADER = "## Dispatch protocol"
+
+
+def _build_system_prompt(
+    agent_name: str,
+    agent: AgentConfig,
+    settings: Settings,
+    timeout: int,
+    *,
+    caller: str | None = None,
+    response_format: str | None = None,
+) -> str | None:
+    """Text for ``--append-system-prompt``: the dispatch protocol + standing orders.
+
+    The protocol tells the dispatched agent what `claude -p` never does on its
+    own: that it is non-interactive (a clarifying question ends the run and is
+    billed for nothing), what its time and spend budget is, to lead with the
+    outcome (``return_ref`` summaries are the HEAD of the text) and to end
+    with a ``STATUS:`` line that :func:`_split_outcome` lifts into
+    ``DispatchResult.outcome``. In JSON mode the last two bullets are dropped —
+    the JSON footer in the task prompt governs the shape of the reply.
+
+    Per-agent ``instructions`` follow under their own header. Returns None
+    when there is nothing to send (protocol off, no instructions), so the flag
+    is not passed at all. The text always starts with a header line, never
+    with ``-``, so it can never be parsed as a flag.
+    """
+    parts: list[str] = []
+    if settings.dispatch_protocol:
+        by = f' by "{caller}" (another agent)' if caller else " by another agent"
+        budget = _effective_budget(agent, settings)
+        budget_note = f", spend cap ${budget:g}" if budget else ""
+        bullets = [
+            f'You are the agent "{agent_name}", dispatched{by} and running '
+            "non-interactively: no human is watching this session.",
+            "- Nobody can answer a question or approve an action. Never end with a "
+            "clarifying question — state your assumption and proceed; when two "
+            "readings differ materially, take the safer one and say which you took.",
+            "- If a tool is denied or something is missing, report it and still "
+            "finish everything that is possible.",
+            f"- Time budget: about {timeout} seconds for the whole run{budget_note}. "
+            "Scope the work to fit; a complete partial answer beats an unfinished "
+            "perfect one.",
+        ]
+        if response_format != "json":
+            bullets += [
+                "- Reply for a machine reader: lead with the outcome or answer, then "
+                "the evidence and what you changed; list what you could not do and "
+                "why. No preamble, no restating the task.",
+                "- End your reply with one final line: `STATUS: done` (task fully "
+                "completed), `STATUS: partial` (some of it done — say what is "
+                "missing), or `STATUS: blocked` (no progress possible — say what "
+                "you need).",
+            ]
+        parts.append(_PROTOCOL_HEADER + "\n" + "\n".join(bullets))
+    if agent.instructions.strip():
+        parts.append(f'## Standing instructions for "{agent_name}"\n{agent.instructions.strip()}')
+    return "\n\n".join(parts) if parts else None
 
 
 def _parse_structured_response(text: str) -> object | None:
@@ -266,6 +384,58 @@ def _build_error_result(
     )
 
 
+def _build_success_result(
+    agent_name: str,
+    data: dict,
+    denied: list[str] | None,
+    agent: AgentConfig,
+    settings: Settings,
+    *,
+    session_fallback: str | None,
+    response_format: str | None,
+    extra_hint: str | None = None,
+) -> DispatchResult:
+    """Build the DispatchResult for a non-error CLI payload.
+
+    Shared by ``dispatch`` and ``dispatch_stream`` (they differ only in the
+    session-id fallback and whether the stream's kill-after-result note
+    applies), like ``_build_error_result`` for the failure side. Order matters:
+    the STATUS line is lifted out *before* JSON parsing, so an agent that adds
+    one in JSON mode anyway does not break ``parsed_result``.
+    """
+    # Coerce like _build_error_result does: a malformed/again-changed CLI payload
+    # can carry a null, number or object here, which would raise a ValidationError
+    # out of the runner instead of coming back as a DispatchResult.
+    raw_result = data.get("result", "")
+    result_text = str(raw_result) if raw_result else ""
+    result_text, outcome = _split_outcome(result_text)
+    parsed = _parse_structured_response(result_text) if response_format == "json" else None
+    session_id = data.get("session_id") or session_fallback
+    hints = [
+        _denial_hint(agent_name, denied) if denied else None,
+        extra_hint,
+        _outcome_hint(agent_name, outcome, session_id),
+    ]
+    hint = " ".join(h for h in hints if h) or None
+    return _apply_budget(
+        DispatchResult(
+            agent=agent_name,
+            success=True,
+            result=result_text,
+            session_id=session_id,
+            cost_usd=data.get("total_cost_usd"),
+            duration_ms=data.get("duration_ms"),
+            num_turns=data.get("num_turns"),
+            parsed_result=parsed,
+            denied_tools=denied,
+            hint=hint,
+            outcome=outcome,
+        ),
+        agent,
+        settings,
+    )
+
+
 def _apply_budget(result: DispatchResult, agent: AgentConfig, settings: Settings) -> DispatchResult:
     """Flag a result whose cost exceeded the configured budget (post-hoc).
 
@@ -465,8 +635,15 @@ def _build_command(
     session_id: str | None = None,
     *,
     new_session_id: str | None = None,
+    system_prompt: str | None = None,
 ) -> list[str]:
     cmd = [claude_path, "-p", task, "--output-format", "json"]
+
+    if system_prompt:
+        # Protocol + standing instructions (see _build_system_prompt). Passed
+        # on --resume too: with --append-system-prompt the CLI does not snapshot
+        # the system prompt, so the text applies fresh to every launch.
+        cmd.extend(["--append-system-prompt", system_prompt])
 
     if session_id:
         _reject_flaglike("session_id", session_id)
@@ -605,6 +782,7 @@ def dispatch(
     new_session = None if session_id else str(uuid.uuid4())
     session_uuid = session_id or new_session
 
+    timeout = agent.timeout or settings.default_timeout
     try:
         cmd = _build_command(
             claude_path,
@@ -613,6 +791,9 @@ def dispatch(
             settings,
             session_id,
             new_session_id=new_session,
+            system_prompt=_build_system_prompt(
+                agent_name, agent, settings, timeout, caller=caller, response_format=response_format
+            ),
         )
     except ArgInjectionError as e:
         return DispatchResult(
@@ -622,7 +803,6 @@ def dispatch(
             error=str(e),
             error_type="cli_error",
         )
-    timeout = agent.timeout or settings.default_timeout
 
     # Propagate depth for recursion protection
     env = os.environ.copy()
@@ -726,6 +906,7 @@ def dispatch(
         # answer — reporting success would also cache "" for the whole TTL.
         success = proc.returncode == 0 and bool(text)
         if success:
+            text, outcome = _split_outcome(text)
             parsed = _parse_structured_response(text) if response_format == "json" else None
             return DispatchResult(
                 agent=agent_name,
@@ -733,6 +914,8 @@ def dispatch(
                 result=text,
                 parsed_result=parsed,
                 session_id=session_uuid,
+                hint=_outcome_hint(agent_name, outcome, session_uuid),
+                outcome=outcome,
             )
         error_text = (
             text
@@ -767,29 +950,14 @@ def dispatch(
             exit_code=proc.returncode,
         )
 
-    # Coerce like _build_error_result does: a malformed/again-changed CLI payload
-    # can carry a null, number or object here, which would raise a ValidationError
-    # out of the runner instead of coming back as a DispatchResult.
-    raw_result = data.get("result", "")
-    result_text = str(raw_result) if raw_result else ""
-    parsed: object | None = None
-    if response_format == "json":
-        parsed = _parse_structured_response(result_text)
-    return _apply_budget(
-        DispatchResult(
-            agent=agent_name,
-            success=True,
-            result=result_text,
-            session_id=data.get("session_id") or session_uuid,
-            cost_usd=data.get("total_cost_usd"),
-            duration_ms=data.get("duration_ms"),
-            num_turns=data.get("num_turns"),
-            parsed_result=parsed,
-            denied_tools=denied,
-            hint=_denial_hint(agent_name, denied) if denied else None,
-        ),
+    return _build_success_result(
+        agent_name,
+        data,
+        denied,
         agent,
         settings,
+        session_fallback=session_uuid,
+        response_format=response_format,
     )
 
 
@@ -855,6 +1023,7 @@ def dispatch_stream(
 
     # Pre-generate session id so a timed-out stream is resumable (see dispatch()).
     new_session = str(uuid.uuid4()) if _use_session_flag else None
+    timeout = agent.timeout or settings.default_timeout
 
     try:
         cmd = _build_command(
@@ -863,6 +1032,9 @@ def dispatch_stream(
             agent,
             settings,
             new_session_id=new_session,
+            system_prompt=_build_system_prompt(
+                agent_name, agent, settings, timeout, caller=caller, response_format=response_format
+            ),
         )
     except ArgInjectionError as e:
         return DispatchResult(
@@ -882,7 +1054,6 @@ def dispatch_stream(
     cmd[fmt_idx + 1] = "stream-json"
     cmd.append("--verbose")
 
-    timeout = agent.timeout or settings.default_timeout
     env = os.environ.copy()
     env[_DEPTH_ENV_VAR] = str(_current_depth() + 1)
 
@@ -1023,27 +1194,15 @@ def dispatch_stream(
                 settings,
                 session_fallback=new_session,
             )
-        raw_result = result_data.get("result", "")
-        result_text = str(raw_result) if raw_result else ""
-        parsed = _parse_structured_response(result_text) if response_format == "json" else None
-        hint = _denial_hint(agent_name, denied) if denied else None
-        if timed_out.is_set():
-            hint = f"{hint} {_STREAM_KILLED_AFTER_RESULT}" if hint else _STREAM_KILLED_AFTER_RESULT
-        return _apply_budget(
-            DispatchResult(
-                agent=agent_name,
-                success=True,
-                result=result_text,
-                session_id=result_data.get("session_id") or new_session,
-                cost_usd=result_data.get("total_cost_usd"),
-                duration_ms=result_data.get("duration_ms"),
-                num_turns=result_data.get("num_turns"),
-                parsed_result=parsed,
-                denied_tools=denied,
-                hint=hint,
-            ),
+        return _build_success_result(
+            agent_name,
+            result_data,
+            denied,
             agent,
             settings,
+            session_fallback=new_session,
+            response_format=response_format,
+            extra_hint=_STREAM_KILLED_AFTER_RESULT if timed_out.is_set() else None,
         )
 
     if timed_out.is_set():

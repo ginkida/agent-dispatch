@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import subprocess
@@ -663,28 +664,37 @@ class TestDoctor:
         Mirrors the real CLI output format:
             agent-dispatch: /path/to/agent-dispatch serve - Connected
         """
+        # The same subprocess.run mock would also answer the `claude --help`
+        # probe (and never list --append-system-prompt), so pin that probe to
+        # "supported" — TestDoctorProtocolProbe covers the other answers.
+        supports = patch("agent_dispatch.cli._claude_supports_flag", return_value=True)
         if fail:
-            return patch(
+            run = patch(
                 "agent_dispatch.cli.subprocess.run",
                 side_effect=FileNotFoundError("no claude"),
             )
-        if stdout is None:
-            if registered:
-                stdout = (
-                    "agent-dispatch: /opt/homebrew/bin/agent-dispatch serve - Connected\n"
-                    "foo: /usr/bin/foo serve - Connected\n"
-                )
-            else:
-                stdout = "foo: /usr/bin/foo serve - Connected\n"
-        return patch(
-            "agent_dispatch.cli.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=stdout,
-                stderr="",
-            ),
-        )
+        else:
+            if stdout is None:
+                if registered:
+                    stdout = (
+                        "agent-dispatch: /opt/homebrew/bin/agent-dispatch serve - Connected\n"
+                        "foo: /usr/bin/foo serve - Connected\n"
+                    )
+                else:
+                    stdout = "foo: /usr/bin/foo serve - Connected\n"
+            run = patch(
+                "agent_dispatch.cli.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=stdout,
+                    stderr="",
+                ),
+            )
+        stack = contextlib.ExitStack()
+        stack.enter_context(supports)
+        stack.enter_context(run)
+        return stack
 
     def test_all_ok(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
@@ -1517,3 +1527,108 @@ class TestConfigWriteFailureIsAMessage:
         # The original is still readable and unchanged.
         listing = runner.invoke(cli, ["list"])
         assert "Original" in listing.output
+
+
+class TestInstructionsCli:
+    """`--instructions`: standing orders on add/update, shown by inspect, pruned when empty."""
+
+    def test_add_and_inspect(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        result = runner.invoke(
+            cli,
+            ["add", "proj", str(agent_dir), "-d", "T", "--instructions", "Read-only.\nNo restart."],
+        )
+        assert result.exit_code == 0, result.output
+        assert load_config().agents["proj"].instructions == "Read-only.\nNo restart."
+        out = runner.invoke(cli, ["describe", "proj"]).output
+        assert "instructions:     Read-only." in out
+        assert "No restart." in out
+
+    def test_update_sets_and_none_clears(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T"])
+        result = runner.invoke(cli, ["update", "proj", "--instructions", "  Be terse.  "])
+        assert result.exit_code == 0, result.output
+        assert "instructions" in result.output
+        assert load_config().agents["proj"].instructions == "Be terse."
+
+        result = runner.invoke(cli, ["update", "proj", "--instructions", "none"])
+        assert result.exit_code == 0, result.output
+        assert load_config().agents["proj"].instructions == ""
+        # Cleared = pruned from YAML, like an empty capabilities list.
+        assert "instructions" not in load_config.__globals__["config_path"]().read_text()
+
+    def test_inspect_without_instructions_omits_the_line(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T"])
+        assert "instructions:" not in runner.invoke(cli, ["describe", "proj"]).output
+
+
+class TestDoctorProtocolProbe:
+    """doctor checks that the installed claude knows --append-system-prompt."""
+
+    def _which(self, name: str):
+        return f"/usr/bin/{name}"
+
+    def _mcp_list(self):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="agent-dispatch: x serve - Connected\n", stderr=""
+        )
+
+    def test_supported_is_ok(self):
+        def run(cmd, **kw):
+            if cmd[1:] == ["--help"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="  --append-system-prompt <prompt>\n", stderr=""
+                )
+            return self._mcp_list()
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=self._which),
+            patch("agent_dispatch.cli.subprocess.run", side_effect=run),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "[OK] claude CLI supports --append-system-prompt" in result.output
+
+    def test_unsupported_warns_with_a_runnable_remedy(self, tmp_path: Path):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T", "--instructions", "x"])
+
+        def run(cmd, **kw):
+            if cmd[1:] == ["--help"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="  --print\n", stderr=""
+                )
+            return self._mcp_list()
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=self._which),
+            patch("agent_dispatch.cli.subprocess.run", side_effect=run),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "[WARN] claude CLI predates --append-system-prompt" in result.output
+        assert "dispatch_protocol: false" in result.output
+        # Run the command the hint prints (remediation text is a contract).
+        m = re.search(r"agent-dispatch (update <name> --instructions none)", result.output)
+        assert m, result.output
+        argv = m.group(1).replace("<name>", "proj").split()
+        assert runner.invoke(cli, argv).exit_code == 0
+        assert load_config().agents["proj"].instructions == ""
+
+    def test_probe_failure_is_a_warning_not_a_crash(self):
+        def run(cmd, **kw):
+            if cmd[1:] == ["--help"]:
+                raise subprocess.TimeoutExpired(cmd, 10)
+            return self._mcp_list()
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=self._which),
+            patch("agent_dispatch.cli.subprocess.run", side_effect=run),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "Could not run `claude --help`" in result.output
+        assert result.exit_code == 0

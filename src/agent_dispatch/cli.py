@@ -101,6 +101,22 @@ def _check_timeout_or_exit(timeout: int | None) -> None:
         raise SystemExit(1)
 
 
+def _claude_supports_flag(claude_path: str, flag: str) -> bool | None:
+    """Whether `claude --help` lists *flag*; None when the probe itself failed."""
+    try:
+        proc = subprocess.run(
+            [claude_path, "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return flag in (proc.stdout or "") + (proc.stderr or "")
+
+
 def _load_or_exit() -> DispatchConfig:
     """Load config, exiting with a friendly error on malformed YAML or schema."""
     try:
@@ -233,6 +249,11 @@ def init() -> None:
     default=None,
     help="Comma-separated risky capabilities (e.g. restart_services).",
 )
+@click.option(
+    "--instructions",
+    default=None,
+    help="Standing orders appended to the agent's system prompt on every dispatch.",
+)
 def add(
     name: str,
     directory: str,
@@ -245,6 +266,7 @@ def add(
     disallowed_tools: str | None,
     capabilities: str | None,
     risky_capabilities: str | None,
+    instructions: str | None,
 ) -> None:
     """Add an agent. Auto-generates description from project files if omitted."""
     try:
@@ -281,6 +303,7 @@ def add(
             disallowed_tools=_parse_csv(disallowed_tools),
             capabilities=_parse_csv(capabilities) or [],
             risky_capabilities=_parse_csv(risky_capabilities) or [],
+            instructions=(instructions or "").strip(),
         )
         if warning := check_permission_mode(permission_mode):
             click.echo(click.style(f"Warning: {warning}", fg="yellow"))
@@ -388,6 +411,11 @@ def list_agents() -> None:
     default=None,
     help="Comma-separated risky capabilities. Use 'none' to clear.",
 )
+@click.option(
+    "--instructions",
+    default=None,
+    help="Standing orders for every dispatch (replaces the text). Use 'none' to clear.",
+)
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -401,6 +429,7 @@ def update(
     disallowed_tools: str | None,
     capabilities: str | None,
     risky_capabilities: str | None,
+    instructions: str | None,
 ) -> None:
     """Update an existing agent's configuration."""
     _check_timeout_or_exit(timeout)
@@ -424,6 +453,7 @@ def update(
             disallowed_tools=disallowed_tools,
             capabilities=capabilities,
             risky_capabilities=risky_capabilities,
+            instructions=instructions,
         )
 
         if not updated:
@@ -446,6 +476,7 @@ def _apply_cli_updates(
     disallowed_tools: str | None,
     capabilities: str | None,
     risky_capabilities: str | None,
+    instructions: str | None = None,
 ) -> list[str]:
     """Apply `update`'s explicitly-passed options in place; return the fields touched."""
     updated: list[str] = []
@@ -493,6 +524,10 @@ def _apply_cli_updates(
         else:
             agent.risky_capabilities = _parse_csv(risky_capabilities) or []
         updated.append("risky_capabilities")
+    if instructions is not None:
+        stripped = instructions.strip()
+        agent.instructions = "" if stripped.lower() == "none" else stripped
+        updated.append("instructions")
 
     return updated
 
@@ -551,7 +586,11 @@ def test(name: str, task: str, stream: bool, timeout: int | None) -> None:
             click.echo()
             click.echo(click.style(f"Note: {result.hint}", fg="yellow"))
         if result.cost_usd is not None:
-            click.echo(f"\n--- Cost: ${result.cost_usd:.4f} | Turns: {result.num_turns}")
+            tail = f"\n--- Cost: ${result.cost_usd:.4f} | Turns: {result.num_turns}"
+            if result.outcome:
+                color = "green" if result.outcome == "done" else "yellow"
+                tail += f" | Outcome: {click.style(result.outcome, fg=color)}"
+            click.echo(tail)
     else:
         click.echo(click.style(f"Error: {result.error}", fg="red"))
         if result.error_type == "permission":
@@ -614,6 +653,11 @@ def describe(name: str) -> None:
         click.echo(f"  capabilities:     {', '.join(agent.capabilities)}")
     if agent.risky_capabilities:
         click.echo(f"  risky_caps:       {', '.join(agent.risky_capabilities)}")
+    if agent.instructions:
+        first, *rest = agent.instructions.splitlines()
+        click.echo(f"  instructions:     {first}")
+        for line in rest:
+            click.echo(f"                    {line}")
     click.echo(f"  allowed_tools:    {_render_tools(agent.allowed_tools)}")
     click.echo(f"  disallowed_tools: {_render_tools(agent.disallowed_tools)}")
 
@@ -828,6 +872,15 @@ def doctor() -> None:
     claude_path = shutil.which("claude")
     if claude_path:
         ok(f"claude CLI: {claude_path}")
+        supported = _claude_supports_flag(claude_path, "--append-system-prompt")
+        if supported is True:
+            ok("claude CLI supports --append-system-prompt (dispatch protocol)")
+        elif supported is False:
+            warn("claude CLI predates --append-system-prompt: every dispatch will fail")
+            click.echo("    Upgrade claude, or set `settings.dispatch_protocol: false` and")
+            click.echo("    clear orders orders: agent-dispatch update <name> --instructions none")
+        else:
+            warn("Could not run `claude --help` to check --append-system-prompt support")
     else:
         fail("claude CLI not found on PATH")
         click.echo("    Install: https://docs.anthropic.com/en/docs/claude-code")
@@ -1048,6 +1101,9 @@ def job_show(job_id: str) -> None:
             click.echo(f"  cost_usd:   ${job.result.cost_usd:.4f}")
         if job.result.budget_exceeded:
             click.echo(click.style("  budget:     EXCEEDED", fg="yellow"))
+        if job.result.outcome:
+            color = "green" if job.result.outcome == "done" else "yellow"
+            click.echo(f"  outcome:    {click.style(job.result.outcome, fg=color)}")
         if job.result.result:
             preview = job.result.result[:2000]
             truncated = len(job.result.result) > 2000

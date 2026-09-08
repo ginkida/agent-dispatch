@@ -222,7 +222,7 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
     # won't drop them — prune empties so agents that never declare capabilities
     # stay clean in YAML instead of growing two empty-list keys on every save.
     for agent_data in data.get("agents", {}).values():
-        for key in ("capabilities", "risky_capabilities"):
+        for key in ("capabilities", "risky_capabilities", "instructions"):
             if not agent_data.get(key):
                 agent_data.pop(key, None)
     # `groups` also defaults to {} (not None), so exclude_none keeps it — prune

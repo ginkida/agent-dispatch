@@ -259,6 +259,23 @@ def test_save_config_prunes_empty_members(tmp_path: Path):
     assert load_config(f).groups["solo"].members == []
 
 
+def test_save_config_prunes_empty_instructions(tmp_path: Path):
+    f = tmp_path / "test.yaml"
+    config = DispatchConfig(
+        agents={
+            "quiet": AgentConfig(directory=tmp_path),
+            "ordered": AgentConfig(directory=tmp_path, instructions="Read-only."),
+        }
+    )
+    save_config(config, f)
+    raw = yaml.safe_load(f.read_text())["agents"]
+    assert "instructions" not in raw["quiet"]
+    assert raw["ordered"]["instructions"] == "Read-only."
+    loaded = load_config(f)
+    assert loaded.agents["quiet"].instructions == ""
+    assert loaded.agents["ordered"].instructions == "Read-only."
+
+
 class TestAtomicSave:
     """agents.yaml is the whole registry — a partial write must never be visible."""
 

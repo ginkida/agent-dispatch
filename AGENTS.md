@@ -28,7 +28,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 578 tests, ~5s
+python3 -m pytest tests/ -v   # 637 tests, ~15s
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`. The one exception is `TestStreamPipeHandling`, which spawns a short-lived *python* subprocess: a pipe deadlock lives in the OS pipe buffer, so a mocked `Popen` structurally cannot reproduce it.
@@ -60,7 +60,9 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - Pydantic does **not** validate on assignment. `Field(ge=...)` guards only the *load* path; every mutation surface (CLI `add`/`update`, MCP `add_agent`/`update_agent`) needs its own boundary check, or the bound escapes as a raw `ValidationError`.
 - Every state file (`agents.yaml`, job files) is written **temp file + `os.replace`**, never in place, and every load/mutate/save is wrapped in `config.ProcessLock` — the CLI and the MCP server are separate processes writing the same files, so a thread lock alone loses updates.
 - Anything that changes an agent's config must call `_invalidate_agent_cache` — the cache key holds the agent *name*, not its directory or permissions.
-- Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, and `budget_exceeded` results, so the documented "grant access, then re-dispatch" recovery is never short-circuited.
+- Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, `budget_exceeded` results, and results whose `outcome` is `partial`/`blocked`, so the documented "grant access / fix the cause, then re-dispatch" recovery is never short-circuited.
+- **The dispatch protocol goes in the system prompt, not the task.** `_build_system_prompt` (runner.py) renders the protocol (non-interactive, time/spend budget, lead with the outcome, trailing `STATUS:` line) plus the agent's `instructions`, and `_build_command` passes it as `--append-system-prompt` — on `--resume` too, since the CLI re-applies an appended prompt on every launch. `_build_prompt` (the `-p` text) is unchanged, so the cache key is unchanged. The text always starts with a `##` header line so it can never be read as a flag. `settings.dispatch_protocol: false` turns the protocol off (for CLIs that predate the flag; `doctor` probes `claude --help` for it); per-agent `instructions` still go through when set.
+- **`outcome` is lifted from the LAST line of the result** (`_split_outcome`), before JSON parsing, by the shared `_build_success_result` (the success-side twin of `_build_error_result` — both `dispatch` and `dispatch_stream` go through it) and by the plain-text fallback tier. A bare marker line is removed from `result`; a marker with a trailing reason stays. `outcome` never flips `success`; `partial`/`blocked` add a `hint` with the `dispatch_session(...)` continuation, after the denial hint. In JSON mode the protocol omits the STATUS instruction (the JSON footer governs), but a STATUS line that arrives anyway is still stripped so `parsed_result` survives.
 - Remediation text is a contract: a hint that names a flag must name one that exists (`test_printed_budget_hint_is_a_runnable_command` feeds the printed flags back into the CLI). Run the command you print.
 - The config error sets are declared **once** and in two halves: `config.CONFIG_LOAD_ERRORS` (read) and `config.CONFIG_SAVE_ERRORS` (write — `yaml.dump`'s `RepresenterError` is a `yaml.YAMLError`, therefore neither `OSError` nor `ConfigLoadError`, and used to escape both the MCP guard and the CLI's `_save_or_exit`). Two halves, not one set, because the remediations differ: a failed write is atomic so the old config survives, while a failed read needs the YAML fixed.
 - MCP tools that load config carry `@_config_guard` under `@mcp.tool()` so a broken `agents.yaml` — or a failed *write* — returns the `{"error": ...}` envelope instead of a raw traceback. The set of load errors lives in one place (`config.CONFIG_LOAD_ERRORS`) because three surfaces handle it: **`UnicodeDecodeError` is a `ValueError`, not an `OSError`**, and listing types per-site is exactly how a cp1251 config slipped past all three.
@@ -85,4 +87,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 578 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 637 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

@@ -102,6 +102,12 @@ class DispatchCache:
             # serve the same crippled answer back for the whole TTL and make that
             # recovery a no-op (the permission config is not part of the key).
             return
+        if result.outcome in ("partial", "blocked"):
+            # The agent itself says the work is unfinished. Whatever it was
+            # missing (a service that was down, a file that did not exist yet)
+            # is not in the key either, so a retry after fixing it would be
+            # served the same unfinished answer for the whole TTL.
+            return
         key = self._make_key(agent, task, context, caller, goal, response_format)
         with self._lock:
             # Bound memory: when at capacity and inserting a new key, evict the

@@ -190,7 +190,8 @@ dispatch(
   "session_id": "sess-abc-123",
   "cost_usd": 0.02,
   "duration_ms": 5000,
-  "num_turns": 2
+  "num_turns": 2,
+  "outcome": "done"
 }
 
 // Response (failure — error_type helps you handle programmatically)
@@ -246,6 +247,30 @@ Error: TypeError at scheduler.py:42
 
 ## Task
 Check container logs for recent errors related to the scheduler service
+```
+
+**The dispatch protocol and `outcome`.** `claude -p` on its own does not know it is being driven by another agent: given an ambiguous task it will happily end with *"Could you clarify which service you mean?"* — a billed run that answered nothing, and one that a plain cache would then serve again for the whole TTL. So every dispatch also appends a short **dispatch protocol** to the agent's system prompt (`--append-system-prompt`, never mixed into your task text):
+
+- it is running non-interactively, dispatched by `caller`, and nobody will answer a question or approve an action — state the assumption and proceed, take the safer reading when two differ;
+- a denied tool or a missing thing is something to report, not something to stop on — finish everything else that is possible;
+- its time budget is about the agent's timeout (and its spend cap, if one is set) — scope the work to fit; a complete partial answer beats an unfinished perfect one;
+- lead with the outcome, then the evidence; list what could not be done and why (this is what makes a `return_ref` summary — the **head** of the text — worth reading);
+- end with one line, `STATUS: done`, `STATUS: partial` or `STATUS: blocked`.
+
+That last line is lifted out of `result` into **`outcome`** — the agent's own verdict, deterministic to check: `"done"` means complete; `"partial"` / `"blocked"` mean the agent says the work is unfinished, the result names what is missing, and a `hint` spells out the continuation (usually `dispatch_session(..., session_id=...)`). Read `outcome` before reading the text. It never flips `success`, `partial` / `blocked` results are **not cached**, and a `dispatch_parallel(..., aggregate=...)` labels such members for the aggregator so a blocked report is not synthesized as a finished one. Absent when the agent did not report one — the protocol is off (`settings.dispatch_protocol: false`), `response_format="json"` was requested (the JSON footer governs the reply shape there), or the agent simply skipped it.
+
+**Standing orders.** Per-agent `instructions` (set via `add_agent` / `update_agent` or `agent-dispatch update <name> --instructions "..."`) follow the protocol in the same system prompt on **every** dispatch — "read-only SQL only", "never restart a stack unless the task says so", "answer with exact log lines". Unlike `context`, which is per call, and unlike the project's own `CLAUDE.md`, which is written for an interactive session, these are the rules for *being dispatched*.
+
+```json
+// Response (success, but the agent says it did not finish)
+{
+  "agent": "infra",
+  "success": true,
+  "result": "Restarted horizon. Could not verify the queue drained: the redis container is not reachable from here.",
+  "session_id": "sess-abc-123",
+  "outcome": "partial",
+  "hint": "The agent reports its work is PARTIAL — read the result for what is missing, then continue in the same session via dispatch_session(agent='infra', task='Continue where you left off', session_id='sess-abc-123') or re-dispatch with what it needed."
+}
 ```
 
 ### `dispatch_session`
@@ -365,6 +390,7 @@ Register a new project directory as an agent. Description is auto-generated from
 | `disallowed_tools` | string | no | Comma-separated disallowed tools |
 | `capabilities` | string | no | Comma-separated capability labels (e.g. `"docker_logs,deploy_debug"`) |
 | `risky_capabilities` | string | no | Comma-separated high-risk labels (e.g. `"restart_services"`) |
+| `instructions` | string | no | Standing orders appended to the agent's system prompt on every dispatch (see [the dispatch protocol](#dispatch)) |
 
 ### `update_agent`
 
@@ -382,6 +408,7 @@ Update an existing agent's configuration. Only non-empty fields are changed. Pas
 | `disallowed_tools` | string | no | Comma-separated. `"none"` to clear |
 | `capabilities` | string | no | Comma-separated. `"none"` to clear |
 | `risky_capabilities` | string | no | Comma-separated. `"none"` to clear |
+| `instructions` | string | no | Standing orders for every dispatch (replaces the text). `"none"` to clear |
 
 Changing an agent's config drops that agent's cached results — the cache key holds the agent *name*, so a re-pointed or re-permissioned agent would otherwise keep answering from the previous config for the rest of the TTL. The same applies to `add_agent` and `remove_agent`.
 
@@ -485,6 +512,7 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 Three soft signals that arrive with `success: true`:
 
 - **`denied_tools` + `hint`** — the agent finished but some tool calls were blocked; the result may be incomplete. Grant access (see the `permission` row) and re-dispatch.
+- **`outcome: "partial"` / `"blocked"`** — the agent's own verdict that it did not finish; the result names what is missing and the `hint` carries the `dispatch_session(...)` call to continue in the same session. Not cached, so a re-dispatch after fixing the cause runs fresh.
 - **`parsed_result: null` with `response_format="json"`** — the reply wasn't valid JSON; the raw text is still in `result`. Caveat: an agent that *can't* comply returns `{"error": "<reason>"}` — which parses successfully — so also check `parsed_result` for an `"error"` key.
 - **`budget_exceeded: true`** — `cost_usd` came in over the agent's `max_budget_usd` (or the settings default) without the CLI stopping the run (the final turn can overshoot the cap). The dispatch is not failed — the money is already spent — but a runaway agent is now visible. Tighten the task, pick a cheaper model, or raise the budget. A run the CLI *did* stop fails with `error_type: "budget"` instead.
 
@@ -509,6 +537,9 @@ agents:
       - deploy_debug
     risky_capabilities:     # high-risk labels, surfaced for visibility
       - restart_services
+    # instructions: |       # standing orders, appended to the system prompt on every dispatch
+    #   Read-only: never restart or redeploy unless the task says so.
+    #   Quote exact log lines with timestamps.
     # model: sonnet         # optional model override
     # max_budget_usd: 1.0   # cost limit per dispatch
     # permission_mode: bypassPermissions  # one of: default | plan | bypassPermissions
@@ -544,6 +575,8 @@ settings:
   #   - Edit
   max_dispatch_depth: 3     # recursion protection
   max_concurrency: 5        # max parallel claude -p processes (per dispatch path)
+  # dispatch_protocol: true # send every agent the dispatch protocol (non-interactive,
+  #                         # time budget, STATUS line → `outcome`). false = raw claude -p.
   # job_retention_days: 30  # 0 (default) = never prune. See "Job retention" below.
   cache:
     enabled: true
@@ -616,8 +649,9 @@ agent-dispatch MCP server
        ▼
      New Claude Code session in ~/projects/infra/
        ├─ Inherits: CLAUDE.md, .mcp.json, project tools
+       ├─ System prompt += dispatch protocol + the agent's standing `instructions`
        ├─ Receives structured prompt with goal/caller/context/task
-       └─ Returns result → cached for future identical requests
+       └─ Returns result (+ its own STATUS → `outcome`) → cached when complete
 ```
 
 ## Safety
@@ -629,7 +663,7 @@ agent-dispatch MCP server
 - **Cost control** — `max_budget_usd` per agent or globally is passed to the `claude` CLI as `--max-budget-usd`, so a runaway dispatch is stopped at the cap and comes back as `error_type: "budget"` with a resumable `session_id`. An overshoot that lands over budget without stopping is flagged post-hoc with `budget_exceeded: true` + a hint.
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). A streaming dispatch runs the agent in its own process group, so the deadline kills the whole tree: a process the agent left running in the background can't hold the dispatch (and its concurrency slot) open past the timeout.
-- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, and results flagged `budget_exceeded` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
+- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, results flagged `budget_exceeded`, and results the agent itself reported as `partial` / `blocked` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
 - **Durable config** — `agents.yaml` is written atomically (temp file + rename), so an interrupted write can never truncate it. Every mutation path (CLI and MCP server alike) also takes a cross-process advisory lock, so concurrent edits don't drop one another's agents. The lock is best-effort by design: after waiting 10 seconds it logs a warning and proceeds anyway, because a wedged lock holder must not freeze the MCP server — so on a heavily contended config a lost update is possible, while a truncated one is not.
 
 See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
@@ -640,13 +674,13 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 |---------|-------------|
 | `agent-dispatch init` | Create config + register MCP server with Claude Code |
 | `agent-dispatch add <name> <dir>` | Add an agent (auto-generates description) |
-| `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, etc.) |
+| `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, `--instructions`, etc.) |
 | `agent-dispatch remove <name>` | Remove an agent |
 | `agent-dispatch list` | List agents with health status and permissions |
 | `agent-dispatch group <add\|list\|inspect\|update\|remove>` | Manage [groups](#groups) — cross-project working sets of agents |
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
-| `agent-dispatch doctor` | Diagnose installation: Claude CLI, MCP registration, agent health, and group membership |
+| `agent-dispatch doctor` | Diagnose installation: Claude CLI (incl. `--append-system-prompt` support), MCP registration, agent health, and group membership |
 | `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
 | `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
 | `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |
