@@ -104,12 +104,15 @@ Lists all configured agents. **Call this first** to see what's available.
     "capabilities": ["docker_logs", "deploy_debug"],
     "risky_capabilities": ["restart_services"],
     "permission_mode": "bypassPermissions",
-    "allowed_tools": ["Bash", "Read", "Grep"]
+    "allowed_tools": ["Bash", "Read", "Grep"],
+    "typical": {"median_seconds": 143.3, "p90_seconds": 178.3, "median_cost_usd": 0.2666}
   }
 ]
 ```
 
 `mcp_servers`, `stacks`, and `dbs` are detected from the agent's project files (`.mcp.json`, `Dockerfile`, `pyproject.toml`, `Cargo.toml`, `prisma/`, `alembic.ini`, etc.) so callers can pick the right agent without dispatching a probe.
+
+`typical` is **measured**, not declared: it comes from this agent's own recent dispatches in the [usage journal](#usage-journal--what-your-fleet-actually-costs) and appears only after a few runs. Use it to size `timeout_seconds` and to know what a call will cost before you make it. It is absent when the journal is off or the agent has too little history — no data is better than a typical duration derived from two runs.
 
 ### `inspect_agent`
 
@@ -121,6 +124,15 @@ Cheap detailed lookup — reads the agent's files without spawning a `claude` se
 | `preview_lines` | int | no | Max lines of CLAUDE.md/README.md (default 40, max 200, 0 disables) |
 
 Use this **before** `dispatch_async`/`dispatch` to confirm an agent has the tools and context for your task — much cheaper than a probe dispatch.
+
+It also carries the agent's `instructions` (its standing orders) and the full `typical` block — the trimmed one in `list_agents` plus `dispatches`, `failed` and the `outcomes` breakdown:
+
+```json
+"typical": {
+  "dispatches": 24, "median_seconds": 143.3, "p90_seconds": 178.3,
+  "median_cost_usd": 0.2666, "failed": 1, "outcomes": {"done": 21, "partial": 2}
+}
+```
 
 ### Groups
 
@@ -204,7 +216,7 @@ dispatch(
 }
 ```
 
-**`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `budget` (the `claude` CLI stopped the session at `max_budget_usd`), `cli_error` (other failures). Permission and budget errors include an actionable hint.
+**`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `budget` (the `claude` CLI stopped the session at `max_budget_usd`), `usage_limit` (the Claude *account* hit its rate/session limit), `cli_error` (other failures). Permission, budget, usage-limit and timeout errors include an actionable hint.
 
 **Resumable timeouts:** every fresh dispatch pre-assigns a session UUID (`--session-id`), so a timed-out dispatch still returns a `session_id` — the partial transcript survives the kill. The timeout error spells out the recovery: resume with `dispatch_session(agent, "Continue where you left off", session_id=...)`, retry with a bigger `timeout_seconds`, or use `dispatch_async`.
 
@@ -503,10 +515,11 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 | `error_type` | Meaning | Recovery |
 |--------------|---------|----------|
 | `permission` | A tool call was denied | `update_agent(name, allowed_tools="Bash,Read")` (least privilege) or `update_agent(name, permission_mode="bypassPermissions")`, then re-dispatch. The `error` text includes a hint with the exact fix. |
-| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=`, or use `dispatch_async`. A *streaming* dispatch that produced its answer before the deadline returns that answer with a `hint` instead of failing. |
+| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=` — once the journal has history the error names the value that would have covered this agent's p90 — or use `dispatch_async`. A *streaming* dispatch that produced its answer before the deadline returns that answer with a `hint` instead of failing. |
 | `not_found` | Agent directory or `claude` CLI missing | `list_agents()` → check `healthy`. Re-add the agent with an existing path, or run `agent-dispatch doctor` to find what's missing. |
 | `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
 | `budget` | The `claude` CLI ended the session at the `max_budget_usd` spend cap — the answer is incomplete | Raise the cap (`update_agent(name, max_budget_usd=2.0)`), switch to a cheaper `model`, or split the task. The partial session is resumable: `dispatch_session(agent, "Continue where you left off", session_id=<from the result>)`. |
+| `usage_limit` | The Claude **account** hit its usage/rate limit — not this agent, and nothing was billed | Wait for the reset named in the `error` text. Dispatching a *different* agent is not a workaround: every agent runs on the same account. If it recurs under load, lower `settings.max_concurrency`. |
 | `cli_error` | Anything else from the `claude` subprocess | Read the `error` text; run `agent-dispatch doctor` for environment issues; retry once if transient. |
 
 Three soft signals that arrive with `success: true`:
@@ -577,6 +590,9 @@ settings:
   max_concurrency: 5        # max parallel claude -p processes (per dispatch path)
   # dispatch_protocol: true # send every agent the dispatch protocol (non-interactive,
   #                         # time budget, STATUS line → `outcome`). false = raw claude -p.
+  # usage_log: true         # record every dispatch in usage.jsonl (cost, duration, outcome).
+  #                         # Powers `agent-dispatch stats`, the `typical` block and the
+  #                         # measured timeout suggestion. false = record nothing.
   # job_retention_days: 30  # 0 (default) = never prune. See "Job retention" below.
   cache:
     enabled: true
@@ -585,6 +601,42 @@ settings:
 ```
 
 Config is reloaded on every tool call — add agents without restarting.
+
+### Usage journal — what your fleet actually costs
+
+Every dispatch appends one line to `~/.config/agent-dispatch/usage.jsonl`
+(override with `AGENT_DISPATCH_USAGE_LOG`): agent, success, cost, duration,
+turns, `outcome`, error type, caller. Cache hits are recorded too, flagged
+`cached`, so the report can show what the cache saves.
+
+```console
+$ agent-dispatch stats --days 7
+Usage (last 7 day(s))
+  dispatches: 33, 1 served from cache
+  spend:      $13.0390
+  duration:   median 87s, p90 2m40s, max 10m00s
+  outcomes:   blocked 1, done 27, partial 3
+  failures:   timeout 1, usage_limit 1
+
+Per agent
+  analytic           18 runs  $  8.9441  median  2m04s  p90  2m51s
+      done 15, partial 3
+  gitlab             12 runs  $  3.7949  median    60s  p90    86s
+      done 12  |  1 cached
+```
+
+`--agent NAME` narrows it, `--json` emits the same report as JSON.
+
+The journal is what makes three other things work: the `typical` block in
+`list_agents` / `inspect_agent`, the timeout error naming a value derived from
+the agent's real p90 instead of a doubling guess, and any answer at all to
+"which agent is expensive". Turn it off with `usage_log: false` in settings.
+
+Properties worth knowing: the file is owner-only (`0o600`); each record is a
+single `O_APPEND` write capped well under `PIPE_BUF`, so the CLI and every
+running server can share it with no lock and no torn lines; it rotates to
+`usage.jsonl.1` at ~2 MB and keeps two generations, so it is bounded at ~4 MB
+forever. A failure to write it can never fail a dispatch.
 
 ### Job retention
 
@@ -652,6 +704,8 @@ agent-dispatch MCP server
        ├─ System prompt += dispatch protocol + the agent's standing `instructions`
        ├─ Receives structured prompt with goal/caller/context/task
        └─ Returns result (+ its own STATUS → `outcome`) → cached when complete
+                    │
+                    └─ one line appended to usage.jsonl (cost, duration, outcome)
 ```
 
 ## Safety
@@ -659,7 +713,7 @@ agent-dispatch MCP server
 - **Recursion protection** — `AGENT_DISPATCH_DEPTH` env var tracks nesting. Default limit: 3. Best-effort across the subprocess boundary (see [SECURITY.md](SECURITY.md)).
 - **Argument-injection guard** — structured CLI fields (`session_id`, `model`, `permission_mode`, tool names) that start with `-` are rejected so they can't smuggle extra `claude` flags.
 - **Path-traversal guard** — caller-supplied `job_id`/`ref` values are validated as 32-char hex before any filesystem access.
-- **Owner-only state** — job files (`0o600`) and `agents.yaml` (`0o600`) are written for the owner only; their directories are `0o700`.
+- **Owner-only state** — job files, `agents.yaml`, the usage journal and the server registry are all written `0o600`; their directories are `0o700`.
 - **Cost control** — `max_budget_usd` per agent or globally is passed to the `claude` CLI as `--max-budget-usd`, so a runaway dispatch is stopped at the cap and comes back as `error_type: "budget"` with a resumable `session_id`. An overshoot that lands over budget without stopping is flagged post-hoc with `budget_exceeded: true` + a hint.
 - **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
 - **Timeout** — per-agent or global (default: 300s). A streaming dispatch runs the agent in its own process group, so the deadline kills the whole tree: a process the agent left running in the background can't hold the dispatch (and its concurrency slot) open past the timeout.
@@ -680,7 +734,8 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch group <add\|list\|inspect\|update\|remove>` | Manage [groups](#groups) — cross-project working sets of agents |
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
-| `agent-dispatch doctor` | Diagnose installation: Claude CLI (incl. `--append-system-prompt` support), MCP registration, agent health, and group membership |
+| `agent-dispatch stats [--days N --agent X --json]` | What dispatches cost: spend, durations, outcomes and failures per agent |
+| `agent-dispatch doctor` | Diagnose installation: Claude CLI (incl. `--append-system-prompt` support), running servers on stale code, MCP registration, agent health, and group membership |
 | `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
 | `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
 | `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |

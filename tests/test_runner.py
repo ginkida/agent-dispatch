@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent_dispatch import usage
 from agent_dispatch.models import AgentConfig, Settings
 from agent_dispatch.runner import (
     ArgInjectionError,
@@ -2134,3 +2135,190 @@ class TestOutcomeThroughDispatch:
         result = dispatch("infra", "hello", self.agent, self.settings)
         assert result.outcome is None
         assert "outcome" not in result.model_dump_json(exclude_none=True)
+
+
+def _ok_stdout(**extra) -> str:
+    payload = {"result": "ok", "is_error": False, "session_id": "s1", "total_cost_usd": 0.02}
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+class TestUsageJournaling:
+    """Every dispatch lands in the usage journal — that is what makes spend visible."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_success_is_recorded_with_cost_duration_and_outcome(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=_ok_stdout(result="done here\nSTATUS: done", duration_ms=4200, num_turns=3),
+            stderr="",
+        )
+        dispatch("infra", "hello", self.agent, self.settings, caller="taylor")
+        (entry,) = usage.load()
+        assert entry["agent"] == "infra"
+        assert entry["ok"] is True
+        assert entry["cost"] == 0.02
+        assert entry["ms"] == 4200
+        assert entry["turns"] == 3
+        assert entry["outcome"] == "done"
+        assert entry["caller"] == "taylor"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_failures_are_recorded_with_their_error_type(self, mock_run, _which):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
+        dispatch("infra", "hello", self.agent, self.settings)
+        (entry,) = usage.load()
+        assert entry["ok"] is False
+        assert entry["err"] == "timeout"
+        # No CLI duration on a timeout: wall time stands in, so the agent still
+        # shows up as "takes its whole budget" instead of as missing data.
+        assert entry["ms"] >= 0
+
+    @patch("agent_dispatch.runner.shutil.which", return_value=None)
+    def test_even_a_pre_flight_failure_is_recorded(self, _which):
+        dispatch("infra", "hello", self.agent, self.settings)
+        (entry,) = usage.load()
+        assert entry["err"] == "not_found"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_usage_log_false_records_nothing(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_ok_stdout(), stderr=""
+        )
+        dispatch("infra", "hello", self.agent, Settings(usage_log=False))
+        assert usage.load() == []
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_records_once(self, mock_popen, _which):
+        line = json.dumps({"type": "result", "result": "ok", "is_error": False})
+        mock_popen.return_value = _FakePopen([line])
+        dispatch_stream("infra", "go", self.agent, self.settings)
+        assert len(usage.load()) == 1
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_the_old_cli_retry_records_one_dispatch_not_two(self, mock_popen, _which):
+        # dispatch_stream re-enters itself for the no---session-id retry; without
+        # the _use_session_flag guard one dispatch would be journalled twice and
+        # every spend figure would drift high.
+        line = json.dumps({"type": "result", "result": "ok", "is_error": False})
+        rejected = _FakePopenWithStderr(
+            [], returncode=1, stderr_text="error: unknown option '--session-id'"
+        )
+        mock_popen.side_effect = [rejected, _FakePopen([line])]
+        result = dispatch_stream("infra", "go", self.agent, self.settings)
+        assert result.success
+        assert mock_popen.call_count == 2
+        assert len(usage.load()) == 1
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_a_broken_journal_never_breaks_a_paid_dispatch(self, mock_run, _which, monkeypatch):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_ok_stdout(), stderr=""
+        )
+
+        def _explode(*_args, **_kwargs):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(usage, "record", _explode)
+        # The wrapper must not let a journal failure destroy a completed result.
+        with pytest.raises(OSError):
+            usage.record("x", ok=True)  # sanity: the patch really raises
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.success
+
+
+class TestUsageLimitClassification:
+    """The account's own rate limit is its own error type, observed live."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    def test_classifier_recognizes_the_real_message(self):
+        # Verbatim from claude 2.1.263 on 2026-09-09.
+        assert (
+            _classify_error("You've hit your session limit · resets 6pm (Asia/Almaty)")
+            == "usage_limit"
+        )
+        assert _classify_error("Rate limit exceeded, try again later") == "usage_limit"
+        assert _classify_error("429 too many requests") == "usage_limit"
+
+    def test_a_permission_error_is_still_a_permission_error(self):
+        assert _classify_error("permission denied for tool Bash") == "permission"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_the_hint_names_the_reset_and_the_account_wide_scope(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="You've hit your session limit · resets 6pm (Asia/Almaty)",
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.error_type == "usage_limit"
+        assert "resets 6pm" in result.error
+        assert "ACCOUNT" in result.error
+        # The actionable part: another agent is not a workaround.
+        assert "different agent" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_the_stream_path_classifies_it_too(self, mock_popen, _which):
+        mock_popen.return_value = _FakePopenWithStderr(
+            [], returncode=1, stderr_text="You've hit your session limit · resets 6pm"
+        )
+        result = dispatch_stream("infra", "go", self.agent, self.settings)
+        assert result.error_type == "usage_limit"
+        assert "ACCOUNT" in result.error
+
+
+class TestTimeoutSuggestion:
+    """ "Use a longer timeout" becomes a number once there is history."""
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_suggests_a_value_derived_from_real_runs(self, mock_run, _which):
+        for _ in range(5):
+            usage.record("infra", ok=True, duration_ms=100_000)
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.error_type == "timeout"
+        assert "timeout_seconds=150" in result.error
+        assert "--timeout 150" in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_falls_back_to_doubling_without_history(self, mock_run, _which):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert "--timeout 20" in result.error
+        assert "suggest" not in result.error
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.run")
+    def test_a_suggestion_below_the_current_timeout_is_not_offered(self, mock_run, _which):
+        # The agent normally answers in a second; this run failed for some other
+        # reason, and telling the caller to *lower* the timeout would be wrong.
+        for _ in range(5):
+            usage.record("infra", ok=True, duration_ms=500)
+        agent = AgentConfig(directory="/tmp", description="test", timeout=600)
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=600)
+        result = dispatch("infra", "hello", agent, self.settings)
+        assert "--timeout 1200" in result.error
+        assert "suggest" not in result.error

@@ -16,7 +16,7 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import runner
+from . import __version__, runner, servers, usage
 from .cache import DispatchCache
 from .config import (
     CONFIG_LOAD_ERRORS,
@@ -308,6 +308,17 @@ def _apply_timeout(agent_config: AgentConfig, timeout_seconds: int) -> AgentConf
     return agent_config.model_copy(update={"timeout": clamped})
 
 
+def _record_cache_hit(config: DispatchConfig, agent: str, caller: str | None) -> None:
+    """Journal a served-from-cache dispatch.
+
+    Recorded here rather than in the runner because a cache hit never reaches
+    it — and a journal that silently omitted every hit would overstate what the
+    fleet actually costs to run and hide how much the cache is earning.
+    """
+    if config.settings.usage_log:
+        usage.record(agent, ok=True, cached=True, caller=caller or None)
+
+
 def _ref_payload(
     job_id: str,
     result: DispatchResult,
@@ -519,6 +530,10 @@ async def list_agents(ctx: Context | None = None) -> str:
             indent=2,
         )
 
+    # One journal read for the whole listing, not one per agent: this is the
+    # discovery call, and re-parsing the tail six times would undo the point.
+    usage_profiles = usage.profiles() if config.settings.usage_log else {}
+
     agents = []
     for name, agent in config.agents.items():
         # is_dir() can raise OSError (PermissionError, network FS hiccup, etc.).
@@ -570,6 +585,16 @@ async def list_agents(ctx: Context | None = None) -> str:
             entry["capabilities"] = agent.capabilities
         if agent.risky_capabilities:
             entry["risky_capabilities"] = agent.risky_capabilities
+        # Measured, not promised: how long this agent's real runs take and what
+        # they cost, so a caller can size timeout_seconds without a probe.
+        # Trimmed here (inspect_agent carries the full profile) — this listing
+        # is read on every discovery pass and pays for every byte.
+        if profile := usage_profiles.get(name):
+            entry["typical"] = {
+                k: profile[k]
+                for k in ("median_seconds", "p90_seconds", "median_cost_usd")
+                if k in profile
+            }
         agents.append(entry)
     if ctx:
         await ctx.info(f"Found {len(agents)} configured agents")
@@ -643,6 +668,10 @@ async def inspect_agent(
         info["risky_capabilities"] = agent.risky_capabilities
     if agent.instructions:
         info["instructions"] = agent.instructions
+    # What this agent has actually cost and taken, so the caller can size
+    # timeout_seconds from data instead of from the description's prose.
+    if config.settings.usage_log and (profile := usage.agent_profile(name)):
+        info["typical"] = profile
 
     try:
         healthy = agent.directory.is_dir()
@@ -860,6 +889,7 @@ async def dispatch(
             rf,
         )
         if cached:
+            _record_cache_hit(config, agent, caller)
             if ctx:
                 await ctx.info(f"Cache hit for {agent} — returning cached result")
             if return_ref:
@@ -1109,6 +1139,7 @@ async def dispatch_parallel(
                 item_rf,
             )
             if cached:
+                _record_cache_hit(config, name, item_caller)
                 if item_return_ref:
                     store = _get_job_store()
                     job = store.create_completed(
@@ -2286,4 +2317,9 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     _startup_maintenance()
+    # Announce which code this session is actually running. A server keeps its
+    # modules in memory for life, so an upgrade reaches an open Claude Code
+    # session only when that session restarts; `agent-dispatch doctor` reads
+    # this registry to name the sessions still on an old release.
+    servers.register(__version__)
     mcp.run(transport="stdio")

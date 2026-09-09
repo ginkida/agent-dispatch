@@ -7,8 +7,35 @@ from pathlib import Path
 
 import pytest
 
+from agent_dispatch import servers, usage
 from agent_dispatch.config import save_config
 from agent_dispatch.models import AgentConfig, DispatchConfig, Settings
+
+
+@pytest.fixture(autouse=True)
+def _isolated_local_state(tmp_path: Path, monkeypatch):
+    """Redirect the usage journal and server registry into tmp_path for EVERY test.
+
+    `runner.dispatch` records each result, and runner tests build a bare
+    `Settings()` with no config env override — without this fixture a plain
+    `pytest` run appended a hundred fake "test"/"infra" dispatches to the
+    developer's real ~/.config/agent-dispatch/usage.jsonl (observed, then
+    cleaned, on 2026-09-09). Same rationale as the config/jobs redirects in
+    test_server.py's `_reset_globals`.
+    """
+    monkeypatch.setenv("AGENT_DISPATCH_USAGE_LOG", str(tmp_path / "usage.jsonl"))
+    # Same reasoning for the live-server registry: `doctor` reads it, so without
+    # this a test's output would depend on how many real MCP servers happen to
+    # be running on the developer's machine.
+    monkeypatch.setenv("AGENT_DISPATCH_SERVERS_DIR", str(tmp_path / "servers"))
+    # The profile memo is a module-level global keyed by the journal's
+    # fingerprint; clearing it keeps one test's timings out of the next.
+    usage._profile_memo = None
+    yield
+    usage._profile_memo = None
+    if servers._registration_fd is not None:  # a test that registered this process
+        os.close(servers._registration_fd)
+        servers._registration_fd = None
 
 
 @pytest.fixture()

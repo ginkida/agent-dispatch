@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent_dispatch import server
+from agent_dispatch import server, usage
 from agent_dispatch.models import (
     AgentConfig,
     CacheSettings,
@@ -3481,3 +3481,119 @@ class TestInstructionsAndOutcome:
             await server.dispatch("infra", "t", return_ref=True)
             jobs = json.loads(await server.dispatch_jobs())
         assert jobs[0]["outcome"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# Usage journal surface: cache hits, measured timings in discovery
+# ---------------------------------------------------------------------------
+
+
+class TestUsageSurface:
+    @pytest.mark.asyncio
+    async def test_a_cache_hit_is_journalled_as_cached(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            # The real runner journals its own call; the fake stands in for it,
+            # so only the server's cache-hit record should appear here.
+            return _ok_dispatch_result(name, "answer")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "task", caller="taylor")
+            assert json.loads(await server.dispatch("infra", "task", caller="taylor"))["cached"]
+
+        entries = usage.load()
+        assert len(entries) == 1
+        assert entries[0] == {
+            **entries[0],
+            "agent": "infra",
+            "ok": True,
+            "cached": True,
+            "caller": "taylor",
+        }
+
+    @pytest.mark.asyncio
+    async def test_parallel_cache_hits_are_journalled_too(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, "answer")
+
+        dispatches = json.dumps([{"agent": "infra", "task": "t"}])
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch_parallel(dispatches)
+            await server.dispatch_parallel(dispatches)
+        assert [e.get("cached") for e in usage.load()] == [True]
+
+    @pytest.mark.asyncio
+    async def test_usage_log_false_records_no_cache_hits(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        config.settings.usage_log = False
+
+        def fake_dispatch(name, task, agent_config, settings, context=None, **kw):
+            return _ok_dispatch_result(name, "answer")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", side_effect=fake_dispatch),
+        ):
+            await server.dispatch("infra", "task")
+            await server.dispatch("infra", "task")
+        assert usage.load() == []
+
+    @pytest.mark.asyncio
+    async def test_inspect_agent_reports_measured_timing_and_cost(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        for _ in range(4):
+            usage.record("infra", ok=True, duration_ms=90_000, cost_usd=0.4, outcome="done")
+        with patch.object(server, "_get_config", return_value=config):
+            info = json.loads(await server.inspect_agent("infra", preview_lines=0))
+        assert info["typical"] == {
+            "dispatches": 4,
+            "median_seconds": 90.0,
+            "p90_seconds": 90.0,
+            "median_cost_usd": 0.4,
+            "outcomes": {"done": 4},
+        }
+
+    @pytest.mark.asyncio
+    async def test_list_agents_carries_a_trimmed_profile(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        for _ in range(4):
+            usage.record("infra", ok=True, duration_ms=30_000, cost_usd=0.1, outcome="done")
+        with patch.object(server, "_get_config", return_value=config):
+            agents = json.loads(await server.list_agents(ctx=AsyncMock()))
+        by_name = {a["name"]: a for a in agents}
+        # The listing pays for every byte: numbers a caller acts on, no histogram.
+        assert by_name["infra"]["typical"] == {
+            "median_seconds": 30.0,
+            "p90_seconds": 30.0,
+            "median_cost_usd": 0.1,
+        }
+        assert "typical" not in by_name["db"]  # no history, no claim
+
+    @pytest.mark.asyncio
+    async def test_thin_history_produces_no_typical_block(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        usage.record("infra", ok=True, duration_ms=30_000)
+        with patch.object(server, "_get_config", return_value=config):
+            info = json.loads(await server.inspect_agent("infra", preview_lines=0))
+            agents = json.loads(await server.list_agents(ctx=AsyncMock()))
+        assert "typical" not in info
+        assert all("typical" not in a for a in agents)
+
+    @pytest.mark.asyncio
+    async def test_discovery_survives_a_corrupt_journal(self, tmp_path: Path):
+        config = _make_config(tmp_path)
+        usage.journal_path().write_text("}} not json\n", encoding="utf-8")
+        with patch.object(server, "_get_config", return_value=config):
+            agents = json.loads(await server.list_agents(ctx=AsyncMock()))
+            info = json.loads(await server.inspect_agent("infra", preview_lines=0))
+        assert len(agents) == 4
+        assert info["name"] == "infra"

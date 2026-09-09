@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1632,3 +1634,113 @@ class TestDoctorProtocolProbe:
             result = runner.invoke(cli, ["doctor"])
         assert "Could not run `claude --help`" in result.output
         assert result.exit_code == 0
+
+
+class TestStatsCommand:
+    """`agent-dispatch stats` is the human answer to "what did this fleet cost"."""
+
+    def _seed(self) -> None:
+        from agent_dispatch import usage
+
+        for _ in range(4):
+            usage.record("analytic", ok=True, cost_usd=0.5, duration_ms=120_000, outcome="done")
+        usage.record("analytic", ok=True, cost_usd=0.2, duration_ms=60_000, outcome="partial")
+        usage.record("gitlab", ok=False, error_type="usage_limit", duration_ms=1_000)
+        usage.record("gitlab", ok=True, cached=True)
+
+    def test_empty_state_explains_where_to_look(self):
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0
+        assert "No dispatches recorded" in result.output
+        assert "usage.jsonl" in result.output
+        assert "settings.usage_log" in result.output
+
+    def test_reports_spend_durations_outcomes_and_failures(self):
+        self._seed()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "dispatches: 6, 1 served from cache" in result.output
+        assert "$2.2000" in result.output
+        assert "done 4, partial 1" in result.output
+        assert "usage_limit 1" in result.output
+        # Per-agent block, biggest spender first.
+        assert result.output.index("analytic") < result.output.index("gitlab")
+        assert "5 runs" in result.output
+        assert "1 run " in result.output
+
+    def test_agent_filter_and_json_output(self):
+        self._seed()
+        result = runner.invoke(cli, ["stats", "--agent", "gitlab", "--json"])
+        assert result.exit_code == 0
+        report = json.loads(result.output)
+        assert set(report["agents"]) == {"gitlab"}
+        assert report["total"]["cached_hits"] == 1
+
+    def test_days_window_filters_old_records(self):
+        import time as _time
+
+        from agent_dispatch import usage
+
+        usage.journal_path().write_text(
+            json.dumps({"t": int(_time.time() - 30 * 86400), "agent": "old", "ok": True}) + "\n",
+            encoding="utf-8",
+        )
+        assert "No dispatches recorded" in runner.invoke(cli, ["stats", "--days", "7"]).output
+        assert "old" in runner.invoke(cli, ["stats"]).output
+
+    def test_negative_window_is_rejected(self):
+        result = runner.invoke(cli, ["stats", "--days", "-1"])
+        assert result.exit_code == 1
+        assert "must be >= 0" in result.output
+
+
+class TestDoctorServerDrift:
+    """doctor names the sessions still executing an older release."""
+
+    def _patch_env(self):
+        return patch("agent_dispatch.cli.shutil.which", side_effect=lambda x: f"/usr/bin/{x}")
+
+    def _patch_run(self):
+        return patch(
+            "agent_dispatch.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="agent-dispatch: x serve - Connected\n", stderr=""
+            ),
+        )
+
+    def test_no_registered_servers_is_fine(self):
+        with (
+            self._patch_env(),
+            self._patch_run(),
+            patch("agent_dispatch.cli._claude_supports_flag", return_value=True),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "No agent-dispatch server is registered" in result.output
+        # The count is a lower bound and must always say so.
+        assert "Lower bound: only servers started on this version" in result.output
+        assert "FAIL" not in result.output
+
+    def test_old_servers_are_reported_with_pid_and_version(self, tmp_path: Path):
+        from agent_dispatch import __version__, servers
+
+        with (
+            self._patch_env(),
+            self._patch_run(),
+            patch("agent_dispatch.cli._claude_supports_flag", return_value=True),
+            patch.object(
+                servers,
+                "live_servers",
+                return_value=[
+                    {"pid": 4242, "version": "0.13.0", "started_at": time.time() - 7200},
+                    {"pid": 4243, "version": __version__, "started_at": time.time()},
+                ],
+            ),
+        ):
+            result = runner.invoke(cli, ["doctor"])
+        assert "2 server process(es) registered, 1 on" in result.output
+        assert "Lower bound: only servers started on this version" in result.output
+        assert "1 server(s) still executing older code: 1x 0.13.0" in result.output
+        assert "pid 4242: 0.13.0" in result.output
+        assert "pid 4243" not in result.output  # the current one needs no action
+        assert "WARN" in result.output
+        assert "FAIL" not in result.output

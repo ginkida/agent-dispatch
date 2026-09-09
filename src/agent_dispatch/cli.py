@@ -891,6 +891,36 @@ def doctor() -> None:
     else:
         warn("agent-dispatch not on PATH (MCP server still works via absolute path)")
 
+    section("Running servers")
+    from . import __version__, servers
+
+    live = servers.live_servers()
+    if not live:
+        ok("No agent-dispatch server is registered as running")
+    else:
+        drift = servers.version_drift(__version__)
+        stale_count = sum(drift.values())
+        ok(f"{len(live)} server process(es) registered, {len(live) - stale_count} on {__version__}")
+    # Printed in BOTH branches on purpose. A server only registers if it was
+    # started on a version that has this registry, so the count is a lower
+    # bound — on the machine this was written, 19 servers were running and
+    # exactly 1 of them appeared here. Reporting "1 server running" without
+    # this line would be a diagnostic that quietly under-counts.
+    click.echo("    Lower bound: only servers started on this version or later register here.")
+    if live:
+        if drift:
+            versions = ", ".join(f"{n}x {v}" for v, n in drift.items())
+            warn(f"{stale_count} server(s) still executing older code: {versions}")
+            click.echo("    A server keeps its modules in memory for life, so an upgrade")
+            click.echo("    reaches an open Claude Code session only when that session")
+            click.echo("    restarts. Restart them to pick up the installed version.")
+            for entry in live:
+                version = str(entry.get("version") or "unknown")
+                if version != __version__:
+                    started = entry.get("started_at")
+                    age = f", up {_age(float(started))}" if started else ""
+                    click.echo(f"      pid {entry.get('pid')}: {version}{age}")
+
     section("Config")
     cp = config_path()
     config: DispatchConfig | None = None
@@ -1178,6 +1208,89 @@ def jobs_gc(days: int, purge_all: bool) -> None:
         raise SystemExit(1)
     deleted = _job_store().gc(days * 86400)
     click.echo(f"Deleted {deleted} job(s) older than {days} day(s).")
+
+
+def _fmt_seconds(ms: float) -> str:
+    """Human duration from milliseconds: 850ms, 42s, 3m20s."""
+    seconds = ms / 1000
+    if seconds < 1:
+        return f"{int(ms)}ms"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
+
+
+def _fmt_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{k} {v}" for k, v in counts.items())
+
+
+@cli.command("stats")
+@click.option("--days", default=0, type=int, help="Only count the last N days (default: all).")
+@click.option("--agent", default=None, help="Only this agent.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def usage_stats(days: int, agent: str | None, as_json: bool) -> None:
+    """Show what dispatches actually cost: spend, durations, outcomes per agent."""
+    from . import usage
+
+    if days < 0:
+        click.echo(click.style(f"Error: --days must be >= 0 (got {days}).", fg="red"))
+        raise SystemExit(1)
+
+    entries = usage.load(days=days, agent=agent)
+    if not entries:
+        window = f" in the last {days} day(s)" if days else ""
+        who = f" for agent '{agent}'" if agent else ""
+        click.echo(f"No dispatches recorded{who}{window}.")
+        click.echo(f"    Journal: {usage.journal_path()}")
+        click.echo("    (Recording is off if settings.usage_log is false in agents.yaml.)")
+        return
+
+    report = usage.summarize(entries)
+    if as_json:
+        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    total = report["total"]
+    window = f"last {days} day(s)" if days else "all recorded"
+    click.echo(click.style(f"Usage ({window})", bold=True))
+    cached = f", {total['cached_hits']} served from cache" if total["cached_hits"] else ""
+    click.echo(f"  dispatches: {total['dispatches']}{cached}")
+    click.echo(f"  spend:      ${total['cost_usd']:.4f}")
+    if "median_ms" in total:
+        click.echo(
+            f"  duration:   median {_fmt_seconds(total['median_ms'])}, "
+            f"p90 {_fmt_seconds(total['p90_ms'])}, max {_fmt_seconds(total['max_ms'])}"
+        )
+    if total.get("outcomes"):
+        click.echo(f"  outcomes:   {_fmt_counts(total['outcomes'])}")
+    if total.get("errors"):
+        click.echo(click.style(f"  failures:   {_fmt_counts(total['errors'])}", fg="yellow"))
+
+    click.echo()
+    click.echo(click.style("Per agent", bold=True))
+    for name, st in report["agents"].items():
+        head = (
+            f"  {click.style(name, bold=True):<24} {st['dispatches']:>4} "
+            f"{'run ' if st['dispatches'] == 1 else 'runs'}  "
+            f"${st['cost_usd']:>8.4f}"
+        )
+        if "median_ms" in st:
+            head += (
+                f"  median {_fmt_seconds(st['median_ms']):>6}  p90 {_fmt_seconds(st['p90_ms']):>6}"
+            )
+        click.echo(head)
+        detail = []
+        if st.get("outcomes"):
+            detail.append(_fmt_counts(st["outcomes"]))
+        if st.get("errors"):
+            detail.append(click.style(_fmt_counts(st["errors"]), fg="yellow"))
+        if st["cached_hits"]:
+            detail.append(f"{st['cached_hits']} cached")
+        if detail:
+            click.echo(f"      {'  |  '.join(detail)}")
+
+    click.echo()
+    click.echo(f"Journal: {usage.journal_path()}")
 
 
 @cli.command()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -10,9 +11,11 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 
+from . import usage
 from .models import AgentConfig, DispatchResult, Settings
 
 logger = logging.getLogger(__name__)
@@ -171,6 +174,36 @@ def _parse_structured_response(text: str) -> object | None:
         return None
 
 
+# The account's own rate/usage limit, observed live 2026-09-09: three concurrent
+# dispatches came back with `You've hit your session limit · resets 6pm
+# (Asia/Almaty)`. It used to classify as a generic `cli_error`, which is the
+# least useful thing to tell a caller — the distinguishing facts are that the
+# limit is on the ACCOUNT (so every agent shares it, and a "try another agent"
+# retry fails identically) and that it clears at a stated time, so retrying
+# before then is pure waste.
+_USAGE_LIMIT_PATTERNS = [
+    "session limit",
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota exceeded",
+]
+_RESET_RE = re.compile(r"resets?\s+(?:at\s+)?([^\n.]{1,40})", re.IGNORECASE)
+
+
+def _usage_limit_hint(error_text: str) -> str:
+    """Actionable guidance for an account-wide usage limit."""
+    m = _RESET_RE.search(error_text or "")
+    when = f" It resets {m.group(1).strip()}." if m else ""
+    return (
+        f"\n\nHint: this is the Claude ACCOUNT's usage limit, not this agent's.{when} "
+        "Every agent shares it, so dispatching a different agent (or retrying now) "
+        "fails the same way — wait for the reset, or reduce concurrent dispatches "
+        "(settings.max_concurrency). Nothing was billed for this call."
+    )
+
+
 _PERMISSION_PATTERNS = [
     "permission denied",
     "not allowed",
@@ -192,10 +225,29 @@ def _classify_error(error_text: object) -> str:
     """
     text = str(error_text) if error_text else ""
     lower = text.lower()
+    # Checked before permissions: an account limit is a specific, actionable
+    # state, and "limit" text carries none of the permission vocabulary anyway.
+    for pattern in _USAGE_LIMIT_PATTERNS:
+        if pattern in lower:
+            return "usage_limit"
     for pattern in _PERMISSION_PATTERNS:
         if pattern in lower:
             return "permission"
     return "cli_error"
+
+
+def _classification_hint(agent_name: str, error_type: str, error_text: str) -> str:
+    """The advisory that belongs to a text-classified error type ("" when none).
+
+    Declared once because four call sites classify an error and then attach its
+    hint; when `usage_limit` was added, three of the four would otherwise have
+    kept silently attaching nothing.
+    """
+    if error_type == "permission":
+        return _permission_hint(agent_name)
+    if error_type == "usage_limit":
+        return _usage_limit_hint(error_text)
+    return ""
 
 
 def _permission_hint(agent_name: str) -> str:
@@ -360,8 +412,7 @@ def _build_error_result(
         error_text += _permission_hint(agent_name)
     else:
         error_type = _classify_error(error_text)
-        if error_type == "permission":
-            error_text += _permission_hint(agent_name)
+        error_text += _classification_hint(agent_name, error_type, error_text)
 
     return _apply_budget(
         DispatchResult(
@@ -382,6 +433,54 @@ def _build_error_result(
         agent,
         settings,
     )
+
+
+def _journaled(fn: Callable) -> Callable:
+    """Record every DispatchResult this function returns in the usage journal.
+
+    Wrapping is what makes the record complete: `dispatch` and `dispatch_stream`
+    each have a dozen early returns (recursion, missing CLI, spawn failure,
+    timeout, budget stop), and instrumenting them individually would guarantee
+    that the next new return path is the one that goes unrecorded. The journal
+    is best-effort by construction (`usage.record` swallows its own errors), so
+    this can never turn a completed dispatch into a raised exception.
+
+    The stream's old-CLI retry re-enters the same function with
+    `_use_session_flag=False`; only the outermost call records, or one dispatch
+    would appear twice.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(agent_name, task, agent, settings, *args, **kwargs):  # noqa: ANN001, ANN002
+        started = time.monotonic()
+        result = fn(agent_name, task, agent, settings, *args, **kwargs)
+        if getattr(settings, "usage_log", True) and kwargs.get("_use_session_flag", True):
+            try:
+                wall_ms = int((time.monotonic() - started) * 1000)
+                usage.record(
+                    agent_name,
+                    ok=result.success,
+                    cost_usd=result.cost_usd,
+                    # The CLI's own duration when it reported one; wall time
+                    # otherwise, so a timeout still shows up as "this agent took
+                    # its whole budget" rather than as a hole in the data.
+                    duration_ms=result.duration_ms if result.duration_ms is not None else wall_ms,
+                    num_turns=result.num_turns,
+                    outcome=result.outcome,
+                    error_type=result.error_type,
+                    caller=kwargs.get("caller"),
+                )
+            except Exception as e:  # noqa: BLE001 - see below
+                # `usage.record` already swallows everything, so this arm is
+                # belt and braces — deliberately. The result in hand has been
+                # billed; letting a bookkeeping failure raise from here would
+                # destroy a paid-for answer, and the guarantee has to hold at
+                # the boundary that owns the damage, not on the other module's
+                # promise. A test removes record()'s own guard to prove it.
+                logger.debug("Could not journal dispatch for %s: %s", agent_name, e)
+        return result
+
+    return wrapper
 
 
 def _build_success_result(
@@ -558,13 +657,29 @@ def _close_quiet(stream: object) -> None:
 
 
 def _timeout_error(agent_name: str, timeout: int, session_uuid: str | None) -> str:
-    """Actionable timeout message: how to retry, extend, or resume."""
+    """Actionable timeout message: how to retry, extend, or resume.
+
+    When the usage journal has enough history, "use a longer timeout" becomes a
+    number: `usage.suggested_timeout` pads this agent's real p90 by 50%. Doubling
+    the current value was a guess that is wrong in both directions — too small
+    for an agent whose runs cluster at 10 minutes, wastefully large for one that
+    normally answers in twenty seconds and just hit a bad run.
+    """
+    suggested = usage.suggested_timeout(agent_name)
+    if suggested and suggested <= timeout:
+        suggested = None  # already generous; the run failed for another reason
+    retry_value = suggested or timeout * 2
     msg = (
         f"Agent '{agent_name}' timed out after {timeout}s. "
         "Options: pass timeout_seconds= for a longer one-off run, use "
         "dispatch_async for fire-and-forget, or raise the agent default "
-        f"(agent-dispatch update {agent_name} --timeout {timeout * 2})."
+        f"(agent-dispatch update {agent_name} --timeout {retry_value})."
     )
+    if suggested:
+        msg += (
+            f" Recent runs of this agent suggest timeout_seconds={suggested} "
+            "(50% over its measured p90)."
+        )
     if session_uuid:
         msg += (
             f" Partial work may be resumable: dispatch_session(agent='{agent_name}', "
@@ -727,6 +842,7 @@ def _build_prompt(
     return body
 
 
+@_journaled
 def dispatch(
     agent_name: str,
     task: str,
@@ -881,8 +997,7 @@ def dispatch(
     if proc.returncode != 0 and not proc.stdout.strip():
         error_text = proc.stderr.strip() or f"claude exited with code {proc.returncode}"
         error_type = _classify_error(error_text)
-        if error_type == "permission":
-            error_text += _permission_hint(agent_name)
+        error_text += _classification_hint(agent_name, error_type, error_text)
         return DispatchResult(
             agent=agent_name,
             success=False,
@@ -923,8 +1038,7 @@ def dispatch(
             or f"claude exited with code {proc.returncode} and produced no output"
         )
         error_type = _classify_error(error_text)
-        if error_type == "permission":
-            error_text += _permission_hint(agent_name)
+        error_text += _classification_hint(agent_name, error_type, error_text)
         return DispatchResult(
             agent=agent_name,
             success=False,
@@ -961,6 +1075,7 @@ def dispatch(
     )
 
 
+@_journaled
 def dispatch_stream(
     agent_name: str,
     task: str,
@@ -1239,8 +1354,7 @@ def dispatch_stream(
         )
     error_text = stderr.strip() or f"No result received (exit code {proc.returncode})"
     error_type = _classify_error(error_text)
-    if error_type == "permission":
-        error_text += _permission_hint(agent_name)
+    error_text += _classification_hint(agent_name, error_type, error_text)
     return DispatchResult(
         agent=agent_name,
         success=False,

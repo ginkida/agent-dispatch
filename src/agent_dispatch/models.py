@@ -119,6 +119,13 @@ class Settings(BaseModel):
     # (parsed into DispatchResult.outcome). Off = raw `claude -p` behaviour,
     # for CLIs that predate --append-system-prompt or for A/B comparison.
     dispatch_protocol: bool = True
+    # Append one line per dispatch to <config dir>/usage.jsonl: agent, ok,
+    # cost, duration, turns, outcome, error type, caller. It is what makes
+    # "which agent burns money / how long does this one actually take"
+    # answerable (CLI `stats`, the timing block in inspect_agent, the
+    # timeout hint's suggested value). Owner-only, rotated at ~2 MB, and
+    # written with a single atomic append so concurrent servers can share it.
+    usage_log: bool = True
 
 
 def validate_agent_name(name: str) -> str:

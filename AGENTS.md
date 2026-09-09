@@ -12,6 +12,8 @@ MCP server + CLI that lets Claude Code agents delegate tasks to agents in other 
 |------|------|
 | `src/agent_dispatch/runner.py` | Sync subprocess wrapper around `claude -p` — the actual work |
 | `src/agent_dispatch/server.py` | Async FastMCP interface (21 MCP tools), wraps runner in `asyncio.to_thread` + semaphore |
+| `src/agent_dispatch/usage.py` | Append-only dispatch journal (cost/duration/outcome) + aggregation for `stats` and the `typical` block |
+| `src/agent_dispatch/servers.py` | Registry of live `serve` processes and the version each one runs (`doctor` reads it) |
 | `src/agent_dispatch/cli.py` | Click CLI: `init`, `add`, `update`, `remove`, `list`, `describe`, `test`, `doctor`, `jobs`, `job`, `cancel`, `gc`, `group` (add/list/inspect/update/remove), `serve` |
 | `src/agent_dispatch/models.py` | Pydantic v2 models (`AgentConfig`, `DispatchGroup`/`GroupMember`, `Settings`, `DispatchResult`) |
 | `src/agent_dispatch/config.py` | YAML config load/save + project auto-description |
@@ -28,7 +30,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 637 tests, ~15s
+python3 -m pytest tests/ -v   # 707 tests, ~17s
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`. The one exception is `TestStreamPipeHandling`, which spawns a short-lived *python* subprocess: a pipe deadlock lives in the OS pipe buffer, so a mocked `Popen` structurally cannot reproduce it.
@@ -61,6 +63,11 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - Every state file (`agents.yaml`, job files) is written **temp file + `os.replace`**, never in place, and every load/mutate/save is wrapped in `config.ProcessLock` — the CLI and the MCP server are separate processes writing the same files, so a thread lock alone loses updates.
 - Anything that changes an agent's config must call `_invalidate_agent_cache` — the cache key holds the agent *name*, not its directory or permissions.
 - Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, `budget_exceeded` results, and results whose `outcome` is `partial`/`blocked`, so the documented "grant access / fix the cause, then re-dispatch" recovery is never short-circuited.
+- **The usage journal is written by a decorator, not at each return.** `runner._journaled` wraps `dispatch`/`dispatch_stream` because each has a dozen early returns; instrumenting them one by one guarantees the next new return path goes unrecorded. It records the outermost call only (`_use_session_flag` is False on the stream's old-CLI retry, which would otherwise double-count one dispatch). It also swallows exceptions itself even though `usage.record` already does: the result in hand is billed, and the guarantee has to hold at the boundary that owns the damage rather than on another module's promise (`test_a_broken_journal_never_breaks_a_paid_dispatch` removes record()'s guard to prove it).
+- **A journal record is one `O_APPEND` write under `PIPE_BUF`**, never a locked read-modify-write: the CLI and every running server share one file, and this user has 14+ servers alive. Every field is capped so the line cannot approach 4096 bytes. Rotation is an atomic rename at ~2 MB, two generations kept.
+- **Profiles are memoized on the journal's (path, size, mtime) and read a NARROWER tail than `stats`.** `list_agents`/`inspect_agent` run on the event-loop thread: a full 2 MB journal cost **24.8 ms** per discovery call at the 512 KB report window — 33x the config parse that 0.13.0 exists to have fixed. Now 3.3 ms cold, ~0 warm. Every profile consumer goes through `usage.profiles()`; never add a caller that re-parses per agent.
+- **`usage_limit` is its own error type** (observed live: `You've hit your session limit · resets 6pm`). It is checked *before* the permission patterns and its hint says the limit is account-wide, so "try another agent" is not a workaround. Text-classified errors attach their advisory through the single `_classification_hint`, not per site.
+- **Server liveness is an advisory lock, not a PID.** `servers.register` holds an exclusive `flock` on `<config dir>/servers/<pid>.json` for the process lifetime; a reader that *takes* that lock owns a dead entry and deletes it. `os.kill(pid, 0)` would believe a recycled PID and would never notice a SIGKILLed server. Never close that fd (re-registering closes the old one first).
 - **The dispatch protocol goes in the system prompt, not the task.** `_build_system_prompt` (runner.py) renders the protocol (non-interactive, time/spend budget, lead with the outcome, trailing `STATUS:` line) plus the agent's `instructions`, and `_build_command` passes it as `--append-system-prompt` — on `--resume` too, since the CLI re-applies an appended prompt on every launch. `_build_prompt` (the `-p` text) is unchanged, so the cache key is unchanged. The text always starts with a `##` header line so it can never be read as a flag. `settings.dispatch_protocol: false` turns the protocol off (for CLIs that predate the flag; `doctor` probes `claude --help` for it); per-agent `instructions` still go through when set.
 - **`outcome` is lifted from the LAST line of the result** (`_split_outcome`), before JSON parsing, by the shared `_build_success_result` (the success-side twin of `_build_error_result` — both `dispatch` and `dispatch_stream` go through it) and by the plain-text fallback tier. A bare marker line is removed from `result`; a marker with a trailing reason stays. `outcome` never flips `success`; `partial`/`blocked` add a `hint` with the `dispatch_session(...)` continuation, after the denial hint. In JSON mode the protocol omits the STATUS instruction (the JSON footer governs), but a STATUS line that arrives anyway is still stripped so `parsed_result` survives.
 - Remediation text is a contract: a hint that names a flag must name one that exists (`test_printed_budget_hint_is_a_runnable_command` feeds the printed flags back into the CLI). Run the command you print.
@@ -87,4 +94,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 637 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 707 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

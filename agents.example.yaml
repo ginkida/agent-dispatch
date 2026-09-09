@@ -100,6 +100,12 @@ settings:
   default_timeout: 300
   max_dispatch_depth: 3           # recursion protection: A -> B -> A
   max_concurrency: 5              # max parallel claude -p processes
+  # usage_log: true                # Append one line per dispatch to usage.jsonl: agent,
+                                   # cost, duration, turns, outcome, error type, caller.
+                                   # Powers `agent-dispatch stats`, the measured `typical`
+                                   # block in list_agents/inspect_agent, and the timeout
+                                   # error's suggested value. Owner-only, rotates at ~2 MB.
+                                   # false = record nothing.
   # dispatch_protocol: true        # Append the dispatch protocol to every agent's system
                                    # prompt: it is non-interactive (never end with a
                                    # question), its time/spend budget, lead with the

@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-09
+
+The measurement round. 0.14.0 told a dispatched agent how to behave; this one
+records what actually happened. Four live dispatches through the new protocol
+came back **4/4 with a STATUS line and 0/4 ending in a clarifying question** —
+including the case it was built for: an ambiguous task ("how many users signed
+up in 30 days?", no project named) where the agent stated its assumption,
+counted across every database, and returned `done` rather than asking. A
+tool-less agent correctly returned `blocked`. No `partial` has been observed in
+the wild yet.
+
+### Added
+- **Usage journal + `agent-dispatch stats`.** Every dispatch appends one line to
+  `usage.jsonl` — agent, ok, cost, duration, turns, outcome, error type, caller;
+  cache hits too, flagged `cached`. `stats [--days N --agent X --json]` turns it
+  into spend, median/p90 durations, outcome and failure counts per agent. Until
+  now `cost_usd` and `duration_ms` were returned once and discarded, so "which
+  agent burns money" had no answer and the only timing knowledge in the system
+  was hand-written prose in agent descriptions. Recording is one `O_APPEND`
+  write capped under `PIPE_BUF`, so the CLI and all running servers share one
+  file with no lock; it rotates at ~2 MB keeping two generations; a failure to
+  write it can never fail a dispatch. Off with `settings.usage_log: false`.
+- **`typical` in `list_agents` and `inspect_agent`** — measured median/p90
+  seconds and median cost from that agent's own recent runs, so a caller can
+  size `timeout_seconds` from data instead of from a description. Absent below
+  three recorded dispatches: no data beats a "typical" derived from two runs.
+  Costs ~115 bytes per agent (3.6% of a discovery payload).
+- **`error_type: "usage_limit"`** for the Claude *account's* rate/session limit,
+  observed live during this round's evaluation (`You've hit your session limit ·
+  resets 6pm`) — it used to land in the generic `cli_error` bucket. The hint
+  names the reset time and says the limit is account-wide, so dispatching a
+  different agent is not a workaround, and nothing was billed.
+- **`doctor` now names the sessions running stale code.** Each server registers
+  `<config dir>/servers/<pid>.json` and holds an advisory lock on it for life;
+  `doctor` reports live servers by version and prints the pid and age of every
+  one still on an older release. A Python process holds its modules for life, so
+  an upgrade reaches an open Claude Code session only when it restarts — on this
+  machine 18 servers were running previous code with no way to tell which.
+  Liveness is the lock, not the PID: a recycled PID cannot fake a live server
+  and a SIGKILLed one cannot linger.
+
+### Changed
+- **A timeout error now suggests a number, not a doubling.** With enough history
+  the message names the value that would have covered this agent's real p90
+  (padded 50%). Doubling the current timeout was wrong in both directions.
+
+### Fixed
+- Discovery no longer pays for the journal on the event loop: profiles are
+  memoized on the journal's (path, size, mtime) and read a narrower tail than
+  the report. Measured on a full 2 MB journal, `list_agents` went from
+  **24.8 ms to 3.3 ms cold and ~0.01 ms warm** — the 512 KB version would have
+  been 33x the config parse that 0.13.0 exists to have eliminated.
+
+
 ## [0.14.0] - 2026-09-08
 
 The delegation round: what a dispatched agent is *told*, and what it tells
