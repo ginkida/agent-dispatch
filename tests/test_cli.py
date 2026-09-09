@@ -1668,6 +1668,23 @@ class TestStatsCommand:
         assert "5 runs" in result.output
         assert "1 run " in result.output
 
+    def test_json_is_valid_json_even_with_no_records(self):
+        # A fresh install is exactly when a script first pipes this somewhere.
+        result = runner.invoke(cli, ["stats", "--json"])
+        assert result.exit_code == 0
+        report = json.loads(result.output)
+        assert report["agents"] == {}
+        assert report["total"]["dispatches"] == 0
+
+    def test_a_corrupt_record_does_not_crash_the_report(self):
+        from agent_dispatch import usage
+
+        usage.journal_path().write_text(
+            '{"t": "broken", "agent": "a", "ok": true}\n', encoding="utf-8"
+        )
+        assert runner.invoke(cli, ["stats", "--days", "7"]).exit_code == 0
+        assert runner.invoke(cli, ["stats"]).exit_code == 0
+
     def test_agent_filter_and_json_output(self):
         self._seed()
         result = runner.invoke(cli, ["stats", "--agent", "gitlab", "--json"])

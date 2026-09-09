@@ -893,6 +893,7 @@ def doctor() -> None:
 
     section("Running servers")
     from . import __version__, servers
+    from . import usage as usage_mod
 
     live = servers.live_servers()
     if not live:
@@ -918,7 +919,7 @@ def doctor() -> None:
                 version = str(entry.get("version") or "unknown")
                 if version != __version__:
                     started = entry.get("started_at")
-                    age = f", up {_age(float(started))}" if started else ""
+                    age = f", up {_age(usage_mod.as_float(started))}" if started else ""
                     click.echo(f"      pid {entry.get('pid')}: {version}{age}")
 
     section("Config")
@@ -1237,17 +1238,19 @@ def usage_stats(days: int, agent: str | None, as_json: bool) -> None:
         raise SystemExit(1)
 
     entries = usage.load(days=days, agent=agent)
+    report = usage.summarize(entries)
+    if as_json:
+        # Always valid JSON, including the empty case — a caller piping this
+        # into a parser must not get prose on a fresh install, which is
+        # exactly when the journal is empty.
+        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+        return
     if not entries:
         window = f" in the last {days} day(s)" if days else ""
         who = f" for agent '{agent}'" if agent else ""
         click.echo(f"No dispatches recorded{who}{window}.")
         click.echo(f"    Journal: {usage.journal_path()}")
         click.echo("    (Recording is off if settings.usage_log is false in agents.yaml.)")
-        return
-
-    report = usage.summarize(entries)
-    if as_json:
-        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
         return
 
     total = report["total"]

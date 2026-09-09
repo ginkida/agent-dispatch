@@ -155,6 +155,24 @@ def record(
         logger.debug("Could not record usage for %s: %s", agent, e)
 
 
+def as_float(value: object, default: float = 0.0) -> float:
+    """Coerce a field read off disk to a float. Never raises.
+
+    Declared once and shared with `servers.py` and the CLI because all three
+    read numbers out of files a user can edit and a torn write can mangle.
+    `float("abc")` raises **ValueError**, which is not caught by a
+    `json.JSONDecodeError` handler and is not an `OSError` either — the same
+    escape route that has produced two rounds of bugs in this codebase. A
+    record with a broken timestamp must be skipped or sorted last, never
+    turned into a traceback from the command you ran *because* something is
+    wrong.
+    """
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _read_tail(path: Path, max_bytes: int) -> list[str]:
     """Last *max_bytes* of a file as whole lines (a partial first line is dropped)."""
     try:
@@ -200,7 +218,7 @@ def load(
             continue  # a torn write or hand-edit must not break the report
         if not isinstance(entry, dict) or "agent" not in entry:
             continue
-        if cutoff is not None and float(entry.get("t") or 0) < cutoff:
+        if cutoff is not None and as_float(entry.get("t")) < cutoff:
             continue
         if agent is not None and entry.get("agent") != agent:
             continue

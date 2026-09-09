@@ -292,3 +292,43 @@ class TestProfileMemo:
         usage.record("infra", ok=True, duration_ms=1000, cost_usd=0.1)
         usage.record("infra", ok=True, duration_ms=1000, cost_usd=0.1)
         assert usage.profiles()["infra"]["dispatches"] == 3
+
+
+class TestCorruptFieldsNeverRaise:
+    """A file a user can edit must degrade the report, never crash the command.
+
+    `float("abc")` raises ValueError — not JSONDecodeError, not OSError — so it
+    walked past the per-line handler and turned `agent-dispatch stats --days 7`
+    into a traceback. Same escape route as this codebase's two previous rounds
+    of error-handling bugs.
+    """
+
+    def test_a_corrupt_timestamp_is_skipped_not_fatal(self):
+        usage.journal_path().write_text(
+            '{"t": "not-a-number", "agent": "bad", "ok": true}\n'
+            '{"t": null, "agent": "nulled", "ok": true}\n'
+            f'{{"t": {int(time.time())}, "agent": "good", "ok": true}}\n',
+            encoding="utf-8",
+        )
+        # Unfiltered: every line still parses.
+        assert {e["agent"] for e in usage.load()} == {"bad", "nulled", "good"}
+        # Windowed: the undatable records fall outside it instead of raising.
+        assert [e["agent"] for e in usage.load(days=7)] == ["good"]
+
+    def test_corrupt_numeric_fields_do_not_break_aggregation(self):
+        usage.journal_path().write_text(
+            '{"t": 1, "agent": "a", "ok": true, "ms": "slow", "cost": "free"}\n'
+            '{"t": 2, "agent": "a", "ok": true, "ms": 1000, "cost": 0.5}\n',
+            encoding="utf-8",
+        )
+        report = usage.summarize(usage.load())
+        assert report["total"]["dispatches"] == 2
+        assert report["total"]["cost_usd"] == 0.5  # the junk value is ignored
+        assert report["total"]["median_ms"] == 1000
+
+    def test_as_float_coerces_or_defaults(self):
+        assert usage.as_float("3.5") == 3.5
+        assert usage.as_float(7) == 7.0
+        assert usage.as_float("abc") == 0.0
+        assert usage.as_float(None) == 0.0
+        assert usage.as_float({"a": 1}, default=-1.0) == -1.0

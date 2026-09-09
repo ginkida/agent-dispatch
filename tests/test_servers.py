@@ -124,6 +124,23 @@ class TestLiveness:
         assert servers.live_servers(directory=tmp_path) == []
 
 
+class TestCorruptTimestamps:
+    def test_a_mangled_started_at_sorts_last_instead_of_crashing(self, tmp_path: Path):
+        # doctor reads this; a hand-edited or torn entry must not take it down.
+        proc = _spawn_live(tmp_path, "0.13.0")
+        try:
+            entry = tmp_path / f"{proc.pid}.json"
+            data = json.loads(entry.read_text())
+            data["started_at"] = "yesterday"
+            entry.write_text(json.dumps(data))
+            live = servers.live_servers(directory=tmp_path)
+            assert [e["version"] for e in live] == ["0.13.0"]
+            assert servers.version_drift("0.15.0", directory=tmp_path) == {"0.13.0": 1}
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 class TestVersionDrift:
     def test_counts_only_versions_other_than_the_running_one(self, tmp_path: Path):
         old = _spawn_live(tmp_path, "0.13.0")

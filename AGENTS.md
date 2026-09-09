@@ -30,7 +30,7 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check src/ tests/
-python3 -m pytest tests/ -v   # 707 tests, ~17s
+python3 -m pytest tests/ -v   # 714 tests, ~17s
 ```
 
 Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.which` + `subprocess.run`/`Popen`; server tests mock `_get_config` + `runner.dispatch`. The one exception is `TestStreamPipeHandling`, which spawns a short-lived *python* subprocess: a pipe deadlock lives in the OS pipe buffer, so a mocked `Popen` structurally cannot reproduce it.
@@ -63,6 +63,8 @@ Tests must **never** invoke the real `claude` CLI. Runner tests mock `shutil.whi
 - Every state file (`agents.yaml`, job files) is written **temp file + `os.replace`**, never in place, and every load/mutate/save is wrapped in `config.ProcessLock` — the CLI and the MCP server are separate processes writing the same files, so a thread lock alone loses updates.
 - Anything that changes an agent's config must call `_invalidate_agent_cache` — the cache key holds the agent *name*, not its directory or permissions.
 - Only *clean* successes are cached: `cache.put` refuses failures, `denied_tools` results, `budget_exceeded` results, and results whose `outcome` is `partial`/`blocked`, so the documented "grant access / fix the cause, then re-dispatch" recovery is never short-circuited.
+- **Coerce every number read off disk through `usage.as_float`.** `float("abc")` raises **ValueError** — not `JSONDecodeError`, not `OSError` — so it escaped the per-line handler in `usage.load` and the sort key in `servers.live_servers`, turning `agent-dispatch stats --days 7` and `doctor` into tracebacks over one hand-edited character. Same escape route as the `UnicodeDecodeError`-is-a-`ValueError` round. A journal or registry field is untrusted input: skip the record or sort it last, never raise from the command someone ran *because* something is already wrong.
+- **`--json` output must be valid JSON on the empty path too.** `stats --json` printed prose when the journal had no records — i.e. on a fresh install, which is exactly when a script first pipes it somewhere.
 - **The usage journal is written by a decorator, not at each return.** `runner._journaled` wraps `dispatch`/`dispatch_stream` because each has a dozen early returns; instrumenting them one by one guarantees the next new return path goes unrecorded. It records the outermost call only (`_use_session_flag` is False on the stream's old-CLI retry, which would otherwise double-count one dispatch). It also swallows exceptions itself even though `usage.record` already does: the result in hand is billed, and the guarantee has to hold at the boundary that owns the damage rather than on another module's promise (`test_a_broken_journal_never_breaks_a_paid_dispatch` removes record()'s guard to prove it).
 - **A journal record is one `O_APPEND` write under `PIPE_BUF`**, never a locked read-modify-write: the CLI and every running server share one file, and this user has 14+ servers alive. Every field is capped so the line cannot approach 4096 bytes. Rotation is an atomic rename at ~2 MB, two generations kept.
 - **Profiles are memoized on the journal's (path, size, mtime) and read a NARROWER tail than `stats`.** `list_agents`/`inspect_agent` run on the event-loop thread: a full 2 MB journal cost **24.8 ms** per discovery call at the 512 KB report window — 33x the config parse that 0.13.0 exists to have fixed. Now 3.3 ms cold, ~0 warm. Every profile consumer goes through `usage.profiles()`; never add a caller that re-parses per agent.
@@ -94,4 +96,4 @@ Python ≥ 3.10 · `from __future__ import annotations` everywhere · Pydantic v
 
 ## More detail
 
-[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 707 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).
+[README.md](README.md) documents every MCP tool with parameter tables, response shapes, and the error-recovery map — it doubles as the behavioral spec. The test suite (`tests/`, 714 tests) encodes the exact expected behavior of every layer: when in doubt, read the tests for the module you're touching (`test_runner.py`, `test_server.py`, `test_cli.py`, ...).

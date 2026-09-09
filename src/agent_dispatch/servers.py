@@ -23,6 +23,8 @@ import os
 import time
 from pathlib import Path
 
+from .usage import as_float
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -138,7 +140,9 @@ def live_servers(*, directory: Path | None = None, prune: bool = True) -> list[d
             # An unreadable or half-written entry tells us nothing; a locked one
             # is live but unparseable, so leave the file alone and skip it.
             continue
-    out.sort(key=lambda e: float(e.get("started_at") or 0), reverse=True)
+    # Same rule as the journal: a registry entry with a mangled timestamp
+    # sorts last, it does not crash `doctor`.
+    out.sort(key=lambda e: as_float(e.get("started_at")), reverse=True)
     return out
 
 

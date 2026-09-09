@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-09-09
+
+Three defects in 0.15.0's own new code, found by re-auditing it the way this
+project audits everything else — the fix is the most likely place for the next
+bug, and a new file is a new place for an old one.
+
+### Fixed
+- **A corrupt number in the journal or the server registry crashed the command
+  you run to diagnose it.** `float("abc")` raises **ValueError**, which is
+  neither a `json.JSONDecodeError` nor an `OSError`, so one hand-edited or
+  torn-written character made `agent-dispatch stats --days 7` and
+  `agent-dispatch doctor` end in a traceback instead of skipping the record.
+  This is the same escape route as the `UnicodeDecodeError`-is-a-`ValueError`
+  round in 0.12.1. All three sites now coerce through one shared
+  `usage.as_float`: an undatable record falls outside the window, a registry
+  entry with a mangled timestamp sorts last.
+- **`stats --json` printed prose instead of JSON when the journal was empty** —
+  which is precisely the state of a fresh install, and therefore the first
+  thing a script piping it would hit. It now always emits the report object.
+- Doc drift: `AGENTS.md` carried a stale test count.
+
+
 ## [0.15.0] - 2026-09-09
 
 The measurement round. 0.14.0 told a dispatched agent how to behave; this one
