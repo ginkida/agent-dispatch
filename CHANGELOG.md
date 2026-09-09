@@ -11,12 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The measurement round. 0.14.0 told a dispatched agent how to behave; this one
 records what actually happened. Four live dispatches through the new protocol
-came back **4/4 with a STATUS line and 0/4 ending in a clarifying question** —
-including the case it was built for: an ambiguous task ("how many users signed
-up in 30 days?", no project named) where the agent stated its assumption,
-counted across every database, and returned `done` rather than asking. A
-tool-less agent correctly returned `blocked`. No `partial` has been observed in
-the wild yet.
+came back **5/5 with a STATUS line and 0/5 ending in a clarifying question**,
+covering every branch of the protocol. The case it was built for: an ambiguous
+task ("how many users signed up in 30 days?", no project named) where the agent
+stated its assumption, counted across every database, and returned `done`
+rather than asking. A tool-less agent returned `blocked`. And under a
+deliberately tight 45s budget an agent scoped the work down, delivered what it
+had, listed three specific gaps ("31 mirrors, not 32 — I did not check which";
+"HEAD only"; "mirrors may be stale") and returned `partial` with a resume hint —
+a result the cache then refuses to store, so the retry runs fresh.
 
 ### Added
 - **Usage journal + `agent-dispatch stats`.** Every dispatch appends one line to
