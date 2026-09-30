@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-30
+
+The process-control round. One concurrency limit now covers every dispatch
+path and serves callers in arrival order; ordinary dispatch runs on the same
+bounded two-reader design as streaming; and a round of adversarial review
+aimed at pipes, process groups and cancellation closed the cases where a
+finished run waited out its whole timeout, a detached descendant hung a
+dispatch forever, or a paid result was thrown away over optional metadata.
+Scripts get machine-readable `doctor`, `jobs` and `job` output.
+
+### Added
+- CI verifies clean wheel installation on Python 3.10 and 3.13, distribution
+  metadata, and a real MCP stdio connection. `scripts/check_install.py` checks
+  CLI/MCP interoperability and full-result export with isolated temporary data.
+- `doctor --json` emits a versioned diagnostic report with checks, severity,
+  counts, and remediation details. `--strict` makes warnings fail the command,
+  for installation checks in scripts.
+- `agent-dispatch jobs --json` exports compact summaries; `job <id> --json`
+  exports the full record, including untruncated results and session metadata.
+- Filter job history by exact agent name with `jobs --agent NAME` or
+  `dispatch_jobs(agent="NAME")`, including history for removed agents.
+- Preview history cleanup with `agent-dispatch gc --dry-run` and
+  `dispatch_gc(dry_run=True)`. Both use the same eligibility rules as deletion.
+
+### Fixed
+- Non-finite budgets are rejected before CLI/MCP mutations and during YAML
+  loading. Invalid numeric fields in parallel dispatch return an error before
+  any task starts, including values that overflow integer conversion.
+- Ordinary dispatch now kills the process group on timeout, stopping descendants
+  that could continue work after the call failed. Pipe reads are concurrent and
+  cleanup is bounded even when a descendant detaches from the group.
+- A complete CLI result from ordinary dispatch survives a cleanup timeout,
+  preserving the paid answer, cost, session and error classification. Partial
+  output still returns a resumable timeout.
+- Running-job cancellation kills the process group, including descendants
+  holding output pipes open. A compatibility retry racing cancellation is
+  stopped too; the cancelled state is persisted before any kill.
+- Streaming ignores malformed progress events without losing the final paid
+  result. Failed process registration cleans up the child and its pipes.
+- Cache keys include the agent configuration and dispatch defaults. Edits from
+  the CLI, another server, or YAML cannot reuse an old answer, and workers
+  finishing under an older configuration cannot overwrite current answers.
+- The process-tree timeout regression test synchronizes subprocess setup before
+  its one-second deadline, avoiding startup-related failures on busy machines.
+- Non-finite and overflowing numeric metadata no longer poison usage reports
+  or crash server diagnostics. Invalid optional result costs are omitted while
+  preserving the dispatch output; journal records omit non-finite costs.
+- Doctor's server counts and version drift now use one registry snapshot,
+  avoiding inconsistent totals when servers start or exit during a check.
+- Two diagnostic tests now mock Claude discovery; a shared test guard rejects
+  accidental launches of the real Claude CLI.
+- Streaming progress uses a bounded tail instead of an unlimited queue.
+  Slow clients receive an explicit omitted-message count; disconnected clients
+  stop retaining progress. Full dispatch results remain intact.
+- All dispatch paths now share `max_concurrency` within a server process.
+  Mixing ordinary and background jobs no longer allows twice the configured
+  number of subprocesses. Changing the limit preserves occupied slots.
+- Cancelling a streaming tool call keeps its concurrency reservation until the
+  worker finishes, just like an ordinary dispatch.
+- Damaged job records cannot redirect status updates or stale recovery to a
+  different job: all reads verify the internal ID against the filename.
+- Invalid and non-finite job timestamps are rejected at the read boundary.
+  Unreadable records are preserved, including during history cleanup.
+- Job IDs with trailing newlines are rejected before file access.
+- Agent and group name validation rejects trailing newlines instead of accepting
+  a partial regular-expression match.
+- Ordinary dispatch completes when the CLI exits and its stdout closes, instead
+  of waiting for stderr. A stdio MCP server that inherited stderr no longer
+  turns a finished run into a full-timeout wait, and a real CLI error (for
+  example a usage limit) is no longer reported as a timeout.
+- Streaming dispatch and running-job cancellation are bounded even when a
+  descendant leaves the process group while holding stdout; the concurrency
+  slot is released.
+- A process group is never signalled after its leader was reaped, so a recycled
+  PID cannot direct the kill at an unrelated process group.
+- The shared concurrency limit serves waiters in arrival order. Background jobs
+  queued later can no longer starve an ordinary, streaming or parallel call.
+- Cancelling an owned job between its start and its process spawn now cancels
+  it instead of reporting it as belonging to another server. A job record that
+  cannot be read at spawn no longer makes the worker kill its own process.
+- Malformed `duration_ms`, `num_turns` or `session_id` in CLI output no longer
+  discard the paid result; a bad session id falls back to the generated one.
+- Usage reports ignore implausible journal values, so totals cannot overflow;
+  `stats --json` never prints `Infinity`.
+- `doctor` survives non-UTF-8 `claude mcp list` output and an unreadable config
+  directory (JSON is still emitted). Its old-CLI warning accounts for
+  `dispatch_protocol` and per-agent instructions, so applying its remedy clears
+  it under `--strict`.
+- `gc`, `gc --dry-run` and `cancel` report job-storage errors instead of
+  printing a traceback.
+- The test guard against launching the real Claude CLI now fails the test even
+  when the launch happens in a background worker thread.
+- A failing progress callback (for example a full disk while an async job
+  writes its progress) no longer kills the run or discards its paid result and
+  session. If the reader threads cannot be started, the spawned process is
+  killed instead of running unsupervised.
+- `dispatch_cancel` reports `already_terminal` when this server's own job
+  finishes during the cancel, instead of claiming another server owns it.
+- A lone surrogate escape in an agent's answer (typically a hand-escaped emoji
+  in a `response_format="json"` reply) no longer makes `dispatch`,
+  `dispatch_session`, `dispatch_stream` or `return_ref` raise instead of
+  answering, and no longer costs an async job its paid result. It is replaced
+  with U+FFFD where the CLI output is parsed.
+
 ## [0.15.1] - 2026-09-09
 
 Three defects in 0.15.0's own new code, found by re-auditing it the way this
@@ -802,7 +906,12 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/ginkida/agent-dispatch/compare/v0.15.1...v0.16.0
+[0.15.1]: https://github.com/ginkida/agent-dispatch/compare/v0.15.0...v0.15.1
+[0.15.0]: https://github.com/ginkida/agent-dispatch/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/ginkida/agent-dispatch/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/ginkida/agent-dispatch/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/ginkida/agent-dispatch/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/ginkida/agent-dispatch/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ginkida/agent-dispatch/compare/v0.10.0...v0.11.0

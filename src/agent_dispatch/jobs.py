@@ -43,7 +43,7 @@ def default_jobs_dir() -> Path:
 
 def is_valid_job_id(job_id: str) -> bool:
     """Return True if *job_id* is a well-formed uuid4 hex string."""
-    return isinstance(job_id, str) and bool(_JOB_ID_RE.match(job_id))
+    return isinstance(job_id, str) and bool(_JOB_ID_RE.fullmatch(job_id))
 
 
 def _chmod_quiet(path: Path, mode: int) -> None:
@@ -64,19 +64,46 @@ class Job(BaseModel):
     caller: str | None = None
     goal: str | None = None
     status: JobStatus = "pending"
-    created_at: float = Field(default_factory=time.time)
-    started_at: float | None = None
-    completed_at: float | None = None
+    created_at: float = Field(default_factory=time.time, allow_inf_nan=False)
+    started_at: float | None = Field(default=None, allow_inf_nan=False)
+    completed_at: float | None = Field(default=None, allow_inf_nan=False)
     result: DispatchResult | None = None
     error: str | None = None
     # Rolling tail of progress lines (assistant text / tool-use events) from
     # the worker's streaming dispatch. None until the first event arrives.
     # Kept after completion as a post-mortem trace of what the agent did.
     progress: list[str] | None = None
-    progress_updated_at: float | None = None
+    progress_updated_at: float | None = Field(default=None, allow_inf_nan=False)
 
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
+
+    def summary(self) -> dict:
+        """Compact discovery record shared by CLI and MCP job listings."""
+        entry: dict = {
+            "id": self.id,
+            "agent": self.agent,
+            "status": self.status,
+            "task": self.task[:120],
+            "created_at": self.created_at,
+        }
+        if self.started_at is not None:
+            entry["started_at"] = self.started_at
+        if self.completed_at is not None:
+            entry["completed_at"] = self.completed_at
+        if self.result is not None:
+            entry["success"] = self.result.success
+            if self.result.cost_usd is not None:
+                entry["cost_usd"] = self.result.cost_usd
+            if self.result.outcome:
+                entry["outcome"] = self.result.outcome
+        if self.status == "running" and self.progress:
+            entry["last_progress"] = self.progress[-1]
+        if self.error:
+            entry["error_type"] = (
+                self.result.error_type if self.result and self.result.error_type else "cli_error"
+            )
+        return entry
 
 
 class JobStore:
@@ -182,25 +209,37 @@ class JobStore:
             # "not found" without touching the filesystem.
             logger.debug("Rejecting malformed job_id: %r", job_id)
             return None
-        path = self._path(job_id)
-        if not path.exists():
+        return self._read(self._path(job_id))
+
+    def _read(self, path: Path) -> Job | None:
+        """Read a record only if its identity matches its filename.
+
+        Every consumer, including recovery and deletion, uses this boundary so
+        a copied or damaged record cannot redirect a mutation to another job.
+        Unreadable records stay on disk for manual inspection.
+        """
+        if not is_valid_job_id(path.stem):
             return None
         try:
-            return Job.model_validate_json(path.read_text(encoding="utf-8"))
+            job = Job.model_validate_json(path.read_text(encoding="utf-8"))
+            if job.id != path.stem:
+                logger.warning("Job identity does not match filename: %s", path)
+                return None
+            return job
+        except FileNotFoundError:
+            return None
         except (OSError, ValueError) as e:
-            logger.warning("Failed to read job %s: %s", job_id, e)
+            logger.warning("Failed to read job %s: %s", path.stem, e)
             return None
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
-        """List all jobs, optionally filtered by status. Sorted by created_at desc."""
+    def list(self, status: JobStatus | None = None, *, agent: str | None = None) -> list[Job]:
+        """List jobs by status and/or exact agent name, sorted by created_at desc."""
         jobs: list[Job] = []
         for path in self.directory.glob("*.json"):
-            try:
-                job = Job.model_validate_json(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                logger.debug("Skipping unreadable job file %s: %s", path, e)
+            job = self._read(path)
+            if job is None:
                 continue
-            if status is None or job.status == status:
+            if (status is None or job.status == status) and (agent is None or job.agent == agent):
                 jobs.append(job)
         jobs.sort(key=lambda j: j.created_at, reverse=True)
         return jobs
@@ -400,28 +439,32 @@ class JobStore:
             self._write(job)
             return job
 
+    def gc_candidates(self, max_age_seconds: float) -> list[Job]:
+        """Preview eligible records, newest first, without changing job files.
+
+        This is a snapshot, not a reservation: deletion rechecks eligibility
+        under the store lock when it runs.
+        """
+        cutoff = time.time() - max_age_seconds
+        return [
+            job
+            for job in self.list()
+            if job.is_terminal()
+            and (job.completed_at if job.completed_at is not None else job.created_at) < cutoff
+        ]
+
     def gc(self, max_age_seconds: float) -> int:
         """Delete terminal jobs whose completed_at is older than max_age_seconds.
 
         Pending/running jobs are never deleted (they may still be active).
         Returns the count of deleted jobs.
         """
-        cutoff = time.time() - max_age_seconds
         deleted = 0
         with self._lock:
-            for path in self.directory.glob("*.json"):
+            for job in self.gc_candidates(max_age_seconds):
                 try:
-                    job = Job.model_validate_json(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if not job.is_terminal():
-                    continue
-                # Use completed_at if set, else created_at as fallback
-                ts = job.completed_at or job.created_at
-                if ts < cutoff:
-                    try:
-                        path.unlink()
-                        deleted += 1
-                    except OSError as e:
-                        logger.warning("Failed to gc job %s: %s", job.id, e)
+                    self._path(job.id).unlink()
+                    deleted += 1
+                except OSError as e:
+                    logger.warning("Failed to gc job %s: %s", job.id, e)
         return deleted

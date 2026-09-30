@@ -27,12 +27,10 @@ from agent_dispatch.models import (
 def _reset_globals(tmp_path: Path, monkeypatch):
     """Reset server-level cache, semaphore and job store between tests."""
     server._cache = None
-    server._semaphore = None
-    server._semaphore_limit = 0
+    server._dispatch_limiter = None
     server._job_store = None
-    server._job_semaphore = None
-    server._job_semaphore_limit = 0
     server._running_procs.clear()
+    server._owned_jobs.clear()
     # Isolate job storage per test
     monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(tmp_path / "_jobs"))
     # ...and the config path. Tests that need a real file on disk set this
@@ -42,12 +40,10 @@ def _reset_globals(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(tmp_path / "_isolated.yaml"))
     yield
     server._cache = None
-    server._semaphore = None
-    server._semaphore_limit = 0
+    server._dispatch_limiter = None
     server._job_store = None
-    server._job_semaphore = None
-    server._job_semaphore_limit = 0
     server._running_procs.clear()
+    server._owned_jobs.clear()
 
 
 def _make_config(tmp_path: Path, cache_enabled: bool = True) -> DispatchConfig:
@@ -883,9 +879,10 @@ class TestAddRemoveAgent:
             os.environ.pop("AGENT_DISPATCH_CONFIG", None)
 
     @pytest.mark.asyncio
-    async def test_add_agent_invalid_name(self):
-        raw = await server.add_agent("-bad", "/tmp")
-        assert "error" in json.loads(raw)
+    @pytest.mark.parametrize("name", ["-bad", "agent\n"])
+    async def test_add_agent_invalid_name(self, tmp_path, name):
+        raw = await server.add_agent(name, str(tmp_path))
+        assert "Invalid agent name" in json.loads(raw)["error"]
 
     @pytest.mark.asyncio
     async def test_add_agent_nonexistent_dir(self):
@@ -1379,8 +1376,45 @@ class TestDispatchJobsList:
         raw = await server.dispatch_jobs(limit=2)
         assert len(json.loads(raw)) == 2
 
+    @pytest.mark.asyncio
+    async def test_dispatch_jobs_agent_filter_before_limit(self):
+        store = server._get_job_store()
+        wanted = store.create_completed(
+            "removed", "old task", DispatchResult(agent="removed", success=True, result="done")
+        )
+        store.create("removed", "pending")
+        store.create_completed(
+            "other", "newer", DispatchResult(agent="other", success=True, result="done")
+        )
+        data = json.loads(await server.dispatch_jobs(status="done", agent="removed", limit=1))
+        assert [entry["id"] for entry in data] == [wanted.id]
+        assert json.loads(await server.dispatch_jobs(agent="unknown")) == []
+
 
 class TestDispatchGC:
+    @pytest.mark.asyncio
+    async def test_preview_preserves_records_and_returns_eligible_ids(self):
+        store = server._get_job_store()
+        job = store.create_completed(
+            "infra", "old", DispatchResult(agent="infra", success=True, result="done")
+        )
+        job.completed_at = 1
+        store._write(job)
+        store.create("infra", "pending")
+        data = json.loads(await server.dispatch_gc(max_age_days=7, dry_run=True))
+        assert data == {
+            "dry_run": True, "purged": 0, "would_purge": 1,
+            "job_ids": [job.id], "max_age_days": 7,
+        }
+        assert store.get(job.id) == job
+        assert json.loads(await server.dispatch_gc(max_age_days=7))["purged"] == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_preview(self):
+        data = json.loads(await server.dispatch_gc(dry_run=True))
+        assert data["job_ids"] == []
+        assert data["would_purge"] == data["purged"] == 0
+
     @pytest.mark.asyncio
     async def test_dispatch_gc_purges_old(self, tmp_path: Path):
         import time as _time
@@ -2122,6 +2156,72 @@ class TestDeniedToolsSurfacing:
 # ---------------------------------------------------------------------------
 
 
+class TestStreamingProgressBuffer:
+    @pytest.mark.asyncio
+    async def test_flood_reports_omitted_progress_and_preserves_full_result(self, tmp_path):
+        config = _make_config(tmp_path)
+        ctx = AsyncMock()
+        full_result = "полный результат" * 1000
+
+        def fake(name, task, agent, settings, context=None, on_progress=None, **kwargs):
+            for i in range(1000):
+                on_progress(f"step {i}:" + "x" * 1000)
+            return DispatchResult(agent=name, success=True, result=full_result)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake),
+        ):
+            data = json.loads(await server.dispatch_stream("infra", "task", ctx=ctx))
+        assert data["result"] == full_result
+        notifications = [call.args[0] for call in ctx.info.await_args_list]
+        assert any("Skipped 900" in message for message in notifications)
+        steps = [message for message in notifications if "step " in message]
+        assert len(steps) == 100
+        assert steps[0].startswith("[infra] step 900:")
+        assert steps[-1].startswith("[infra] step 999:")
+        assert all(len(message) <= 308 for message in steps)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_client_discards_late_worker_progress(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        buffer = server.ProgressBuffer()
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def fake(name, task, agent, settings, context=None, on_progress=None, **kwargs):
+            on_progress("starting")
+            started.set()
+            release.wait(5)
+            for _ in range(1000):
+                on_progress("late output")
+            finished.set()
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server, "ProgressBuffer", return_value=buffer),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake),
+        ):
+            task = asyncio.create_task(server.dispatch_stream("infra", "task", ctx=AsyncMock()))
+            try:
+                assert await asyncio.to_thread(started.wait, 3)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert buffer.drain() == ([], 0)
+            finally:
+                release.set()
+                assert await asyncio.to_thread(finished.wait, 3)
+                await asyncio.gather(task, return_exceptions=True)
+                limiter = server._get_dispatch_limiter(config)
+                await asyncio.wait_for(limiter.acquire_async(), 3)
+                limiter.release()
+            assert buffer.drain() == ([], 0)
+
+
 class TestAsyncJobProgress:
     @pytest.mark.asyncio
     async def test_progress_persisted_after_completion(self, tmp_path: Path):
@@ -2268,6 +2368,21 @@ class TestParallelNumericValidation:
         assert "summary_chars" in json.loads(raw)["error"]
         mock_dispatch.assert_not_called()
 
+    @pytest.mark.parametrize("field", ["timeout_seconds", "summary_chars"])
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    async def test_nonfinite_number_rejects_batch_before_any_work(self, tmp_path, field, value):
+        with (
+            patch.object(server, "_get_config", return_value=_make_config(tmp_path)),
+            patch.object(server.runner, "dispatch") as run,
+        ):
+            payload = json.dumps([
+                {"agent": "infra", "task": "valid task"},
+                {"agent": "db", "task": "invalid task", field: value},
+            ])
+            result = json.loads(await server.dispatch_parallel(payload))
+        assert field in result["error"]
+        run.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_null_timeout_seconds_treated_as_unset(self, tmp_path: Path):
         config = _make_config(tmp_path)
@@ -2331,6 +2446,112 @@ class TestStatusPostMortemProgress:
 
 class TestCancelRunningJob:
     """dispatch_cancel kills a running job's subprocess when this server owns it."""
+
+    async def test_cancel_kills_process_group_after_persisting_state(self):
+        store = server._get_job_store()
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+
+        class FakeProc:
+            pid = 123456
+
+            def kill(self):
+                pytest.fail("Cancellation must kill the process group")
+
+        server._owned_jobs[job.id] = False
+        server._running_procs[job.id] = FakeProc()
+
+        def kill_group(pid, sig):
+            assert pid == FakeProc.pid
+            assert store.get(job.id).status == "cancelled"
+
+        with patch("agent_dispatch.runner.os.killpg", side_effect=kill_group) as kill:
+            result = json.loads(await server.dispatch_cancel(job.id))
+        assert result["outcome"] == "cancelled_running"
+        kill.assert_called_once()
+
+    async def test_own_job_finishing_mid_cancel_is_reported_terminal(self):
+        # The unlocked cancel() saw "running"; our worker then finished and
+        # left _owned_jobs before the ownership check. Must not claim the job
+        # belongs to another server.
+        store = server._get_job_store()
+        job = store.create("infra", "task")
+        store.mark_running(job.id)
+        real_cancel = store.cancel
+
+        def cancel_then_finish(job_id, **kw):
+            outcome = real_cancel(job_id, **kw)
+            store.finish(job_id, _ok_dispatch_result("infra"))
+            return outcome
+
+        with patch.object(store, "cancel", side_effect=cancel_then_finish):
+            result = json.loads(await server.dispatch_cancel(job.id))
+        assert result["outcome"] == "already_terminal"
+        assert result["status"] == "done"
+        assert "message" not in result
+
+    async def test_failed_progress_writes_do_not_cost_the_result(self, tmp_path):
+        config = _make_config(tmp_path)
+
+        def fake_stream(name, task, agent_config, settings, context=None,
+                        on_progress=None, **kw):
+            on_progress("working")
+            return _ok_dispatch_result(name)
+
+        store = server._get_job_store()
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
+            patch.object(store, "update_progress", side_effect=OSError(28, "No space")),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            job = await _wait_terminal(job_id)
+        assert job.status == "done"
+        assert job.result is not None and job.result.success is True
+
+    async def test_cancel_also_stops_a_retry_registered_after_cancellation(self, tmp_path):
+        config = _make_config(tmp_path)
+        first_started = threading.Event()
+        retry_allowed = threading.Event()
+        worker_finished = threading.Event()
+        killed = []
+
+        class FakeProc:
+            def __init__(self, name):
+                self.name = name
+
+            def kill(self):
+                killed.append(self.name)
+
+        def fake_stream(name, *args, on_proc, **kwargs):
+            on_proc(FakeProc("first"))
+            first_started.set()
+            try:
+                assert retry_allowed.wait(5)
+                on_proc(FakeProc("retry"))
+                return _ok_dispatch_result(name)
+            finally:
+                worker_finished.set()
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            try:
+                assert await asyncio.to_thread(first_started.wait, 5)
+                result = json.loads(await server.dispatch_cancel(job_id))
+                assert result["outcome"] == "cancelled_running"
+            finally:
+                retry_allowed.set()
+                assert await asyncio.to_thread(worker_finished.wait, 5)
+                for _ in range(200):
+                    if job_id not in server._running_procs:
+                        break
+                    await asyncio.sleep(0.01)
+        assert job_id not in server._running_procs
+        assert killed == ["first", "retry"]
+        assert server._get_job_store().get(job_id).status == "cancelled"
 
     @pytest.mark.asyncio
     async def test_cancel_kills_running_subprocess(self, tmp_path: Path):
@@ -2430,6 +2651,164 @@ class TestCancelRunningJob:
                     break
                 await asyncio.sleep(0.01)
             assert job_id not in server._running_procs
+
+    async def test_cancel_before_spawn_is_honored_and_kills_the_late_process(self, tmp_path):
+        """Owned job caught between mark_running and on_proc: still cancellable.
+
+        Ownership used to be keyed on the Popen handle alone, so this window
+        answered "not started by this server" and the job ran on, billed.
+        """
+        config = _make_config(tmp_path)
+        entered = threading.Event()
+        spawn_allowed = threading.Event()
+        worker_finished = threading.Event()
+        killed = []
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                killed.append("late")
+
+        def fake_stream(name, *args, on_proc, **kwargs):
+            # mark_running has already run; the process does not exist yet.
+            entered.set()
+            try:
+                assert spawn_allowed.wait(5)
+                on_proc(FakeProc())
+                return _ok_dispatch_result(name)
+            finally:
+                worker_finished.set()
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                assert server._get_job_store().get(job_id).status == "running"
+                result = json.loads(await server.dispatch_cancel(job_id))
+                assert result["outcome"] == "cancelled_running"
+                assert result["status"] == "cancelled"
+                assert "not been spawned yet" in result["message"]
+                assert killed == []  # nothing to kill yet
+            finally:
+                spawn_allowed.set()
+                assert await asyncio.to_thread(worker_finished.wait, 5)
+                for _ in range(200):
+                    if job_id not in server._owned_jobs:
+                        break
+                    await asyncio.sleep(0.01)
+        assert killed == ["late"]
+        job = server._get_job_store().get(job_id)
+        assert job.status == "cancelled"
+        assert job.result is None  # the worker's finish() was refused
+        assert job_id not in server._owned_jobs
+        assert job_id not in server._running_procs
+
+    async def test_ownership_is_claimed_before_mark_running_and_released_on_skip(
+        self, tmp_path: Path
+    ):
+        store = server._get_job_store()
+        job = store.create("infra", "task")
+        seen = []
+
+        def spy(job_id):
+            seen.append(job_id in server._owned_jobs)
+            return None  # refused, e.g. cancelled while queued: early return
+
+        with (
+            patch.object(store, "mark_running", side_effect=spy),
+            patch.object(server.runner, "dispatch_stream") as stream,
+        ):
+            server._run_job(
+                job.id,
+                "infra",
+                "task",
+                AgentConfig(directory=tmp_path),
+                Settings(),
+                None,
+                None,
+                None,
+                None,
+                server.DispatchLimiter(1),
+            )
+        assert seen == [True]
+        stream.assert_not_called()
+        assert job.id not in server._owned_jobs
+
+    async def test_unreadable_record_at_spawn_does_not_kill_the_process(self, tmp_path):
+        """store.get() -> None can be a transient read error, not a verdict."""
+        config = _make_config(tmp_path)
+        store = server._get_job_store()
+        real_get = store.get
+        unreadable = threading.Event()
+        killed = []
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                killed.append(True)
+
+        def flaky_get(job_id):
+            return None if unreadable.is_set() else real_get(job_id)
+
+        def fake_stream(name, *args, on_proc, **kwargs):
+            unreadable.set()  # e.g. EMFILE while on_proc reads the record
+            try:
+                on_proc(FakeProc())
+            finally:
+                unreadable.clear()
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
+            patch.object(store, "get", side_effect=flaky_get),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            job = await _wait_terminal(job_id)
+        assert killed == []
+        assert job.status == "done"
+
+    async def test_positively_terminal_record_at_spawn_still_kills(self, tmp_path):
+        """Another server's recover_stale failed the job: the spawn is killed."""
+        config = _make_config(tmp_path)
+        killed = []
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                killed.append(True)
+
+        def fake_stream(name, *args, on_proc, **kwargs):
+            store = server._get_job_store()
+            (job,) = store.list("running")
+            store.fail(job.id, "Abandoned")
+            on_proc(FakeProc())
+            return _ok_dispatch_result(name)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            job = await _wait_terminal(job_id)
+        assert killed == [True]
+        assert job.status == "failed"
+        assert job.result is None
 
     @pytest.mark.asyncio
     async def test_cancel_running_without_registered_proc_keeps_old_behavior(
@@ -2775,6 +3154,76 @@ class TestReturnRefOnCacheHit:
 
 
 class TestConfigMutationInvalidatesCache:
+    @pytest.mark.parametrize("surface", ["single", "parallel"])
+    async def test_external_config_edits_refresh_only_affected_agent(
+        self, tmp_path, monkeypatch, surface,
+    ):
+        from agent_dispatch.config import save_config
+
+        config = _make_config(tmp_path)
+        config_file = tmp_path / "agents.yaml"
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(config_file))
+        save_config(config, config_file)
+
+        async def dispatch(name):
+            if surface == "single":
+                return json.loads(await server.dispatch(name, "task"))
+            result = json.loads(await server.dispatch_parallel(
+                json.dumps([{"agent": name, "task": "task"}]),
+            ))
+            return result[0]
+
+        def fake_dispatch(name, task, agent, settings, *args, **kwargs):
+            return _ok_dispatch_result(name, agent.instructions or "original")
+
+        with patch.object(server.runner, "dispatch", side_effect=fake_dispatch) as runner:
+            await dispatch("infra")
+            await dispatch("db")
+            assert (await dispatch("infra"))["cached"] is True
+            # Simulate an edit by the CLI or another server process.
+            config.agents["infra"].instructions = "new instructions"
+            save_config(config, config_file)
+            assert (await dispatch("db"))["cached"] is True
+            updated = await dispatch("infra")
+            assert updated.get("cached") is None
+            assert updated["result"] == "new instructions"
+            assert runner.call_count == 3
+
+            config.settings.dispatch_protocol = False
+            save_config(config, config_file)
+            assert (await dispatch("infra")).get("cached") is None
+            assert (await dispatch("db")).get("cached") is None
+            assert runner.call_count == 5
+
+    async def test_old_dispatch_cannot_repopulate_cache_after_config_edit(self, tmp_path):
+        old_config = _make_config(tmp_path)
+        new_config = old_config.model_copy(deep=True)
+        new_config.agents["infra"].instructions = "new"
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_dispatch(name, task, agent, *args, **kwargs):
+            if not agent.instructions:
+                started.set()
+                assert release.wait(5)
+            return _ok_dispatch_result(name, agent.instructions or "old")
+
+        with (
+            patch.object(server, "_get_config", return_value=old_config) as get_config,
+            patch.object(server.runner, "dispatch", side_effect=fake_dispatch),
+        ):
+            old = asyncio.create_task(server.dispatch("infra", "task"))
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                get_config.return_value = new_config
+                assert json.loads(await server.dispatch("infra", "task"))["result"] == "new"
+            finally:
+                release.set()
+                await old
+            cached = json.loads(await server.dispatch("infra", "task"))
+        assert cached["result"] == "new"
+        assert cached["cached"] is True
+
     @pytest.mark.asyncio
     async def test_update_agent_drops_that_agents_cached_results(self, tmp_path: Path):
         config = _make_config(tmp_path)
@@ -2924,6 +3373,21 @@ class TestAggregationWithRefItems:
 
 
 class TestBudgetValidationAtToolBoundary:
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    async def test_nonfinite_budget_never_changes_config(self, tmp_path, monkeypatch, value):
+        from agent_dispatch.config import save_config
+
+        config_file = tmp_path / "agents.yaml"
+        monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(config_file))
+        save_config(_make_config(tmp_path), config_file)
+        before = config_file.read_bytes()
+        added = json.loads(await server.add_agent("new", str(tmp_path), max_budget_usd=value))
+        assert "finite" in added["error"]
+        assert config_file.read_bytes() == before
+        updated = json.loads(await server.update_agent("infra", max_budget_usd=value))
+        assert "finite" in updated["error"]
+        assert config_file.read_bytes() == before
+
     @pytest.mark.asyncio
     async def test_add_agent_rejects_negative_budget(self, tmp_path: Path):
         # AgentConfig.max_budget_usd is ge=0 — without a boundary check this
@@ -3299,6 +3763,160 @@ class TestSemaphoreOutlivesCancellation:
             await asyncio.wait_for(second, timeout=5)
             assert calls == ["blocking", "queued"]
 
+    @pytest.mark.asyncio
+    async def test_cancelled_stream_keeps_slot_until_worker_ends(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def fake(name, task, *args, **kwargs):
+            calls.append(task)
+            started.set()
+            release.wait(5)
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake),
+            patch.object(server.runner, "dispatch", side_effect=fake),
+        ):
+            first = asyncio.create_task(server.dispatch_stream("infra", "stream"))
+            second = None
+            try:
+                assert await asyncio.to_thread(started.wait, 3)
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+                second = asyncio.create_task(server.dispatch("infra", "queued"))
+                await asyncio.sleep(0.15)
+                assert calls == ["stream"]
+            finally:
+                release.set()
+                await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+            assert calls == ["stream", "queued"]
+
+
+class TestSharedProcessLimit:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("first_path", ["dispatch", "dispatch_stream", "dispatch_async"])
+    @pytest.mark.parametrize("second_path", ["dispatch", "dispatch_stream", "dispatch_async"])
+    async def test_all_paths_share_one_limit(self, tmp_path, first_path, second_path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def fake(name, task, *args, **kwargs):
+            calls.append(task)
+            started.set()
+            release.wait(5)
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        async def run(path, task):
+            result = await getattr(server, path)("infra", task)
+            if path == "dispatch_async":
+                await _wait_terminal(json.loads(result)["job_id"])
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch", side_effect=fake),
+            patch.object(server.runner, "dispatch_stream", side_effect=fake),
+        ):
+            first = asyncio.create_task(run(first_path, "first"))
+            second = None
+            try:
+                assert await asyncio.to_thread(started.wait, 3)
+                second = asyncio.create_task(run(second_path, "second"))
+                await asyncio.sleep(0.15)
+                assert calls == ["first"]
+            finally:
+                release.set()
+                await asyncio.wait_for(
+                    asyncio.gather(first, *([second] if second else [])), timeout=5,
+                )
+            assert calls == ["first", "second"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("old_limit,new_limit", [(1, 2), (2, 1)])
+    async def test_resizing_keeps_existing_reservations(self, tmp_path, old_limit, new_limit):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = old_limit
+        release = threading.Event()
+        calls = []
+
+        def fake(name, task, *args, **kwargs):
+            calls.append(task)
+            release.wait(5)
+            return DispatchResult(agent=name, success=True, result="ok")
+
+        async def wait_for_calls(count):
+            for _ in range(300):
+                if len(calls) >= count:
+                    return
+                await asyncio.sleep(0.01)
+            pytest.fail(f"Only {len(calls)} workers started; expected {count}")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch", side_effect=fake),
+        ):
+            tasks = [
+                asyncio.create_task(server.dispatch("infra", str(i))) for i in range(old_limit)
+            ]
+            try:
+                await wait_for_calls(old_limit)
+                config.settings.max_concurrency = new_limit
+                tasks.extend(asyncio.create_task(server.dispatch("infra", f"new-{i}"))
+                             for i in range(2))
+                expected = max(old_limit, new_limit)
+                await wait_for_calls(expected)
+                await asyncio.sleep(0.15)
+                assert len(calls) == expected
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_never_launches_a_process(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        limiter = server._get_dispatch_limiter(config)
+        await limiter.acquire_async()
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch") as dispatch,
+        ):
+            task = asyncio.create_task(server.dispatch("infra", "cancel before starting"))
+            try:
+                await asyncio.sleep(0.1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                limiter.release()
+            await asyncio.sleep(0.1)
+            dispatch.assert_not_called()
+            await asyncio.wait_for(limiter.acquire_async(), timeout=1)
+            limiter.release()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["dispatch", "dispatch_stream"])
+    async def test_worker_exception_releases_slot(self, tmp_path, path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, path, side_effect=RuntimeError("worker failed")),
+        ):
+            with pytest.raises(RuntimeError, match="worker failed"):
+                await getattr(server, path)("infra", "task")
+            limiter = server._get_dispatch_limiter(config)
+            await asyncio.wait_for(limiter.acquire_async(), timeout=1)
+            limiter.release()
+
 
 class TestConfigWriteFailureIsAnEnvelope:
     """A config that cannot be *rendered* must not escape as a traceback.
@@ -3597,3 +4215,34 @@ class TestUsageSurface:
             info = json.loads(await server.inspect_agent("infra", preview_lines=0))
         assert len(agents) == 4
         assert info["name"] == "infra"
+
+
+class TestLoneSurrogateAnswers:
+    """An agent that hand-escapes an emoji as a lone ``\\udXXX`` in a JSON answer
+    used to make the tool raise PydanticSerializationError instead of answering,
+    and an async job lose its paid result in finish(). Real runner, fake CLI."""
+
+    ANSWER = '{"icon": "\\ud83d"}'
+
+    def _completed(self, *args, **kwargs):
+        import subprocess
+
+        stdout = json.dumps({"type": "result", "is_error": False, "result": self.ANSWER})
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+    async def test_dispatch_and_return_ref_answer(self, tmp_path):
+        config = _make_config(tmp_path)
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude"),
+            patch("agent_dispatch.runner._run_captured", side_effect=self._completed),
+        ):
+            plain = json.loads(await server.dispatch("infra", "t", response_format="json"))
+            ref = json.loads(
+                await server.dispatch("db", "t", response_format="json", return_ref=True)
+            )
+        assert plain["success"] is True
+        assert plain["parsed_result"] == {"icon": "�"}
+        assert ref["success"] is True and ref["ref"]
+        full = json.loads(await server.fetch_result(ref["ref"]))
+        assert full["parsed_result"] == {"icon": "�"}

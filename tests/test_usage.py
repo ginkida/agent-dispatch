@@ -7,6 +7,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from agent_dispatch import usage
 
 
@@ -295,6 +297,14 @@ class TestProfileMemo:
 
 
 class TestCorruptFieldsNeverRaise:
+    def test_nonfinite_cost_is_omitted_without_losing_the_journal_record(self):
+        usage.record("infra", ok=True, cost_usd=float("nan"))
+        raw = usage.journal_path().read_text(encoding="utf-8")
+        entry = json.loads(raw, parse_constant=pytest.fail)
+        assert entry["agent"] == "infra"
+        assert entry["ok"] is True
+        assert "cost" not in entry
+
     """A file a user can edit must degrade the report, never crash the command.
 
     `float("abc")` raises ValueError — not JSONDecodeError, not OSError — so it
@@ -332,3 +342,38 @@ class TestCorruptFieldsNeverRaise:
         assert usage.as_float("abc") == 0.0
         assert usage.as_float(None) == 0.0
         assert usage.as_float({"a": 1}, default=-1.0) == -1.0
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "1e999", 10**400])
+    def test_nonfinite_numbers_use_the_default(self, value):
+        assert usage.as_float(value, default=-1) == -1
+
+    def test_nonfinite_metrics_do_not_poison_statistics(self):
+        entries = [
+            {"agent": "a", "ok": True, "ms": float("nan"), "cost": float("inf")},
+            {"agent": "a", "ok": True, "ms": 10**400, "cost": float("nan")},
+            {"agent": "a", "ok": True, "ms": 1000, "cost": 0.5},
+        ]
+        report = usage.summarize(entries)
+        json.dumps(report, allow_nan=False)
+        assert report["total"]["dispatches"] == 3
+        assert report["total"]["cost_usd"] == 0.5
+        assert report["total"]["median_ms"] == 1000
+
+    def test_huge_finite_values_cannot_overflow_the_report(self):
+        # Each 1e308 is finite, so a finiteness filter alone keeps them — and
+        # their sum is inf, which `stats --json` printed as `Infinity`.
+        usage.journal_path().write_text(
+            '{"t": 1, "agent": "a", "ok": true, "cost": 1e308}\n'
+            '{"t": 2, "agent": "a", "ok": true, "cost": 1e308}\n'
+            '{"t": 3, "agent": "a", "ok": true, "ms": 1e308}\n'
+            '{"t": 4, "agent": "a", "ok": true, "ms": -5, "cost": -1}\n'
+            '{"t": 5, "agent": "a", "ok": true, "ms": 2000, "cost": 0.25}\n',
+            encoding="utf-8",
+        )
+        report = usage.summarize(usage.load())
+        json.dumps(report, allow_nan=False)
+        total = report["total"]
+        assert total["dispatches"] == 5
+        assert total["cost_usd"] == 0.25
+        assert total["max_cost_usd"] == 0.25
+        assert total["max_ms"] == total["p90_ms"] == total["median_ms"] == 2000

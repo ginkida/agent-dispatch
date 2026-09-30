@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import click
 import yaml
@@ -70,10 +72,13 @@ def _save_or_exit(config: DispatchConfig) -> None:
 
 
 def _check_budget_or_exit(max_budget: float | None) -> None:
-    """Reject a negative spend cap before it reaches `AgentConfig` (ge=0).
+    """Reject an invalid spend cap before constructing or mutating an agent.
 
     Without this the pydantic ValidationError escapes Click as a raw traceback.
     """
+    if max_budget is not None and not math.isfinite(max_budget):
+        click.echo("Error: --max-budget must be a finite number.")
+        raise SystemExit(1)
     if max_budget is not None and max_budget < 0:
         click.echo(
             click.style(
@@ -849,24 +854,135 @@ def group_remove(name: str) -> None:
     click.echo(f"Removed group '{name}'.")
 
 
+_PERMISSION_HINT = (
+    "    Your user needs read access to the file and search (x) access to every "
+    "parent directory."
+)
+
+
+def _doctor_load_config(
+    cp: Path,
+) -> tuple[DispatchConfig | None, tuple[str, str, list[str]]]:
+    """Load the config for doctor: (config or None, (status, message, details))."""
+    try:
+        # Outside load_config on purpose: a missing file is a WARN here, not an
+        # empty config. Before Python 3.14, Path.exists() re-raises EACCES from
+        # an unsearchable parent directory instead of answering False — and it
+        # sat outside every handler, so doctor tracebacked with no report.
+        exists = cp.exists()
+    except OSError as e:
+        return None, ("fail", f"Config could not be read: {cp}", [f"    {e}", _PERMISSION_HINT])
+    if not exists:
+        return None, ("warn", f"Config not found: {cp}", ["    Run: agent-dispatch init"])
+    try:
+        config = load_config(cp)
+    except ValidationError as e:
+        return None, ("fail", f"Config schema invalid: {cp}", [f"    {e}"])
+    except yaml.YAMLError as e:
+        return None, ("fail", f"Config not valid YAML: {cp}", [f"    {e}"])
+    except UnicodeDecodeError as e:
+        # A ValueError, not an OSError — it slipped past both handlers above
+        # and crashed the one command meant to diagnose a broken config.
+        return None, (
+            "fail",
+            f"Config is not valid UTF-8: {cp}",
+            [f"    {e}", "    Re-save the file as UTF-8."],
+        )
+    except OSError as e:
+        details = [f"    {e}"]
+        if isinstance(e, PermissionError):
+            details.append(_PERMISSION_HINT)
+        return None, ("fail", f"Config could not be read: {cp}", details)
+    n = len(config.agents)
+    return config, ("ok", f"Config: {cp} ({n} {'agent' if n == 1 else 'agents'})", [])
+
+
+def _protocol_flag_verdict(
+    config: DispatchConfig | None, cp: Path
+) -> tuple[str, str, list[str]]:
+    """Severity of a claude CLI without --append-system-prompt, given the config.
+
+    The runner sends that flag only when there is something to append: the
+    dispatch protocol (settings.dispatch_protocol) or an agent's instructions.
+    Warning unconditionally meant the printed remedy could never clear the
+    warning, so `doctor --strict` could not pass on a correctly configured
+    old CLI.
+    """
+    head = "claude CLI predates --append-system-prompt"
+    if config is None:
+        return "warn", f"{head}: dispatches that need it will fail", [
+            "    Config could not be loaded, so whether dispatches send it is unknown.",
+            "    Upgrade claude to use the dispatch protocol.",
+        ]
+    protocol = config.settings.dispatch_protocol
+    instructed = [name for name, a in config.agents.items() if a.instructions.strip()]
+    if not protocol and not instructed:
+        return "ok", f"{head}; unused (dispatch_protocol is off, no agent has instructions)", []
+    if protocol:
+        msg = f"{head}: every dispatch will fail"
+        details = ["    settings.dispatch_protocol is on (the default)."]
+    else:
+        msg = f"{head}: dispatches to {', '.join(instructed)} will fail"
+        details = []
+    if instructed:
+        details.append(f"    Agents with instructions: {', '.join(instructed)}.")
+    details.append("    Upgrade claude (recommended), or stop sending the flag:")
+    if protocol:
+        # No CLI command sets settings; say exactly which key to edit.
+        details.append(f"      set `dispatch_protocol: false` under `settings:` in {cp}")
+    for name in instructed:
+        details.append(f"      agent-dispatch update {name} --instructions none")
+    return "warn", msg, details
+
+
 @cli.command()
-def doctor() -> None:
+@click.option("--json", "as_json", is_flag=True, help="Output a structured diagnostic report.")
+@click.option("--strict", is_flag=True, help="Exit with code 1 for warnings as well as failures.")
+def doctor(as_json: bool, strict: bool) -> None:
     """Diagnose the agent-dispatch setup and surface common issues."""
     counters = {"issues": 0, "warnings": 0}
+    checks: list[dict] = []
+    current_section = ""
 
     def section(title: str) -> None:
-        click.echo(f"\n{click.style(title, bold=True)}")
+        nonlocal current_section
+        current_section = title
+        if not as_json:
+            click.echo(f"\n{click.style(title, bold=True)}")
+
+    def record(status: str, msg: str) -> None:
+        checks.append({"section": current_section, "status": status, "message": msg, "details": []})
+        if not as_json:
+            colors = {"ok": "green", "warn": "yellow", "fail": "red"}
+            label = click.style(status.upper(), fg=colors[status])
+            click.echo(f"  [{label}] {msg}")
+
+    def detail(msg: str) -> None:
+        checks[-1]["details"].append(msg.strip())
+        if not as_json:
+            click.echo(msg)
 
     def ok(msg: str) -> None:
-        click.echo(f"  [{click.style('OK', fg='green')}] {msg}")
+        record("ok", msg)
 
     def warn(msg: str) -> None:
         counters["warnings"] += 1
-        click.echo(f"  [{click.style('WARN', fg='yellow')}] {msg}")
+        record("warn", msg)
 
     def fail(msg: str) -> None:
         counters["issues"] += 1
-        click.echo(f"  [{click.style('FAIL', fg='red')}] {msg}")
+        record("fail", msg)
+
+    def emit(status: str, msg: str, details: list[str]) -> None:
+        {"ok": ok, "warn": warn, "fail": fail}[status](msg)
+        for line in details:
+            detail(line)
+
+    # Loaded up front, reported under "Config" below. The Environment section
+    # needs it too: whether an old claude CLI actually breaks anything depends
+    # on settings.dispatch_protocol and on which agents carry instructions.
+    cp = config_path()
+    config, config_check = _doctor_load_config(cp)
 
     section("Environment")
     claude_path = shutil.which("claude")
@@ -876,14 +992,12 @@ def doctor() -> None:
         if supported is True:
             ok("claude CLI supports --append-system-prompt (dispatch protocol)")
         elif supported is False:
-            warn("claude CLI predates --append-system-prompt: every dispatch will fail")
-            click.echo("    Upgrade claude, or set `settings.dispatch_protocol: false` and")
-            click.echo("    clear orders orders: agent-dispatch update <name> --instructions none")
+            emit(*_protocol_flag_verdict(config, cp))
         else:
             warn("Could not run `claude --help` to check --append-system-prompt support")
     else:
         fail("claude CLI not found on PATH")
-        click.echo("    Install: https://docs.anthropic.com/en/docs/claude-code")
+        detail("    Install: https://docs.anthropic.com/en/docs/claude-code")
 
     ad_path = shutil.which("agent-dispatch")
     if ad_path:
@@ -899,7 +1013,7 @@ def doctor() -> None:
     if not live:
         ok("No agent-dispatch server is registered as running")
     else:
-        drift = servers.version_drift(__version__)
+        drift = servers.version_drift(__version__, entries=live)
         stale_count = sum(drift.values())
         ok(f"{len(live)} server process(es) registered, {len(live) - stale_count} on {__version__}")
     # Printed in BOTH branches on purpose. A server only registers if it was
@@ -907,48 +1021,23 @@ def doctor() -> None:
     # bound — on the machine this was written, 19 servers were running and
     # exactly 1 of them appeared here. Reporting "1 server running" without
     # this line would be a diagnostic that quietly under-counts.
-    click.echo("    Lower bound: only servers started on this version or later register here.")
+    detail("    Lower bound: only servers started on this version or later register here.")
     if live:
         if drift:
             versions = ", ".join(f"{n}x {v}" for v, n in drift.items())
             warn(f"{stale_count} server(s) still executing older code: {versions}")
-            click.echo("    A server keeps its modules in memory for life, so an upgrade")
-            click.echo("    reaches an open Claude Code session only when that session")
-            click.echo("    restarts. Restart them to pick up the installed version.")
+            detail("    A server keeps its modules in memory for life, so an upgrade")
+            detail("    reaches an open Claude Code session only when that session")
+            detail("    restarts. Restart them to pick up the installed version.")
             for entry in live:
                 version = str(entry.get("version") or "unknown")
                 if version != __version__:
-                    started = entry.get("started_at")
-                    age = f", up {_age(usage_mod.as_float(started))}" if started else ""
-                    click.echo(f"      pid {entry.get('pid')}: {version}{age}")
+                    started = usage_mod.as_float(entry.get("started_at"))
+                    age = f", up {_age(started)}" if started > 0 else ""
+                    detail(f"      pid {entry.get('pid')}: {version}{age}")
 
     section("Config")
-    cp = config_path()
-    config: DispatchConfig | None = None
-    if not cp.exists():
-        warn(f"Config not found: {cp}")
-        click.echo("    Run: agent-dispatch init")
-    else:
-        try:
-            config = load_config()
-            n = len(config.agents)
-            suffix = "agent" if n == 1 else "agents"
-            ok(f"Config: {cp} ({n} {suffix})")
-        except ValidationError as e:
-            fail(f"Config schema invalid: {cp}")
-            click.echo(f"    {e}")
-        except yaml.YAMLError as e:
-            fail(f"Config not valid YAML: {cp}")
-            click.echo(f"    {e}")
-        except UnicodeDecodeError as e:
-            # A ValueError, not an OSError — it slipped past both handlers above
-            # and crashed the one command meant to diagnose a broken config.
-            fail(f"Config is not valid UTF-8: {cp}")
-            click.echo(f"    {e}")
-            click.echo("    Re-save the file as UTF-8.")
-        except OSError as e:
-            fail(f"Config could not be read: {cp}")
-            click.echo(f"    {e}")
+    emit(*config_check)
 
     section("MCP registration")
     if claude_path is None:
@@ -959,6 +1048,11 @@ def doctor() -> None:
                 [claude_path, "mcp", "list"],
                 capture_output=True,
                 text=True,
+                # Strict decoding raised UnicodeDecodeError — a ValueError, so
+                # it walked past every arm below and doctor (and --json) died
+                # with a traceback on one non-UTF-8 byte in a server's name.
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             # Match the server name at the start of any line — `claude mcp list`
@@ -969,7 +1063,7 @@ def doctor() -> None:
                 ok("agent-dispatch is registered with Claude Code")
             else:
                 warn("agent-dispatch is not registered with Claude Code")
-                click.echo("    Run: agent-dispatch init")
+                detail("    Run: agent-dispatch init")
         except subprocess.TimeoutExpired:
             warn("Could not check MCP registration: claude mcp list timed out")
         except (FileNotFoundError, PermissionError, OSError) as e:
@@ -1007,13 +1101,13 @@ def doctor() -> None:
             if unknown:
                 missing = ", ".join(unknown)
                 fail(f"{name}: unknown member(s): {missing}")
-                click.echo(
+                detail(
                     f"    Fix by recreating: agent-dispatch group remove {name} && "
                     f"agent-dispatch group add {name} --member ... (or edit agents.yaml)"
                 )
             elif not group.members:
                 warn(f"{name}: no members configured")
-                click.echo(
+                detail(
                     f"    Add members by recreating: agent-dispatch group remove {name} && "
                     f"agent-dispatch group add {name} --member agent1 --member agent2"
                 )
@@ -1022,9 +1116,20 @@ def doctor() -> None:
                 suffix = "member" if count == 1 else "members"
                 ok(f"{name}: {count} {suffix}")
 
-    section("Summary")
     issues = counters["issues"]
     warnings = counters["warnings"]
+    if as_json:
+        click.echo(json.dumps({
+            "schema_version": 1,
+            "status": "fail" if issues else "warn" if warnings else "ok",
+            **counters,
+            "checks": checks,
+        }, ensure_ascii=False, indent=2))
+        if issues or (strict and warnings):
+            raise SystemExit(1)
+        return
+
+    section("Summary")
     if issues == 0 and warnings == 0:
         click.echo(click.style("All checks passed.", fg="green"))
     else:
@@ -1044,7 +1149,7 @@ def doctor() -> None:
                 )
             )
         click.echo(", ".join(parts))
-        if issues > 0:
+        if issues > 0 or (strict and warnings):
             raise SystemExit(1)
 
 
@@ -1077,6 +1182,15 @@ def _styled_status(status: str) -> str:
     return click.style(status, fg=_STATUS_COLORS.get(status, "white"))
 
 
+def _job_error(message: str, *, as_json: bool) -> NoReturn:
+    """Keep operational errors parseable for callers using job commands as JSON."""
+    if as_json:
+        click.echo(json.dumps({"error": message}, ensure_ascii=False))
+    else:
+        click.echo(click.style(message, fg="red"))
+    raise SystemExit(1)
+
+
 @cli.command("jobs")
 @click.option(
     "--status",
@@ -1085,9 +1199,18 @@ def _styled_status(status: str) -> str:
     help="Filter by job status.",
 )
 @click.option("--limit", default=20, type=int, help="Max jobs shown (default: 20).")
-def jobs_list(status: str | None, limit: int) -> None:
+@click.option("--agent", default=None, help="Filter by exact agent name, including removed agents.")
+@click.option("--json", "as_json", is_flag=True, help="Output compact job summaries as JSON.")
+def jobs_list(status: str | None, limit: int, agent: str | None, as_json: bool) -> None:
     """List async dispatch jobs (most recent first)."""
-    jobs = _job_store().list(status=status)[: max(1, limit)]  # type: ignore[arg-type]
+    try:
+        jobs = _job_store().list(status=status, agent=agent)  # type: ignore[arg-type]
+    except OSError as e:
+        _job_error(f"Could not read job storage: {e}", as_json=as_json)
+    jobs = jobs[: max(1, limit)]
+    if as_json:
+        click.echo(json.dumps([job.summary() for job in jobs], ensure_ascii=False, indent=2))
+        return
     if not jobs:
         click.echo("No jobs found." if status is None else f"No {status} jobs found.")
         return
@@ -1102,15 +1225,20 @@ def jobs_list(status: str | None, limit: int) -> None:
 
 @cli.command("job")
 @click.argument("job_id")
-def job_show(job_id: str) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Output the full, untruncated job record.")
+def job_show(job_id: str, as_json: bool) -> None:
     """Show one async job in detail (status, progress tail, result preview)."""
     if not is_valid_job_id(job_id):
-        click.echo(click.style(f"Invalid job id: {job_id!r} (expected 32 hex chars)", fg="red"))
-        raise SystemExit(1)
-    job = _job_store().get(job_id)
+        _job_error(f"Invalid job id: {job_id!r} (expected 32 hex chars)", as_json=as_json)
+    try:
+        job = _job_store().get(job_id)
+    except OSError as e:
+        _job_error(f"Could not read job storage: {e}", as_json=as_json)
     if job is None:
-        click.echo(click.style(f"Job not found: {job_id}", fg="red"))
-        raise SystemExit(1)
+        _job_error(f"Job not found: {job_id}", as_json=as_json)
+    if as_json:
+        click.echo(job.model_dump_json(indent=2, exclude_none=True))
+        return
 
     click.echo(f"{click.style(job.id, bold=True)} [{_styled_status(job.status)}]")
     click.echo(f"  agent:      {job.agent}")
@@ -1161,7 +1289,12 @@ def job_cancel(job_id: str) -> None:
     if not is_valid_job_id(job_id):
         click.echo(click.style(f"Invalid job id: {job_id!r} (expected 32 hex chars)", fg="red"))
         raise SystemExit(1)
-    job, outcome = _job_store().cancel(job_id)
+    # Same guard as `jobs`/`job`: an uncreatable jobs dir (a file in the way,
+    # a read-only volume) raised OSError out of JobStore() as a traceback.
+    try:
+        job, outcome = _job_store().cancel(job_id)
+    except OSError as e:
+        _job_error(f"Could not access job storage: {e}", as_json=False)
     if outcome == "not_found":
         click.echo(click.style(f"Job not found: {job_id}", fg="red"))
         raise SystemExit(1)
@@ -1189,16 +1322,13 @@ def job_cancel(job_id: str) -> None:
     is_flag=True,
     help="Purge every terminal job regardless of age (what --days 0 used to do silently).",
 )
-def jobs_gc(days: int, purge_all: bool) -> None:
+@click.option("--dry-run", is_flag=True, help="Show eligible jobs without deleting them.")
+def jobs_gc(days: int, purge_all: bool, dry_run: bool) -> None:
     """Purge old terminal async jobs (done/failed/cancelled)."""
-    if purge_all:
-        deleted = _job_store().gc(0)
-        click.echo(f"Deleted {deleted} terminal job(s) (all ages).")
-        return
     # `--days 0` used to clamp to a cutoff of "now" and wipe every terminal job,
     # including return_ref results a caller was about to fetch — while the
     # dispatch_gc MCP tool rejected the same input. Reject it here too.
-    if days <= 0:
+    if not purge_all and days <= 0:
         click.echo(
             click.style(
                 f"Error: --days must be > 0 (got {days}). "
@@ -1207,8 +1337,25 @@ def jobs_gc(days: int, purge_all: bool) -> None:
             )
         )
         raise SystemExit(1)
-    deleted = _job_store().gc(days * 86400)
-    click.echo(f"Deleted {deleted} job(s) older than {days} day(s).")
+    max_age_seconds = 0 if purge_all else days * 86400
+    try:
+        store = _job_store()
+        if dry_run:
+            candidates = store.gc_candidates(max_age_seconds)
+        else:
+            deleted = store.gc(max_age_seconds)
+    except OSError as e:
+        _job_error(f"Could not access job storage: {e}", as_json=False)
+    if dry_run:
+        for job in candidates:
+            task = job.task[:60].replace("\n", " ")
+            click.echo(f"{job.id}  {job.status}  {job.agent}  {task}")
+        click.echo(f"Would delete {len(candidates)} terminal job(s). No jobs deleted.")
+        return
+    if purge_all:
+        click.echo(f"Deleted {deleted} terminal job(s) (all ages).")
+    else:
+        click.echo(f"Deleted {deleted} job(s) older than {days} day(s).")
 
 
 def _fmt_seconds(ms: float) -> str:
@@ -1243,7 +1390,14 @@ def usage_stats(days: int, agent: str | None, as_json: bool) -> None:
         # Always valid JSON, including the empty case — a caller piping this
         # into a parser must not get prose on a fresh install, which is
         # exactly when the journal is empty.
-        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+        # allow_nan=False: bare NaN/Infinity is not JSON, and json.dumps emits
+        # it silently — the consumer's parser is what fails. usage.py bounds
+        # the values; this is the backstop that keeps the output parseable.
+        try:
+            click.echo(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
+        except ValueError as e:
+            click.echo(json.dumps({"error": f"Usage report has a non-finite value: {e}"}))
+            raise SystemExit(1) from None
         return
     if not entries:
         window = f" in the last {days} day(s)" if days else ""

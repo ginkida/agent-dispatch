@@ -7,11 +7,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
 
@@ -24,7 +26,10 @@ from agent_dispatch.models import DispatchResult
 def _isolated_config(tmp_path: Path):
     """Point config at a temp file so tests don't touch the real config."""
     config_file = tmp_path / "agents.yaml"
-    with patch.dict(os.environ, {"AGENT_DISPATCH_CONFIG": str(config_file)}):
+    with patch.dict(os.environ, {
+        "AGENT_DISPATCH_CONFIG": str(config_file),
+        "AGENT_DISPATCH_JOBS_DIR": str(tmp_path / "jobs"),
+    }):
         yield config_file
 
 
@@ -32,6 +37,14 @@ runner = CliRunner()
 
 
 class TestAdd:
+    def test_name_with_trailing_newline_is_rejected_without_config_write(
+        self, tmp_path, _isolated_config,
+    ):
+        result = runner.invoke(cli, ["add", "agent\n", str(tmp_path), "-d", "Test"])
+        assert result.exit_code == 1
+        assert "Invalid agent name" in result.output
+        assert not _isolated_config.exists()
+
     def test_add_basic(self, tmp_path: Path):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
@@ -654,6 +667,98 @@ class TestDescribe:
 class TestDoctor:
     """Tests for `agent-dispatch doctor` diagnostic command."""
 
+    def test_json_healthy_report(self, tmp_path):
+        directory = tmp_path / "проект"
+        directory.mkdir()
+        assert runner.invoke(cli, ["add", "proj", str(directory), "-d", "Test"]).exit_code == 0
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+            self._patch_claude_mcp_list(),
+        ):
+            result = runner.invoke(cli, ["doctor", "--json", "--strict"])
+        assert result.exit_code == 0, result.output
+        report = json.loads(result.output)
+        assert report["schema_version"] == 1
+        assert report["status"] == "ok"
+        assert report["issues"] == report["warnings"] == 0
+        assert {check["section"] for check in report["checks"]} == {
+            "Environment", "Running servers", "Config", "MCP registration", "Agents", "Groups",
+        }
+        assert all(check["status"] == "ok" for check in report["checks"])
+        assert "проект" in result.output
+
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_warning_exit_policy(self, strict, as_json):
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+            self._patch_claude_mcp_list(),
+        ):
+            args = ["doctor"] + (["--json"] if as_json else []) + (["--strict"] if strict else [])
+            result = runner.invoke(cli, args)
+        assert result.exit_code == int(strict), result.output
+        if as_json:
+            report = json.loads(result.output)
+            assert report["status"] == "warn"
+            assert report["issues"] == 0
+            assert report["warnings"] > 0
+            check = next(check for check in report["checks"] if check["section"] == "Config")
+            assert "Run: agent-dispatch init" in check["details"]
+
+    @pytest.mark.parametrize("content", [b"agents: [", b"agents: 12", b"\xff\xfeinvalid"])
+    def test_json_corrupt_config_reports_failure(self, _isolated_config, content):
+        _isolated_config.write_bytes(content)
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+            self._patch_claude_mcp_list(),
+        ):
+            result = runner.invoke(cli, ["doctor", "--json"])
+        assert result.exit_code == 1, result.output
+        report = json.loads(result.output)
+        assert report["status"] == "fail"
+        assert report["issues"] == sum(check["status"] == "fail" for check in report["checks"])
+        assert report["warnings"] == sum(check["status"] == "warn" for check in report["checks"])
+        check = next(check for check in report["checks"] if check["section"] == "Config")
+        assert check["status"] == "fail"
+        assert check["details"]
+
+    def test_json_missing_cli_includes_remediation(self):
+        with patch("agent_dispatch.cli.shutil.which", return_value=None):
+            result = runner.invoke(cli, ["doctor", "--json"])
+        assert result.exit_code == 1
+        report = json.loads(result.output)
+        check = next(check for check in report["checks"] if check["status"] == "fail")
+        assert check["message"] == "claude CLI not found on PATH"
+        assert any("Install:" in detail for detail in check["details"])
+
+    def test_server_counts_use_one_snapshot(self):
+        from agent_dispatch import __version__
+
+        entries = [{"pid": 1, "version": __version__}, {"pid": 2, "version": "0.1.0"}]
+        with (
+            patch("agent_dispatch.cli.shutil.which", return_value=None),
+            patch("agent_dispatch.servers.live_servers", return_value=entries) as scan,
+        ):
+            result = runner.invoke(cli, ["doctor", "--json"])
+        report = json.loads(result.output)
+        scan.assert_called_once()
+        checks = [check for check in report["checks"] if check["section"] == "Running servers"]
+        assert "2 server process(es) registered, 1 on" in checks[0]["message"]
+        assert "1 server(s) still executing older code" in checks[1]["message"]
+
+    @pytest.mark.parametrize("started", ["NaN", "Infinity", "broken"])
+    def test_bad_server_timestamp_is_not_shown_as_uptime(self, started):
+        with (
+            patch("agent_dispatch.cli.shutil.which", return_value=None),
+            patch("agent_dispatch.servers.live_servers", return_value=[{
+                "pid": 123, "version": "0.1.0", "started_at": started,
+            }]),
+        ):
+            result = runner.invoke(cli, ["doctor", "--json"])
+        report = json.loads(result.output, parse_constant=pytest.fail)
+        checks = [check for check in report["checks"] if check["section"] == "Running servers"]
+        assert "pid 123: 0.1.0" in checks[1]["details"]
+
     def _patch_claude_mcp_list(
         self,
         *,
@@ -1100,6 +1205,92 @@ def jobs_env(tmp_path: Path):
 
 
 class TestJobsCommands:
+    @pytest.mark.parametrize("command", ["jobs", "job"])
+    def test_bad_stored_cost_does_not_break_json_or_lose_result(self, jobs_env, command):
+        job = jobs_env.create_completed(
+            "infra", "task", DispatchResult(agent="infra", success=True, result="paid output")
+        )
+        payload = job.model_dump()
+        payload["result"]["cost_usd"] = "NaN"
+        (jobs_env.directory / f"{job.id}.json").write_text(json.dumps(payload), encoding="utf-8")
+        args = ["jobs", "--json"] if command == "jobs" else ["job", job.id, "--json"]
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output, parse_constant=pytest.fail)
+        if command == "jobs":
+            assert data[0]["id"] == job.id
+            assert "cost_usd" not in data[0]
+        else:
+            assert data["result"]["result"] == "paid output"
+            assert "cost_usd" not in data["result"]
+
+    def test_jobs_json_empty(self, jobs_env):
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output) == []
+
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_agent_and_status_filters_apply_before_limit(self, jobs_env, as_json):
+        wanted = jobs_env.create_completed(
+            "removed-agent", "проверить сервис",
+            DispatchResult(agent="removed-agent", success=True, result="готово", cost_usd=0.03),
+        )
+        jobs_env.create("removed-agent", "still pending")
+        jobs_env.create_completed(
+            "other", "newer", DispatchResult(agent="other", success=True, result="done")
+        )
+        args = ["jobs", "--agent", "removed-agent", "--status", "done", "--limit", "1"]
+        result = runner.invoke(cli, args + (["--json"] if as_json else []))
+        assert result.exit_code == 0, result.output
+        assert wanted.id in result.output
+        assert "проверить сервис" in result.output
+        assert "still pending" not in result.output
+        assert "newer" not in result.output
+        if as_json:
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["success"] is True
+            assert data[0]["cost_usd"] == 0.03
+            assert "result" not in data[0]
+
+    def test_job_json_preserves_full_result_and_metadata(self, jobs_env):
+        job = jobs_env.create("infra", "задача" * 100, context="контекст", caller="api")
+        jobs_env.mark_running(job.id)
+        progress = [f"шаг {i}" for i in range(20)]
+        jobs_env.update_progress(job.id, progress)
+        output = "результат\n" * 1000
+        jobs_env.finish(job.id, DispatchResult(
+            agent="infra", success=True, result=output, session_id="session-123",
+            outcome="partial", hint="Continue the session", cost_usd=0.01,
+        ))
+        result = runner.invoke(cli, ["job", job.id, "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["task"] == job.task
+        assert data["context"] == "контекст"
+        assert data["caller"] == "api"
+        assert data["progress"] == progress
+        assert data["result"]["result"] == output
+        assert data["result"]["session_id"] == "session-123"
+        assert data["result"]["outcome"] == "partial"
+        assert data["result"]["hint"] == "Continue the session"
+        assert "результат" in result.output
+
+    @pytest.mark.parametrize("job_id", ["../invalid", "f" * 32])
+    def test_job_json_errors_are_parseable(self, jobs_env, job_id):
+        result = runner.invoke(cli, ["job", job_id, "--json"])
+        assert result.exit_code == 1
+        assert "error" in json.loads(result.output)
+
+    @pytest.mark.parametrize("args", [["jobs"], ["job", "f" * 32]])
+    def test_json_storage_error_is_parseable(self, tmp_path, monkeypatch, args):
+        path = tmp_path / "not-a-directory"
+        path.write_text("occupied", encoding="utf-8")
+        monkeypatch.setenv("AGENT_DISPATCH_JOBS_DIR", str(path))
+        result = runner.invoke(cli, [*args, "--json"])
+        assert result.exit_code == 1
+        assert "Could not read job storage" in json.loads(result.output)["error"]
+
     def test_jobs_empty(self, jobs_env):
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
@@ -1332,6 +1523,29 @@ class TestGcGuards:
             "infra", "task", DispatchResult(agent="infra", success=True, result="done")
         )
 
+    @pytest.mark.parametrize("args", [["--all"], ["--days", "7"]])
+    def test_dry_run_previews_without_deleting(self, jobs_env, args):
+        job = self._finished_job(jobs_env)
+        job.completed_at = 1
+        jobs_env._write(job)
+        pending = jobs_env.create("infra", "pending")
+        result = runner.invoke(cli, ["gc", *args, "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert job.id in result.output
+        assert pending.id not in result.output
+        assert "Would delete 1" in result.output
+        assert jobs_env.get(job.id) == job
+
+    def test_dry_run_empty(self, jobs_env):
+        result = runner.invoke(cli, ["gc", "--dry-run"])
+        assert result.exit_code == 0
+        assert "Would delete 0" in result.output
+
+    def test_dry_run_rejects_invalid_age(self, jobs_env):
+        result = runner.invoke(cli, ["gc", "--days", "0", "--dry-run"])
+        assert result.exit_code == 1
+        assert "must be > 0" in result.output
+
     def test_days_zero_is_rejected(self, jobs_env):
         job = self._finished_job(jobs_env)
         result = runner.invoke(cli, ["gc", "--days", "0"])
@@ -1434,6 +1648,20 @@ class TestBrokenConfigMessages:
 
 
 class TestAddBudgetGuard:
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999"])
+    def test_nonfinite_budget_never_changes_config(self, tmp_path, _isolated_config, value):
+        assert runner.invoke(cli, ["add", "proj", str(tmp_path), "-d", "d"]).exit_code == 0
+        before = _isolated_config.read_bytes()
+        for command in (
+            ["add", "new", str(tmp_path), "-d", "d"],
+            ["update", "proj"],
+        ):
+            result = runner.invoke(cli, [*command, "--max-budget", value])
+            assert result.exit_code == 1
+            assert "finite" in result.output
+            assert not isinstance(result.exception, ValidationError)
+            assert _isolated_config.read_bytes() == before
+
     def test_add_rejects_negative_budget(self, tmp_path: Path, _isolated_config):
         # AgentConfig.max_budget_usd is ge=0 — the CLI must not leak the
         # pydantic ValidationError as a traceback.
@@ -1463,16 +1691,18 @@ class TestNonUtf8Config:
         assert "UTF-8" in result.output
         assert not isinstance(result.exception, UnicodeDecodeError)
 
-    def test_doctor_diagnoses_instead_of_crashing(self, _isolated_config):
+    def test_doctor_diagnoses_instead_of_crashing(self, _isolated_config, monkeypatch):
         # doctor is the command you reach for when the config is broken — it
         # must never be the one that crashes on it.
         self._write_cp1251(_isolated_config)
+        monkeypatch.setattr("agent_dispatch.cli.shutil.which", lambda name: None)
         result = runner.invoke(cli, ["doctor"])
         assert not isinstance(result.exception, UnicodeDecodeError)
         assert "not valid UTF-8" in result.output
         assert "Re-save the file as UTF-8" in result.output
 
     def test_unreadable_config_is_reported_by_doctor(self, _isolated_config, monkeypatch):
+        monkeypatch.setattr("agent_dispatch.cli.shutil.which", lambda name: None)
         _isolated_config.write_text("agents: {}\n")
         monkeypatch.setattr(
             "agent_dispatch.cli.load_config",
@@ -1595,7 +1825,7 @@ class TestDoctorProtocolProbe:
             result = runner.invoke(cli, ["doctor"])
         assert "[OK] claude CLI supports --append-system-prompt" in result.output
 
-    def test_unsupported_warns_with_a_runnable_remedy(self, tmp_path: Path):
+    def test_unsupported_warns_with_a_runnable_remedy(self, tmp_path: Path, _isolated_config):
         agent_dir = tmp_path / "proj"
         agent_dir.mkdir()
         runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T", "--instructions", "x"])
@@ -1613,13 +1843,81 @@ class TestDoctorProtocolProbe:
         ):
             result = runner.invoke(cli, ["doctor"])
         assert "[WARN] claude CLI predates --append-system-prompt" in result.output
-        assert "dispatch_protocol: false" in result.output
+        assert "every dispatch will fail" in result.output
+        assert "Agents with instructions: proj." in result.output
+        # No CLI command sets settings, so the hint names the key and the file.
+        assert f"set `dispatch_protocol: false` under `settings:` in {_isolated_config}" in (
+            result.output
+        )
         # Run the command the hint prints (remediation text is a contract).
-        m = re.search(r"agent-dispatch (update <name> --instructions none)", result.output)
+        m = re.search(r"agent-dispatch (update proj --instructions none)", result.output)
         assert m, result.output
-        argv = m.group(1).replace("<name>", "proj").split()
-        assert runner.invoke(cli, argv).exit_code == 0
+        assert runner.invoke(cli, m.group(1).split()).exit_code == 0
         assert load_config().agents["proj"].instructions == ""
+
+    def _doctor_old_cli(self, *args: str):
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=self._which),
+            patch("agent_dispatch.cli._claude_supports_flag", return_value=False),
+            patch("agent_dispatch.cli.subprocess.run", return_value=self._mcp_list()),
+        ):
+            return runner.invoke(cli, ["doctor", *args])
+
+    def _protocol_check(self, result) -> dict:
+        report = json.loads(result.output)
+        return next(c for c in report["checks"] if "--append-system-prompt" in c["message"])
+
+    def test_applying_the_printed_remedy_clears_the_warning(self, tmp_path, _isolated_config):
+        """The WARN used to ignore the config, so following it could never pass --strict."""
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T", "--instructions", "x"])
+        assert self._doctor_old_cli("--strict").exit_code == 1
+
+        # Exactly what the hint says: the settings key, then the printed command.
+        raw = yaml.safe_load(_isolated_config.read_text())
+        raw.setdefault("settings", {})["dispatch_protocol"] = False
+        _isolated_config.write_text(yaml.safe_dump(raw))
+        partial = self._doctor_old_cli()
+        assert "dispatches to proj will fail" in partial.output
+        assert "dispatch_protocol: false" not in partial.output  # already done
+        assert runner.invoke(cli, ["update", "proj", "--instructions", "none"]).exit_code == 0
+
+        result = self._doctor_old_cli("--strict")
+        assert result.exit_code == 0, result.output
+        assert "[OK] claude CLI predates --append-system-prompt; unused" in result.output
+        assert "All checks passed." in result.output
+
+        as_json = self._doctor_old_cli("--json", "--strict")
+        assert as_json.exit_code == 0, as_json.output
+        check = self._protocol_check(as_json)
+        assert (check["section"], check["status"]) == ("Environment", "ok")
+        assert json.loads(as_json.output)["status"] == "ok"
+
+    def test_protocol_on_without_instructions_still_warns(self, tmp_path, _isolated_config):
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T"])
+        result = self._doctor_old_cli("--json", "--strict")
+        assert result.exit_code == 1
+        check = self._protocol_check(result)
+        assert (check["section"], check["status"]) == ("Environment", "warn")
+        assert "every dispatch will fail" in check["message"]
+        assert "settings.dispatch_protocol is on (the default)." in check["details"]
+        assert not any("--instructions none" in d for d in check["details"])
+
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_unloadable_config_cannot_clear_the_warning(self, _isolated_config, as_json):
+        _isolated_config.write_text("settings:\n  dispatch_protocol: false\nagents: 12\n")
+        result = self._doctor_old_cli(*(["--json"] if as_json else []))
+        assert result.exit_code == 1  # the schema FAIL
+        if as_json:
+            check = self._protocol_check(result)
+            assert (check["section"], check["status"]) == ("Environment", "warn")
+            assert any("could not be loaded" in d for d in check["details"])
+        else:
+            assert "[WARN] claude CLI predates --append-system-prompt" in result.output
+            assert "Config could not be loaded" in result.output
 
     def test_probe_failure_is_a_warning_not_a_crash(self):
         def run(cmd, **kw):
@@ -1637,6 +1935,24 @@ class TestDoctorProtocolProbe:
 
 
 class TestStatsCommand:
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_nonfinite_metrics_are_ignored(self, as_json):
+        from agent_dispatch import usage
+
+        usage.journal_path().write_text(
+            '{"t": 1, "agent": "a", "ok": true, "ms": NaN, "cost": Infinity}\n'
+            '{"t": 2, "agent": "a", "ok": true, "ms": 1000, "cost": 0.5}\n',
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["stats", *(["--json"] if as_json else [])])
+        assert result.exit_code == 0, result.output
+        if as_json:
+            report = json.loads(result.output, parse_constant=pytest.fail)
+            assert report["total"]["cost_usd"] == 0.5
+            assert report["total"]["median_ms"] == 1000
+        else:
+            assert "$0.5000" in result.output
+
     """`agent-dispatch stats` is the human answer to "what did this fleet cost"."""
 
     def _seed(self) -> None:
@@ -1761,3 +2077,106 @@ class TestDoctorServerDrift:
         assert "pid 4243" not in result.output  # the current one needs no action
         assert "WARN" in result.output
         assert "FAIL" not in result.output
+
+
+class TestDoctorNeverTracebacks:
+    """doctor is what you run when something is broken; it must always report."""
+
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_non_utf8_mcp_list_output_is_decoded(self, tmp_path: Path, as_json):
+        # A real child process: a mock returning str would skip the decode step
+        # where UnicodeDecodeError (a ValueError) used to escape every handler.
+        # Not named "claude" — conftest refuses to spawn anything by that name.
+        fake = tmp_path / "fake-claude"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.stdout.buffer.write(b'agent-dispatch: /opt/\\xff\\xfe/bin serve - Connected\\n')\n"
+        )
+        fake.chmod(0o755)
+
+        def which(name: str):
+            return str(fake) if name == "claude" else f"/usr/bin/{name}"
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=which),
+            patch("agent_dispatch.cli._claude_supports_flag", return_value=True),
+        ):
+            result = runner.invoke(cli, ["doctor", *(["--json"] if as_json else [])])
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        if as_json:
+            report = json.loads(result.output)
+            check = next(c for c in report["checks"] if c["section"] == "MCP registration")
+            assert check["status"] == "ok", check
+        else:
+            assert "[OK] agent-dispatch is registered with Claude Code" in result.output
+
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root ignores directory permissions",
+    )
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_unsearchable_config_dir_is_a_fail_not_a_traceback(self, tmp_path: Path, as_json):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        cfg = locked / "agents.yaml"
+        cfg.write_text("agents: {}\n")
+        locked.chmod(0o000)
+        try:
+            with (
+                patch.dict(os.environ, {"AGENT_DISPATCH_CONFIG": str(cfg)}),
+                patch("agent_dispatch.cli.shutil.which", return_value=None),
+            ):
+                result = runner.invoke(cli, ["doctor", *(["--json"] if as_json else [])])
+        finally:
+            locked.chmod(0o700)
+        assert result.exit_code == 1
+        assert not isinstance(result.exception, OSError), result.exception
+        if as_json:
+            report = json.loads(result.output)
+            check = next(c for c in report["checks"] if c["section"] == "Config")
+            assert check["status"] == "fail"
+            assert check["message"] == f"Config could not be read: {cfg}"
+            assert any("search (x) access to every parent" in d for d in check["details"])
+            later = [c for c in report["checks"] if c["section"] in ("Agents", "Groups")]
+            assert all(c["message"] == "Skipped (config could not be loaded)" for c in later)
+        else:
+            assert "[FAIL] Config could not be read" in result.output
+            assert "search (x) access to every parent directory" in result.output
+
+
+class TestJobStorageUnavailable:
+    """gc/cancel took no OSError guard, unlike jobs/job — a traceback, not a message."""
+
+    @pytest.fixture()
+    def blocked_jobs_dir(self, tmp_path: Path):
+        # A regular file where a directory must go: mkdir fails even for root,
+        # unlike a chmod-based setup.
+        (tmp_path / "f").write_text("")
+        with patch.dict(os.environ, {"AGENT_DISPATCH_JOBS_DIR": str(tmp_path / "f" / "jobs")}):
+            yield
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["gc"],
+            ["gc", "--dry-run"],
+            ["gc", "--all"],
+            ["cancel", "0" * 32],
+        ],
+    )
+    def test_reports_instead_of_raising(self, blocked_jobs_dir, args):
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert "Could not access job storage" in result.output
+
+
+class TestStatsJsonBackstop:
+    def test_nonfinite_value_yields_a_json_error_not_bare_nan(self):
+        report = {"total": {"dispatches": 1, "cost_usd": float("nan")}, "agents": {}}
+        with patch("agent_dispatch.usage.summarize", return_value=report):
+            result = runner.invoke(cli, ["stats", "--json"])
+        assert result.exit_code == 1
+        payload = json.loads(result.output, parse_constant=pytest.fail)
+        assert "non-finite" in payload["error"]

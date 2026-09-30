@@ -146,10 +146,12 @@ def live_servers(*, directory: Path | None = None, prune: bool = True) -> list[d
     return out
 
 
-def version_drift(current: str, *, directory: Path | None = None) -> dict[str, int]:
-    """Live servers whose version differs from *current*, counted by version."""
+def version_drift(
+    current: str, *, directory: Path | None = None, entries: list[dict] | None = None,
+) -> dict[str, int]:
+    """Count other versions, optionally reusing an already-read registry snapshot."""
     drift: dict[str, int] = {}
-    for entry in live_servers(directory=directory):
+    for entry in live_servers(directory=directory) if entries is None else entries:
         version = str(entry.get("version") or "unknown")
         if version != current:
             drift[version] = drift.get(version, 0) + 1

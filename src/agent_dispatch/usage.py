@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -56,6 +57,13 @@ _MAX_JOURNAL_BYTES = 2_000_000
 _PROFILE_TAIL_BYTES = 128 * 1024
 
 _CALLER_MAX_CHARS = 60
+
+# Plausibility ceilings for journal numbers. A dispatch is capped at 7200 s by
+# `timeout_seconds`, and no single run costs a million dollars; these are far
+# above any real value and far below where a sum of ~10k records could leave
+# the finite range, so the report is finite by construction.
+_MAX_PLAUSIBLE_MS = 1e9
+_MAX_PLAUSIBLE_COST_USD = 1e6
 
 # Memo of the last profile computation, keyed by the journal's identity and
 # fingerprint (size + mtime). The file only changes when a dispatch finishes,
@@ -121,7 +129,9 @@ def record(
             "ok": bool(ok),
         }
         if cost_usd is not None:
-            entry["cost"] = round(float(cost_usd), 6)
+            cost = round(float(cost_usd), 6)
+            if math.isfinite(cost):
+                entry["cost"] = cost
         if duration_ms is not None:
             entry["ms"] = int(duration_ms)
         if num_turns is not None:
@@ -156,7 +166,7 @@ def record(
 
 
 def as_float(value: object, default: float = 0.0) -> float:
-    """Coerce a field read off disk to a float. Never raises.
+    """Coerce a field read off disk to a finite float, or return the default.
 
     Declared once and shared with `servers.py` and the CLI because all three
     read numbers out of files a user can edit and a torn write can mangle.
@@ -168,8 +178,9 @@ def as_float(value: object, default: float = 0.0) -> float:
     wrong.
     """
     try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        number = float(value)  # type: ignore[arg-type]
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -236,8 +247,17 @@ def _percentile(values: list[float], pct: float) -> float:
 def _stats(entries: list[dict]) -> dict:
     """Aggregate one agent's (or everything's) records into a summary dict."""
     live = [e for e in entries if not e.get("cached")]
-    durations = [float(e["ms"]) for e in live if isinstance(e.get("ms"), (int, float))]
-    costs = [float(e["cost"]) for e in live if isinstance(e.get("cost"), (int, float))]
+
+    def values(field: str, ceiling: float) -> list[float]:
+        # Finite is not enough: two corrupted lines of 1e308 are each finite
+        # and sum to inf, which `stats --json` prints as `Infinity` (not JSON)
+        # and the text report as `$inf`. Anything outside [0, ceiling) is a
+        # mangled record, not a measurement, so it is dropped here, at the read.
+        numbers = (as_float(e.get(field), default=math.nan) for e in live)
+        return [number for number in numbers if 0 <= number < ceiling]
+
+    durations = values("ms", _MAX_PLAUSIBLE_MS)
+    costs = values("cost", _MAX_PLAUSIBLE_COST_USD)
     outcomes: dict[str, int] = {}
     errors: dict[str, int] = {}
     ok = 0
@@ -253,7 +273,7 @@ def _stats(entries: list[dict]) -> dict:
         "cached_hits": len(entries) - len(live),
         "ok": ok,
         "failed": len(live) - ok,
-        "cost_usd": round(sum(costs), 4) if costs else 0.0,
+        "cost_usd": round(math.fsum(costs), 4) if costs else 0.0,
     }
     if durations:
         summary["median_ms"] = int(_percentile(durations, 50))
