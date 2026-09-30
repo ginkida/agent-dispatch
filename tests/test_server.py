@@ -2793,11 +2793,16 @@ class TestCancelRunningJob:
             def kill(self):
                 killed.append(True)
 
+        spawned = threading.Event()
+
         def fake_stream(name, *args, on_proc, **kwargs):
             store = server._get_job_store()
             (job,) = store.list("running")
             store.fail(job.id, "Abandoned")
-            on_proc(FakeProc())
+            try:
+                on_proc(FakeProc())
+            finally:
+                spawned.set()
             return _ok_dispatch_result(name)
 
         with (
@@ -2805,6 +2810,9 @@ class TestCancelRunningJob:
             patch.object(server.runner, "dispatch_stream", side_effect=fake_stream),
         ):
             job_id = json.loads(await server.dispatch_async("infra", "task"))["job_id"]
+            # fail() makes the job terminal BEFORE on_proc runs, so waiting for
+            # the terminal state alone raced the kill (seen on CI, 3.10).
+            assert await asyncio.to_thread(spawned.wait, 5)
             job = await _wait_terminal(job_id)
         assert killed == [True]
         assert job.status == "failed"
