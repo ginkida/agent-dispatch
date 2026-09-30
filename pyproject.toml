@@ -36,7 +36,7 @@ dependencies = [
     # was replaced by `mcp.server.mcpserver.MCPServer`), which server.py imports.
     # Without the cap a fresh install resolves 2.x and `agent-dispatch serve`
     # dies with ModuleNotFoundError. Lift it only together with the port.
-    "mcp[cli]>=1.2.0,<2",
+    "mcp[cli]>=1.2.0,<3",
     "pyyaml>=6.0",
     "click>=8.0",
 ]
