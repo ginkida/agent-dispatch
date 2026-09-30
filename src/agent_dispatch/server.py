@@ -7,7 +7,6 @@ import functools
 import json
 import logging
 import math
-import queue
 import sys
 import threading
 import time
@@ -18,6 +17,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from . import __version__, runner, servers, usage
 from .cache import DispatchCache
+from .concurrency import DispatchLimiter
 from .config import (
     CONFIG_LOAD_ERRORS,
     CONFIG_SAVE_ERRORS,
@@ -39,6 +39,7 @@ from .models import (
     check_permission_mode,
     validate_agent_name,
 )
+from .progress import ProgressBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -98,16 +99,21 @@ mcp = FastMCP(
 )
 
 _cache: DispatchCache | None = None
-_semaphore: asyncio.Semaphore | None = None
-_semaphore_limit: int = 0
+_dispatch_limiter: DispatchLimiter | None = None
 _job_store: JobStore | None = None
-_job_semaphore: threading.BoundedSemaphore | None = None
-_job_semaphore_limit: int = 0
 # Live Popen handles of running async jobs, keyed by job_id. In-memory on
 # purpose: only the server that spawned a subprocess can kill it safely (a
 # PID persisted to disk could be reused by an unrelated process after a
 # restart). Registered by the worker via runner's on_proc callback.
 _running_procs: dict[str, Any] = {}
+# Jobs whose worker lives in THIS process, keyed by job_id -> "this server has
+# cancelled it". Separate from _running_procs because ownership starts before
+# mark_running while the Popen handle only exists once runner.dispatch_stream
+# has spawned: keyed on the handle alone, a cancel landing in between was told
+# "not started by this server" and the job ran to completion, billed. The flag
+# lets on_proc kill a late spawn without trusting a disk read. Both dicts are
+# guarded by _running_procs_lock.
+_owned_jobs: dict[str, bool] = {}
 _running_procs_lock = threading.Lock()
 
 _RESOLVED_MARKER = "[RESOLVED]"
@@ -255,14 +261,49 @@ def _get_cache(config: DispatchConfig) -> DispatchCache | None:
     return _cache
 
 
-def _get_semaphore(config: DispatchConfig) -> asyncio.Semaphore:
-    """Return concurrency-limiting semaphore, recreated if limit changes."""
-    global _semaphore, _semaphore_limit  # noqa: PLW0603
-    limit = config.settings.max_concurrency
-    if _semaphore is None or _semaphore_limit != limit:
-        _semaphore = asyncio.Semaphore(limit)
-        _semaphore_limit = limit
-    return _semaphore
+def _cache_config_key(config: DispatchConfig, agent: str) -> str:
+    """Snapshot dispatch inputs so external edits and late workers cannot serve stale data.
+
+    Groups already enter the key through merged context. Operational settings
+    do not change the agent's answer; model, permissions and protocol do.
+    Capture once before awaiting work and reuse for both lookup and insertion.
+    """
+    return config.agents[agent].model_dump_json() + config.settings.model_dump_json(
+        exclude={"cache", "max_concurrency", "job_retention_days", "usage_log"},
+    )
+
+
+def _get_dispatch_limiter(config: DispatchConfig) -> DispatchLimiter:
+    """Reuse the same reservations across every dispatch path and config reload."""
+    global _dispatch_limiter  # noqa: PLW0603
+    if _dispatch_limiter is None:
+        _dispatch_limiter = DispatchLimiter(config.settings.max_concurrency)
+    else:
+        _dispatch_limiter.resize(config.settings.max_concurrency)
+    return _dispatch_limiter
+
+
+async def _start_guarded(
+    config: DispatchConfig, work: Callable[[], DispatchResult],
+) -> asyncio.Future[DispatchResult]:
+    """Submit work with a reservation owned by the worker's completion future."""
+    limiter = _get_dispatch_limiter(config)
+    await limiter.acquire_async()
+    try:
+        future = asyncio.ensure_future(asyncio.to_thread(work))
+    except BaseException:
+        limiter.release()
+        raise
+
+    def completed(done: asyncio.Future[DispatchResult]) -> None:
+        limiter.release()
+        # A disconnected caller may no longer await the worker. Retrieve its
+        # exception so asyncio does not report an unobserved task failure.
+        if not done.cancelled():
+            done.exception()
+
+    future.add_done_callback(completed)
+    return future
 
 
 async def _dispatch_guarded(
@@ -286,10 +327,7 @@ async def _dispatch_guarded(
     tied to the subprocess's real lifetime. Cancellation still propagates to the
     caller immediately; only the accounting is honest.
     """
-    sem = _get_semaphore(config)
-    await sem.acquire()
-    future = asyncio.ensure_future(asyncio.to_thread(runner.dispatch, *args, **kwargs))
-    future.add_done_callback(lambda _f: sem.release())
+    future = await _start_guarded(config, functools.partial(runner.dispatch, *args, **kwargs))
     return await asyncio.shield(future)
 
 
@@ -369,7 +407,7 @@ def _ref_payload(
 def _validate_timeout(timeout: int) -> str | None:
     """Reject a timeout that would brick the agent. 0 means "leave unchanged/default".
 
-    A negative timeout reaches ``subprocess.run(timeout=...)``, which raises
+    A negative timeout reaches the process deadline, which raises
     TimeoutExpired immediately — every dispatch to that agent then fails with a
     nonsensical "timed out after -5s" until someone edits the YAML by hand.
     """
@@ -383,16 +421,18 @@ def _validate_timeout(timeout: int) -> str | None:
     return None
 
 
-def _validate_budget(max_budget_usd: float) -> str | None:
-    """Reject a negative spend cap. 0 means "no limit" (add) / "unchanged" (update).
+def _validate_budget(max_budget_usd: float, *, allow_clear: bool = False) -> str | None:
+    """Validate a finite spend cap; updates may use a negative value to clear it.
 
     ``AgentConfig.max_budget_usd`` is ``ge=0``, but pydantic does not validate on
     assignment — and a negative value would reach the command line as
     ``--max-budget-usd -1``, a token the claude CLI parses as another flag.
     """
-    if max_budget_usd < 0:
+    if not math.isfinite(max_budget_usd):
+        return _dumps({"error": "max_budget_usd must be a finite number."})
+    if max_budget_usd < 0 and not allow_clear:
         return _dumps(
-            {"error": f"max_budget_usd must be >= 0 (got {max_budget_usd}); 0 means no limit."}
+            {"error": f"max_budget_usd must be >= 0 (got {max_budget_usd}); 0 inherits defaults."}
         )
     return None
 
@@ -400,10 +440,8 @@ def _validate_budget(max_budget_usd: float) -> str | None:
 def _invalidate_agent_cache(config: DispatchConfig, name: str) -> None:
     """Drop cached dispatch results for an agent whose config just changed.
 
-    The cache key is (agent, task, context, caller, goal, response_format) — it
-    cannot tell that the *name* now points at a different directory, permission
-    set or model. Without this, remove_agent + add_agent under the same name
-    keeps serving the previous project's answers for the rest of the TTL.
+    Reclaims old entries immediately. The configuration snapshot in cache keys
+    separately handles external edits and workers finishing after this call.
     """
     cache = _get_cache(config)
     if cache and (dropped := cache.invalidate_agent(name)):
@@ -498,16 +536,6 @@ def _get_job_store() -> JobStore:
     if _job_store is None:
         _job_store = JobStore(default_jobs_dir())
     return _job_store
-
-
-def _get_job_semaphore(config: DispatchConfig) -> threading.BoundedSemaphore:
-    """Threading semaphore for async jobs, recreated if max_concurrency changes."""
-    global _job_semaphore, _job_semaphore_limit  # noqa: PLW0603
-    limit = config.settings.max_concurrency
-    if _job_semaphore is None or _job_semaphore_limit != limit:
-        _job_semaphore = threading.BoundedSemaphore(limit)
-        _job_semaphore_limit = limit
-    return _job_semaphore
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +907,7 @@ async def dispatch(
     # Check cache. caller/goal/response_format are part of the key because
     # they change the prompt sent to Claude and therefore the response.
     cache = _get_cache(config)
+    cache_config_key = _cache_config_key(config, agent) if cache else None
     if cache:
         cached = cache.get(
             agent,
@@ -887,6 +916,7 @@ async def dispatch(
             caller or None,
             goal or None,
             rf,
+            config_key=cache_config_key,
         )
         if cached:
             _record_cache_hit(config, agent, caller)
@@ -939,6 +969,7 @@ async def dispatch(
             caller or None,
             goal or None,
             rf,
+            config_key=cache_config_key,
         )
 
     if return_ref:
@@ -1093,7 +1124,7 @@ async def dispatch_parallel(
             if item.get(field) is not None:  # JSON null = "not set"
                 try:
                     int(item[field])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return _dumps(
                         {
                             "error": f"dispatches[{i}].{field} must be a number, "
@@ -1127,6 +1158,7 @@ async def dispatch_parallel(
             raw_summary = _DEFAULT_SUMMARY_CHARS
         item_summary_chars = max(0, min(int(raw_summary), _MAX_SUMMARY_CHARS))
         item_timeout = int(item.get("timeout_seconds") or 0)
+        cache_config_key = _cache_config_key(config, name) if cache else None
 
         # Check cache (caller/goal/response_format are part of the key — see dispatch())
         if cache:
@@ -1137,6 +1169,7 @@ async def dispatch_parallel(
                 item_caller,
                 item_goal,
                 item_rf,
+                config_key=cache_config_key,
             )
             if cached:
                 _record_cache_hit(config, name, item_caller)
@@ -1179,6 +1212,7 @@ async def dispatch_parallel(
                 item_caller,
                 item_goal,
                 item_rf,
+                config_key=cache_config_key,
             )
 
         if item_return_ref:
@@ -1298,15 +1332,25 @@ async def dispatch_stream(
     if ctx:
         await ctx.info(f"Dispatching (stream) to {agent}: {task[:80]}...")
 
-    progress_queue: queue.Queue[str] = queue.Queue()
+    progress = ProgressBuffer()
 
     def on_progress(msg: str) -> None:
-        progress_queue.put(msg)
+        if ctx:
+            progress.append(msg)
 
-    async with _get_semaphore(config):
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(
-            None,
+    async def forward_progress() -> None:
+        messages, dropped = progress.drain()
+        if ctx:
+            if dropped:
+                await ctx.info(
+                    f"[{agent}] Skipped {dropped} older progress messages; showing latest."
+                )
+            for message in messages:
+                await ctx.info(f"[{agent}] {message}")
+
+    try:
+        future = await _start_guarded(
+            config,
             lambda: runner.dispatch_stream(
                 agent,
                 task,
@@ -1320,27 +1364,16 @@ async def dispatch_stream(
             ),
         )
 
-        # Forward progress messages while the subprocess runs
         while not future.done():
             await asyncio.sleep(0.1)
-            while True:
-                try:
-                    msg = progress_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if ctx:
-                    await ctx.info(f"[{agent}] {msg[:300]}")
+            await forward_progress()
 
-        result = await asyncio.wrap_future(future)
-
-        # Drain any remaining messages
-        while True:
-            try:
-                msg = progress_queue.get_nowait()
-            except queue.Empty:
-                break
-            if ctx:
-                await ctx.info(f"[{agent}] {msg[:300]}")
+        result = await asyncio.shield(future)
+        await forward_progress()
+    finally:
+        # The worker can outlive a cancelled call. Its callbacks must stop
+        # retaining progress, while its process reservation remains intact.
+        progress.close()
 
     return result.model_dump_json(indent=2, exclude_none=True)
 
@@ -1712,6 +1745,8 @@ async def update_agent(
     """
     if err := _validate_timeout(timeout):
         return err
+    if err := _validate_budget(max_budget_usd, allow_clear=True):
+        return err
 
     with config_lock():
         config = _get_config()
@@ -1837,7 +1872,7 @@ def _run_job(
     caller: str | None,
     goal: str | None,
     response_format: str | None,
-    sem: threading.BoundedSemaphore,
+    sem: DispatchLimiter,
 ) -> None:
     """Worker thread body: runs the dispatch and persists the result.
 
@@ -1848,65 +1883,137 @@ def _run_job(
     """
     store = _get_job_store()
     with sem:
-        # mark_running refuses (returns None) if the job was cancelled while
-        # queued — honor that and skip the dispatch entirely.
-        if store.mark_running(job_id) is None:
-            logger.info("Async job %s skipped (cancelled or missing)", job_id)
-            return
-        logger.info("Async job %s running (agent=%s)", job_id, agent)
-
-        progress_lines: list[str] = []
-        last_write = 0.0
-
-        def on_progress(msg: str) -> None:
-            # Called synchronously from the worker thread's stdout loop —
-            # no locking needed around progress_lines.
-            nonlocal last_write
-            progress_lines.append(msg[:300])
-            del progress_lines[:-_JOB_PROGRESS_MAX_LINES]
-            now = time.monotonic()
-            if now - last_write >= _JOB_PROGRESS_WRITE_INTERVAL:
-                last_write = now
-                store.update_progress(job_id, list(progress_lines))
-
-        def on_proc(proc: Any) -> None:
-            # Register the live subprocess so dispatch_cancel can kill it.
-            # May fire twice (old-CLI retry respawns) — last write wins.
-            with _running_procs_lock:
-                _running_procs[job_id] = proc
-
+        # Claim ownership BEFORE the job can be observed as running, so no
+        # dispatch_cancel ever sees a running job of ours that it thinks
+        # belongs to another server. Released in the finally below, which also
+        # covers the early return.
+        with _running_procs_lock:
+            _owned_jobs[job_id] = False
         try:
-            result = runner.dispatch_stream(
+            _run_owned_job(
+                store,
+                job_id,
                 agent,
                 task,
                 agent_config,
                 settings,
                 context,
-                on_progress,
-                caller=caller,
-                goal=goal,
-                response_format=response_format,
-                on_proc=on_proc,
+                caller,
+                goal,
+                response_format,
             )
-            # Flush trailing progress lines the throttle skipped, so the
-            # finished job's trace is complete.
-            if progress_lines:
-                store.update_progress(job_id, list(progress_lines))
-            # finish() refuses terminal jobs — if dispatch_cancel force-killed
-            # us, the job is already 'cancelled' and this is a no-op.
-            store.finish(job_id, result)
-            logger.info(
-                "Async job %s finished: success=%s cost=%s",
-                job_id,
-                result.success,
-                result.cost_usd,
-            )
-        except Exception as e:  # noqa: BLE001 — must not crash worker thread
-            logger.exception("Async job %s crashed: %s", job_id, e)
-            store.fail(job_id, f"Worker crashed: {e}")
         finally:
             with _running_procs_lock:
                 _running_procs.pop(job_id, None)
+                _owned_jobs.pop(job_id, None)
+
+
+def _flush_progress(store: JobStore, job_id: str, lines: list[str]) -> None:
+    """Persist the progress tail; a failed write must never cost the result.
+
+    Progress is optional. finish() — which re-reads the job and stores the paid
+    result — must still run after ENOSPC/EACCES on a progress write.
+    """
+    try:
+        store.update_progress(job_id, list(lines))
+    except Exception:  # noqa: BLE001 - disk errors, and anything serialization raises
+        logger.warning("Async job %s: progress write failed", job_id, exc_info=True)
+
+
+def _run_owned_job(
+    store: JobStore,
+    job_id: str,
+    agent: str,
+    task: str,
+    agent_config: AgentConfig,
+    settings: Settings,
+    context: str | None,
+    caller: str | None,
+    goal: str | None,
+    response_format: str | None,
+) -> None:
+    """_run_job's body, run while the job is registered in _owned_jobs."""
+    # mark_running refuses (returns None) if the job was cancelled while
+    # queued — honor that and skip the dispatch entirely.
+    if store.mark_running(job_id) is None:
+        logger.info("Async job %s skipped (cancelled or missing)", job_id)
+        return
+    logger.info("Async job %s running (agent=%s)", job_id, agent)
+
+    progress_lines: list[str] = []
+    last_write = 0.0
+
+    def on_progress(msg: str) -> None:
+        # Called synchronously from the worker thread's stdout loop —
+        # no locking needed around progress_lines.
+        nonlocal last_write
+        progress_lines.append(msg[:300])
+        del progress_lines[:-_JOB_PROGRESS_MAX_LINES]
+        now = time.monotonic()
+        if now - last_write >= _JOB_PROGRESS_WRITE_INTERVAL:
+            last_write = now
+            _flush_progress(store, job_id, progress_lines)
+
+    def on_proc(proc: Any) -> None:
+        # Register the live subprocess so dispatch_cancel can kill it.
+        # Registration and cancellation share a lock: a spawn (first or an
+        # old-CLI retry) must either be visible to the canceller or observe
+        # the cancellation itself.
+        with _running_procs_lock:
+            _running_procs[job_id] = proc
+            if _owned_jobs.get(job_id):
+                # This server cancelled the job before the process existed.
+                runner._kill_process_tree(proc)
+                return
+            # Kill only on a POSITIVE terminal observation (e.g. another
+            # server's recover_stale failed it). get() returns None for a
+            # transient read error (EMFILE, EIO) as well as a missing file;
+            # treating that as terminal made the worker SIGKILL the process
+            # it had just spawned and record a failure nobody asked for.
+            job = store.get(job_id)
+            if job is None:
+                logger.warning(
+                    "Async job %s: record unreadable at spawn; leaving its "
+                    "subprocess running",
+                    job_id,
+                )
+            elif job.is_terminal():
+                runner._kill_process_tree(proc)
+
+    try:
+        result = runner.dispatch_stream(
+            agent,
+            task,
+            agent_config,
+            settings,
+            context,
+            on_progress,
+            caller=caller,
+            goal=goal,
+            response_format=response_format,
+            on_proc=on_proc,
+        )
+        # Flush trailing progress lines the throttle skipped, so the
+        # finished job's trace is complete.
+        if progress_lines:
+            _flush_progress(store, job_id, progress_lines)
+        # finish() refuses terminal jobs — if dispatch_cancel force-killed
+        # us, the job is already 'cancelled' and this is a no-op.
+        store.finish(job_id, result)
+        logger.info(
+            "Async job %s finished: success=%s cost=%s",
+            job_id,
+            result.success,
+            result.cost_usd,
+        )
+    except Exception as e:  # noqa: BLE001 — must not crash worker thread
+        logger.exception("Async job %s crashed: %s", job_id, e)
+        try:
+            store.fail(job_id, f"Worker crashed: {e}")
+        except OSError:
+            # Same full disk, most likely. recover_stale fails the job later;
+            # a daemon thread that raises here just dies unreported.
+            logger.exception("Async job %s: could not record the crash", job_id)
 
 
 @mcp.tool()
@@ -1954,7 +2061,7 @@ async def dispatch_async(
         goal=goal or None,
     )
 
-    sem = _get_job_semaphore(config)
+    sem = _get_dispatch_limiter(config)
     agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     thread = threading.Thread(
         target=_run_job,
@@ -2058,14 +2165,16 @@ async def dispatch_cancel(
     """Cancel an async job — pending always, running when this server owns it.
 
     A *pending* job is simply marked cancelled. A *running* job can be
-    cancelled too if its subprocess was spawned by this server instance: the
-    job is marked cancelled first, then the claude subprocess is killed
-    (partial work is lost; the job's progress tail is preserved). A running
-    job started by a previous server run cannot be killed safely — poll
+    cancelled too if its worker runs in this server instance: the job is
+    marked cancelled first, then the claude process group is killed (partial
+    work is lost; the job's progress tail is preserved) — or, if it has not
+    been spawned yet, killed as soon as it is. A running job started by
+    another or a previous server cannot be killed safely — poll
     dispatch_status until it finishes.
 
     Returns the job's new state plus an ``outcome`` field: ``cancelled``
-    (was pending), ``cancelled_running`` (was running, subprocess killed),
+    (was pending), ``cancelled_running`` (was running, subprocess killed or
+    killed on spawn — see ``message``),
     ``running`` (could not cancel — not owned by this server),
     ``already_terminal``, or ``not_found``.
 
@@ -2076,21 +2185,36 @@ async def dispatch_cancel(
         return err
     store = _get_job_store()
     job, outcome = store.cancel(job_id)
+    spawned = False
     if outcome == "running":
-        # We can kill the subprocess only if this server spawned it.
+        # We can kill the subprocess only if this server's worker owns it.
         with _running_procs_lock:
-            proc = _running_procs.get(job_id)
-        if proc is not None:
-            # Mark cancelled BEFORE killing: finish()/fail() refuse terminal
-            # jobs, so the worker's trailing write cannot undo this. If the
-            # job finished in the meantime, cancel returns already_terminal
-            # and we leave the (already exiting) process alone.
-            job, outcome = store.cancel(job_id, force=True)
-            if outcome == "cancelled_running":
-                try:
-                    proc.kill()
-                except OSError as e:  # already gone — job stays cancelled
-                    logger.debug("Kill of job %s subprocess failed: %s", job_id, e)
+            if job_id in _owned_jobs:
+                # Keep registration locked through mark + kill, so an old-CLI
+                # retry cannot replace the handle between these operations.
+                # finish()/fail() refuse the terminal state persisted first.
+                job, outcome = store.cancel(job_id, force=True)
+                if outcome == "cancelled_running":
+                    # Flag it in memory too: a process spawned after this
+                    # point is killed by on_proc without re-reading the disk.
+                    _owned_jobs[job_id] = True
+                    proc = _running_procs.get(job_id)
+                    if proc is not None:
+                        spawned = True
+                        runner._kill_process_tree(proc)
+            else:
+                # Our own worker may have finished (and left _owned_jobs) after
+                # the unlocked cancel() above saw "running". Its finally pops
+                # ownership only after finish()/fail() persisted the terminal
+                # state, so a re-read here tells "another server's job" apart
+                # from "ours, already done".
+                # get() is None for a transient read error too: keep what the
+                # first read established rather than answer "not found".
+                fresh = store.get(job_id)
+                if fresh is not None and fresh.is_terminal():
+                    job, outcome = fresh, "already_terminal"
+                elif fresh is not None:
+                    job = fresh
     if outcome == "not_found":
         return _dumps({"error": f"Job not found: {job_id}"})
     if ctx:
@@ -2098,8 +2222,14 @@ async def dispatch_cancel(
     payload: dict = {"job_id": job_id, "outcome": outcome}
     if job is not None:
         payload["status"] = job.status
-    if outcome == "cancelled_running":
+    if outcome == "cancelled_running" and spawned:
         payload["message"] = "Job was running; its subprocess has been killed."
+    elif outcome == "cancelled_running":
+        payload["message"] = (
+            "Job was running but its subprocess had not been spawned yet; it "
+            "is marked cancelled and the subprocess is killed the moment it "
+            "starts."
+        )
     elif outcome == "running":
         payload["message"] = (
             "Job is running but was not started by this server instance, so "
@@ -2115,6 +2245,7 @@ async def dispatch_jobs(
     status: str = "",
     limit: int = 50,
     ctx: Context | None = None,
+    agent: str = "",
 ) -> str:
     """List recent async jobs as summaries (most recent first).
 
@@ -2126,6 +2257,7 @@ async def dispatch_jobs(
         status: Optional filter — "pending", "running", "done", "failed",
             "cancelled". Empty = all.
         limit: Max entries returned (default 50).
+        agent: Exact agent name, including removed agents. Empty = all.
     """
     store = _get_job_store()
     valid_statuses = {"pending", "running", "done", "failed", "cancelled"}
@@ -2137,35 +2269,9 @@ async def dispatch_jobs(
                 f"Use one of: {', '.join(sorted(valid_statuses))} or empty.",
             }
         )
-    jobs = store.list(status=filt)  # type: ignore[arg-type]
+    jobs = store.list(status=filt, agent=agent or None)  # type: ignore[arg-type]
     jobs = jobs[: max(1, min(int(limit), _MAX_JOBS_LIMIT))]
-    summaries: list[dict] = []
-    for j in jobs:
-        entry: dict = {
-            "id": j.id,
-            "agent": j.agent,
-            "status": j.status,
-            "task": j.task[:120],
-            "created_at": j.created_at,
-        }
-        if j.started_at is not None:
-            entry["started_at"] = j.started_at
-        if j.completed_at is not None:
-            entry["completed_at"] = j.completed_at
-        if j.result is not None:
-            entry["success"] = j.result.success
-            if j.result.cost_usd is not None:
-                entry["cost_usd"] = j.result.cost_usd
-            if j.result.outcome:
-                entry["outcome"] = j.result.outcome
-        if j.status == "running" and j.progress:
-            entry["last_progress"] = j.progress[-1]
-        if j.error:
-            entry["error_type"] = (
-                j.result.error_type if j.result and j.result.error_type else "cli_error"
-            )
-        summaries.append(entry)
-    return _dumps(summaries, indent=2)
+    return _dumps([job.summary() for job in jobs], indent=2)
 
 
 @mcp.tool()
@@ -2213,6 +2319,7 @@ async def fetch_result(
 async def dispatch_gc(
     max_age_days: float = 7,
     ctx: Context | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Delete terminal jobs (done/failed/cancelled) older than max_age_days.
 
@@ -2220,6 +2327,7 @@ async def dispatch_gc(
 
     Args:
         max_age_days: Age threshold in days (default 7).
+        dry_run: Preview eligible job IDs without deleting anything (default false).
     """
     if max_age_days <= 0:
         return _dumps({"error": "max_age_days must be > 0"})
@@ -2227,6 +2335,15 @@ async def dispatch_gc(
     if not math.isfinite(max_age_seconds):
         return _dumps({"error": "max_age_days is too large (non-finite)"})
     store = _get_job_store()
+    if dry_run:
+        candidates = store.gc_candidates(max_age_seconds)
+        return _dumps({
+            "dry_run": True,
+            "purged": 0,
+            "would_purge": len(candidates),
+            "job_ids": [job.id for job in candidates],
+            "max_age_days": max_age_days,
+        })
     purged = store.gc(max_age_seconds=max_age_seconds)
     if ctx:
         await ctx.info(f"Purged {purged} terminal jobs older than {max_age_days}d")

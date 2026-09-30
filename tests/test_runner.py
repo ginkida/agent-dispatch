@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -267,7 +269,7 @@ class TestArgInjection:
         assert "sonnet" in cmd and "Bash(git diff)" in cmd and "abc-123-def" in cmd
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_returns_error_not_raise(self, mock_run, _which):
         """dispatch() must surface injection as a clean failure, never spawn claude."""
         agent = AgentConfig(directory="/tmp", description="t", timeout=10)
@@ -315,7 +317,7 @@ class TestDispatch:
         assert result.error_type == "not_found"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_successful_json_response(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -339,7 +341,7 @@ class TestDispatch:
         assert result.cost_usd == 0.02
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_timeout(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
         result = dispatch("test", "slow task", self.agent, self.settings)
@@ -347,8 +349,38 @@ class TestDispatch:
         assert "timed out" in result.error.lower()
         assert result.error_type == "timeout"
 
+    @pytest.mark.parametrize("output", [
+        "", "partial answer", '{"type":"result",', '{"result":"unfinished"}', "[]",
+    ])
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_timeout_requires_a_complete_cli_result(self, mock_run, _which, output):
+        mock_run.side_effect = subprocess.TimeoutExpired([], 10, output=output)
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "timeout"
+        assert result.session_id
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_budget_result_outranks_cleanup_timeout(self, mock_run, _which):
+        payload = {
+            "type": "result", "is_error": True, "subtype": "error_max_budget_usd",
+            "session_id": "paid-session", "total_cost_usd": 0.42,
+        }
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            [], 10, output=json.dumps(payload).encode(),
+        )
+        result = dispatch("test", "task", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "budget"
+        assert result.budget_exceeded
+        assert result.session_id == "paid-session"
+        assert result.cost_usd == 0.42
+        assert len(usage.load()) == 1
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
     def test_plain_text_fallback(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="Just plain text\n", stderr=""
@@ -358,7 +390,7 @@ class TestDispatch:
         assert result.result == "Just plain text"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_plain_text_fallback_failure_sets_error_type(self, mock_run, _which):
         """A2: non-JSON stdout with non-zero exit should set error_type."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -370,7 +402,7 @@ class TestDispatch:
         assert "something broke" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_is_error_true_with_empty_result(self, mock_run, _which):
         """A3: is_error=true with empty/missing result should get a fallback error message."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -385,7 +417,7 @@ class TestDispatch:
         assert "no details" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_is_error_true_with_none_result(self, mock_run, _which):
         """A1+A3: is_error=true with result=null should not crash."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -401,7 +433,7 @@ class TestDispatch:
         assert result.result == ""  # coerced safely
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_context_is_prepended(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
@@ -413,7 +445,7 @@ class TestDispatch:
         assert "fix this" in prompt
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_depth_incremented_in_env(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
@@ -423,7 +455,7 @@ class TestDispatch:
         assert env["AGENT_DISPATCH_DEPTH"] == "1"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_cwd_is_agent_directory(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
@@ -433,7 +465,7 @@ class TestDispatch:
         assert cwd == str(self.agent.directory)
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_permission_error_detected_from_stderr(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="Error: permission denied for tool Bash"
@@ -445,7 +477,7 @@ class TestDispatch:
         assert "bypassPermissions" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_permission_error_detected_from_is_error(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -464,7 +496,7 @@ class TestDispatch:
         assert "Hint" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_non_permission_cli_error(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="connection refused"
@@ -475,7 +507,7 @@ class TestDispatch:
         assert "Hint" not in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_successful_dispatch_has_no_error_type(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
@@ -485,7 +517,7 @@ class TestDispatch:
         assert result.error_type is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_caller_and_goal_in_prompt(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps({"result": "ok", "is_error": False}), stderr=""
@@ -512,7 +544,7 @@ class TestResumableTimeout:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_fresh_dispatch_passes_session_id_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -529,7 +561,7 @@ class TestResumableTimeout:
         _uuid.UUID(cmd[idx + 1])
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_resume_does_not_pass_session_id_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -543,7 +575,7 @@ class TestResumableTimeout:
         assert "--resume" in cmd
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_timeout_returns_resumable_session_id(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
         result = dispatch("test", "slow task", self.agent, self.settings)
@@ -555,7 +587,7 @@ class TestResumableTimeout:
         assert "timeout_seconds" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_timeout_on_resume_keeps_original_session(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=[], timeout=10)
         result = dispatch(
@@ -569,7 +601,7 @@ class TestResumableTimeout:
         assert result.session_id == "orig-sess"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_json_session_id_wins_over_generated(self, mock_run, _which):
         """claude's reported session_id is authoritative when present."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -582,7 +614,7 @@ class TestResumableTimeout:
         assert result.session_id == "from-cli"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_generated_session_id_fallback_when_missing(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -596,7 +628,7 @@ class TestResumableTimeout:
         assert result.session_id == generated
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_plain_text_success_carries_session_id(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="Just plain text\n", stderr=""
@@ -645,7 +677,7 @@ class TestDeniedTools:
         assert len(names[0]) == 100
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_success_with_denials_gets_hint(self, mock_run, _which):
         """The user-reported case: agent 'succeeds' but asks for permission."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -669,7 +701,7 @@ class TestDeniedTools:
         assert "Bash" in result.hint
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_success_without_denials_no_hint(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -682,7 +714,7 @@ class TestDeniedTools:
         assert result.hint is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_is_error_with_denials_classified_as_permission(self, mock_run, _which):
         """Denials are a stronger signal than substring matching on the text."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -827,7 +859,7 @@ class TestOldCliSessionFlagFallback:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_retries_without_session_flag(self, mock_run, _which):
         ok = subprocess.CompletedProcess(
             args=[],
@@ -850,7 +882,7 @@ class TestOldCliSessionFlagFallback:
         assert "--session-id" not in retry_cmd
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_no_retry_on_other_errors(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -863,7 +895,7 @@ class TestOldCliSessionFlagFallback:
         assert mock_run.call_count == 1  # no pointless retry
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_retry_failure_does_not_loop(self, mock_run, _which):
         rejected = subprocess.CompletedProcess(
             args=[],
@@ -916,6 +948,29 @@ class TestDispatchStream:
     def setup_method(self):
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
+
+    @pytest.mark.parametrize("event", [
+        None, [], 42, "noise",
+        {"type": "assistant", "message": None},
+        {"type": "assistant", "message": []},
+        {"type": "assistant", "message": {"content": [None, "noise", 42]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": 42}]}},
+    ])
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_malformed_progress_preserves_result(self, mock_popen, _which, event):
+        answer = {"type": "result", "result": "paid answer", "total_cost_usd": 0.42}
+        mock_popen.return_value = _FakePopen([
+            json.dumps(event), json.dumps(answer), json.dumps(event),
+        ])
+        progress = []
+        result = dispatch_stream(
+            "test", "task", self.agent, self.settings, on_progress=progress.append,
+        )
+        assert result.success
+        assert result.result == "paid answer"
+        assert result.cost_usd == 0.42
+        assert progress == []
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     def test_missing_directory(self, _which, tmp_path: Path):
@@ -984,6 +1039,54 @@ class TestDispatchStream:
         progress: list[str] = []
         dispatch_stream("test", "check", self.agent, self.settings, on_progress=progress.append)
         assert any("Checking logs" in p for p in progress)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_failing_progress_callback_keeps_the_paid_result(self, mock_popen, _which):
+        # An async job's callback writes the job file; ENOSPC there used to
+        # escape the read loop, kill the tree and drop result + session.
+        assistant_line = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}
+        )
+        result_line = json.dumps({"type": "result", "result": "done", "is_error": False})
+        fake = _FakePopen([assistant_line, result_line])
+        killed: list[bool] = []
+        fake.kill = lambda: killed.append(True)
+        mock_popen.return_value = fake
+
+        def broken(_msg):
+            raise OSError(28, "No space left on device")
+
+        result = dispatch_stream("test", "check", self.agent, self.settings, on_progress=broken)
+        assert result.success is True
+        assert result.result == "done"
+        assert result.session_id
+        assert killed == []
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_thread_start_failure_kills_the_spawned_process(self, mock_popen, _which):
+        # Without a timer or reader the claude process would run unsupervised.
+        fake = _FakePopen([json.dumps({"type": "result", "result": "x", "is_error": False})])
+        killed: list[bool] = []
+        fake.kill = lambda: killed.append(True)
+        fake.wait = lambda timeout=None: None  # real Popen.wait takes a timeout
+        mock_popen.return_value = fake
+
+        class _NoTimer:
+            def __init__(self, *a, **kw):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def cancel(self):
+                pass
+
+        with patch("agent_dispatch.runner.threading.Timer", _NoTimer):
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                dispatch_stream("test", "check", self.agent, self.settings)
+        assert killed == [True]
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
@@ -1082,7 +1185,7 @@ class TestStructuredResponse:
         assert prompt.rstrip().endswith('{"error": "<reason>"}.')
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_parses_clean_json_object(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
 
@@ -1108,7 +1211,7 @@ class TestStructuredResponse:
         assert result.parsed_result == {"count": 3, "errors": ["a", "b"]}
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_parses_fenced_json(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
 
@@ -1130,7 +1233,7 @@ class TestStructuredResponse:
         assert result.parsed_result == {"ok": True}
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_parses_fenced_without_lang(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
 
@@ -1151,7 +1254,7 @@ class TestStructuredResponse:
         assert result.parsed_result == [1, 2, 3]
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_unparseable_keeps_success_with_none_parsed(self, mock_run, _which):
         """Soft-mode: bad JSON doesn't fail the dispatch, just leaves parsed_result=None."""
         from agent_dispatch.runner import dispatch
@@ -1179,7 +1282,7 @@ class TestStructuredResponse:
         assert "3 errors" in result.result
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_without_response_format_does_not_parse(self, mock_run, _which):
         from agent_dispatch.runner import dispatch
 
@@ -1200,7 +1303,7 @@ class TestStructuredResponse:
         assert result.parsed_result is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_plaintext_fallback_with_json_format(self, mock_run, _which):
         """Non-claude-wrapper stdout → plain text branch still records None
         for parsed_result when content isn't valid JSON."""
@@ -1325,7 +1428,7 @@ class TestBudget:
         assert result.success is False
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_flags_over_budget(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1347,7 +1450,7 @@ class TestBudget:
         assert "exceeded" in result.hint
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_within_budget_no_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1414,7 +1517,7 @@ class TestBudgetExhausted:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_classifies_budget_error(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1437,7 +1540,7 @@ class TestBudgetExhausted:
         assert result.num_turns == 1
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_terminal_reason_alone_is_enough(self, mock_run, _which):
         payload = _budget_payload()
         del payload["subtype"]
@@ -1451,7 +1554,7 @@ class TestBudgetExhausted:
         assert result.error_type == "budget"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_subtype_alone_is_enough(self, mock_run, _which):
         payload = _budget_payload()
         del payload["terminal_reason"]
@@ -1465,7 +1568,7 @@ class TestBudgetExhausted:
         assert result.error_type == "budget"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_budget_flag_set_even_when_cost_under_cap(self, mock_run, _which):
         """The cap was reached by definition — don't rely on the cost compare."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -1480,7 +1583,7 @@ class TestBudgetExhausted:
         assert result.hint is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_budget_wins_over_denied_tools(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1493,7 +1596,7 @@ class TestBudgetExhausted:
         assert result.denied_tools == ["Bash"]  # still reported
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_hint_names_the_cap(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1506,7 +1609,7 @@ class TestBudgetExhausted:
         assert "$0.25" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_settings_default_budget_named_in_hint(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1547,7 +1650,7 @@ class TestCliErrorDetails:
         return dispatch("test", "task", self.agent, self.settings)
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_errors_list_is_surfaced(self, mock_run, _which):
         result = self._dispatch(
             mock_run, {"is_error": True, "errors": ["Reached maximum turns (5)"]}
@@ -1557,19 +1660,19 @@ class TestCliErrorDetails:
         assert "no details" not in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_multiple_errors_joined(self, mock_run, _which):
         result = self._dispatch(mock_run, {"is_error": True, "errors": ["first", "second"]})
         assert "first; second" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_subtype_used_when_errors_absent(self, mock_run, _which):
         result = self._dispatch(mock_run, {"is_error": True, "subtype": "error_during_execution"})
         assert "error_during_execution" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_result_text_still_wins(self, mock_run, _which):
         result = self._dispatch(
             mock_run, {"is_error": True, "result": "agent said no", "errors": ["ignored"]}
@@ -1578,14 +1681,14 @@ class TestCliErrorDetails:
         assert result.result == "agent said no"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_fallback_when_nothing_available(self, mock_run, _which):
         result = self._dispatch(mock_run, {"is_error": True})
         assert "no details" in result.error
         assert "exit code 0" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_details_are_classified(self, mock_run, _which):
         """A permission failure reported only in `errors` is still classified."""
         result = self._dispatch(mock_run, {"is_error": True, "errors": ["Permission denied: Bash"]})
@@ -1593,7 +1696,7 @@ class TestCliErrorDetails:
         assert "agent-dispatch update" in result.error  # permission hint appended
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_untrusted_errors_are_capped(self, mock_run, _which):
         result = self._dispatch(
             mock_run,
@@ -1603,14 +1706,14 @@ class TestCliErrorDetails:
         assert len(result.error) < 2500
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_non_string_errors_do_not_crash(self, mock_run, _which):
         result = self._dispatch(mock_run, {"is_error": True, "errors": [{"code": 7}, None]})
         assert not result.success
         assert result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_blank_errors_fall_through_to_subtype(self, mock_run, _which):
         result = self._dispatch(
             mock_run, {"is_error": True, "errors": ["   ", ""], "subtype": "error_weird"}
@@ -1620,6 +1723,26 @@ class TestCliErrorDetails:
 
 class TestOnProc:
     """dispatch_stream exposes its Popen handle via the on_proc callback."""
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_registration_failure_reaps_process_and_closes_pipes(self, mock_popen, _which):
+        proc = mock_popen.return_value
+        proc.pid = None  # exercise the kill fallback without signalling real PIDs
+
+        def fail_registration(child):
+            assert child is proc
+            raise OSError("job storage unavailable")
+
+        with pytest.raises(OSError, match="job storage unavailable"):
+            dispatch_stream(
+                "test", "task", AgentConfig(directory="/tmp"), Settings(),
+                on_proc=fail_registration,
+            )
+        proc.kill.assert_called_once()
+        proc.wait.assert_called_once()
+        proc.stdout.close.assert_called_once()
+        proc.stderr.close.assert_called_once()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
@@ -1688,7 +1811,107 @@ class TestStreamPipeHandling:
         launcher.chmod(0o755)
         return launcher
 
-    def test_chatty_stderr_does_not_deadlock(self, tmp_path: Path):
+    @staticmethod
+    def _spawn_after_ready(ready: Path):
+        """Exclude interpreter startup from deliberately short test deadlines."""
+        real_popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                proc.kill()
+                proc.wait(timeout=5)
+                proc.stdout.close()
+                proc.stderr.close()
+                pytest.fail("Test subprocess did not finish setting up")
+            return proc
+
+        return spawn
+
+    def test_ordinary_dispatch_keeps_result_before_cleanup_timeout(self, tmp_path):
+        ready = tmp_path / "ready"
+        cli = self._fake_cli(
+            tmp_path,
+            "import json, time\nfrom pathlib import Path\n"
+            "print(json.dumps({'type': 'result', 'result': 'paid answer', "
+            "'total_cost_usd': 0.42, 'is_error': False}), end='', flush=True)\n"
+            f"Path({str(ready)!r}).touch()\n"
+            "time.sleep(3)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, timeout=1)
+        with (
+            patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+            patch("agent_dispatch.runner.subprocess.Popen", self._spawn_after_ready(ready)),
+        ):
+            result = dispatch("test", "task", agent, Settings())
+        assert result.success, result.error
+        assert result.result == "paid answer"
+        assert result.cost_usd == 0.42
+        assert "cleanup" in result.hint
+
+    @pytest.mark.parametrize("parent_exits", [False, True])
+    def test_ordinary_timeout_stops_descendant_work(self, tmp_path, parent_exits):
+        ready = tmp_path / "ready"
+        unwanted = tmp_path / "work-after-timeout"
+        child = (
+            "import time; from pathlib import Path; "
+            f"Path({str(ready)!r}).touch(); "
+            f"time.sleep(2); Path({str(unwanted)!r}).touch()"
+        )
+        cli = self._fake_cli(
+            tmp_path,
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+            + ("sys.exit(0)\n" if parent_exits else "time.sleep(4)\n"),
+        )
+        agent = AgentConfig(directory=tmp_path, timeout=1)
+        with (
+            patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+            patch("agent_dispatch.runner.subprocess.Popen", self._spawn_after_ready(ready)),
+        ):
+            result = dispatch("test", "task", agent, Settings())
+        assert result.error_type == "timeout"
+        assert ready.exists(), "Descendant was not ready before the timeout"
+        time.sleep(1.5)
+        assert not unwanted.exists(), "Descendant continued work after dispatch timed out"
+
+    def test_ordinary_cleanup_is_bounded_with_a_detached_writer(self, tmp_path):
+        pid_file = tmp_path / "detached-pid"
+        ready = tmp_path / "ready"
+        cli = self._fake_cli(
+            tmp_path,
+            "import json, subprocess, sys, time\nfrom pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'], "
+            "start_new_session=True)\n"
+            f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            "print(json.dumps({'type': 'result', 'result': 'complete', "
+            "'is_error': False}), end='', flush=True)\n"
+            f"Path({str(ready)!r}).touch()\n"
+            "time.sleep(15)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, timeout=1)
+        started = time.monotonic()
+        try:
+            with (
+                patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+                patch("agent_dispatch.runner.subprocess.Popen", self._spawn_after_ready(ready)),
+            ):
+                result = dispatch("test", "task", agent, Settings())
+            assert result.success, result.error
+            assert result.result == "complete"
+            assert time.monotonic() - started < 5, "Cleanup waited on a detached writer"
+        finally:
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @pytest.mark.parametrize("run", [dispatch, dispatch_stream], ids=["ordinary", "stream"])
+    def test_chatty_stderr_does_not_deadlock(self, tmp_path: Path, run):
         # 1 MiB of stderr — far past the ~64 KiB pipe buffer. Before stderr was
         # drained concurrently the child blocked in write(2), never emitted its
         # result line, and the dispatch burned its whole timeout.
@@ -1698,13 +1921,13 @@ class TestStreamPipeHandling:
             "sys.stderr.write('W' * 1_000_000)\n"
             "sys.stderr.flush()\n"
             "print(json.dumps({'type': 'result', 'is_error': False, "
-            "'result': 'done', 'session_id': 's1'}))\n",
+            "'result': 'данные' * 20000, 'session_id': 's1'}, ensure_ascii=False))\n",
         )
         agent = AgentConfig(directory=tmp_path, description="t", timeout=10)
         with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
-            result = dispatch_stream("test", "hello", agent, Settings())
+            result = run("test", "hello", agent, Settings())
         assert result.success, result.error
-        assert result.result == "done"
+        assert result.result == "данные" * 20000
         assert result.error_type is None
 
     @patch("agent_dispatch.runner.threading.Timer", _InstantTimer)
@@ -1773,19 +1996,36 @@ class TestStreamPipeHandling:
         The child is spawned in its own process group and the timer kills the
         group, so the pipe reaches EOF on time.
         """
+        ready = tmp_path / "grandchild-ready"
         cli = self._fake_cli(
             tmp_path,
-            "import json, subprocess, sys\n"
+            "import json, subprocess, sys\nfrom pathlib import Path\n"
             # full default inheritance: the grandchild holds fd 1 and fd 2
             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
             "print(json.dumps({'type': 'result', 'is_error': False, "
             "'result': 'ANSWER', 'session_id': 's4'}), flush=True)\n"
+            f"Path({str(ready)!r}).touch()\n"
             "sys.exit(0)\n",
         )
+
+        def wait_for_setup(proc):
+            # on_proc runs before the dispatch timer starts. Separate process
+            # startup from the one-second tree-cleanup deadline: interpreter
+            # startup can itself consume that second on a busy machine.
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                from agent_dispatch.runner import _kill_process_tree
+
+                _kill_process_tree(proc)
+                proc.wait(timeout=5)
+                pytest.fail("Test subprocess did not finish setting up its grandchild")
+
         agent = AgentConfig(directory=tmp_path, description="t", timeout=1)
         started = time.monotonic()
         with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
-            result = dispatch_stream("test", "hello", agent, Settings())
+            result = dispatch_stream("test", "hello", agent, Settings(), on_proc=wait_for_setup)
         elapsed = time.monotonic() - started
         assert result.success
         assert result.result == "ANSWER"
@@ -1803,13 +2043,213 @@ class TestStreamPipeHandling:
         assert "everything is on fire" in result.error
 
 
+    @staticmethod
+    def _kill_pid_file(pid_file: Path) -> None:
+        """Teardown for descendants a test leaves behind on purpose."""
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+
+    def _stderr_holder_cli(self, tmp_path: Path, pid_file: Path, tail: str) -> Path:
+        # The grandchild gets stdout=DEVNULL but inherits fd 2 — the shape of a
+        # stdio MCP server that `claude` started and that outlives it.
+        return self._fake_cli(
+            tmp_path,
+            "import json, subprocess, sys\nfrom pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],\n"
+            "                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)\n"
+            f"Path({str(pid_file)!r}).write_text(str(child.pid))\n" + tail,
+        )
+
+    def test_ordinary_dispatch_does_not_wait_on_an_inherited_stderr(self, tmp_path):
+        """Completion is stdout EOF + leader exit; a stderr holder must not stall it.
+
+        Waiting for stderr EOF kept a cleanly finished dispatch until its
+        deadline and then labelled the answer "killed after the timeout".
+        """
+        pid_file = tmp_path / "holder-pid"
+        cli = self._stderr_holder_cli(
+            tmp_path,
+            pid_file,
+            "print(json.dumps({'type': 'result', 'result': 'ANSWER', "
+            "'is_error': False}), flush=True)\nsys.exit(0)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, timeout=10)
+        started = time.monotonic()
+        try:
+            with patch("agent_dispatch.runner.shutil.which", return_value=str(cli)):
+                result = dispatch("test", "task", agent, Settings())
+            elapsed = time.monotonic() - started
+            assert result.success, result.error
+            assert result.result == "ANSWER"
+            assert result.hint is None  # not "killed after the timeout"
+            assert elapsed < 2, f"dispatch waited {elapsed:.1f}s on a stderr holder"
+        finally:
+            self._kill_pid_file(pid_file)
+
+    def test_ordinary_stderr_error_survives_an_inherited_stderr(self, tmp_path):
+        """A real CLI failure reported on stderr (rc!=0) must not become a timeout."""
+        pid_file = tmp_path / "holder-pid"
+        cli = self._stderr_holder_cli(
+            tmp_path,
+            pid_file,
+            "sys.stderr.write(\"You've hit your session limit \\u00b7 resets 6pm\\n\")\n"
+            "sys.stderr.flush()\nsys.exit(1)\n",
+        )
+        agent = AgentConfig(directory=tmp_path, timeout=5)
+        started = time.monotonic()
+        try:
+            with (
+                patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+                # stdout is empty, so stderr is the only explanation and gets the
+                # long join — shortened here only to keep the test fast.
+                patch("agent_dispatch.runner._STDERR_JOIN_SECONDS", 0.3),
+            ):
+                result = dispatch("test", "task", agent, Settings())
+            elapsed = time.monotonic() - started
+            assert not result.success
+            assert result.error_type == "usage_limit", result.error
+            assert "session limit" in result.error
+            assert elapsed < 3, f"dispatch waited {elapsed:.1f}s on a stderr holder"
+        finally:
+            self._kill_pid_file(pid_file)
+
+    def _detached_stdout_holder_cli(self, tmp_path: Path, pid_file: Path, ready: Path) -> Path:
+        # start_new_session: the grandchild leaves the dispatch's process group,
+        # so killpg cannot reach it — and it inherits fd 1.
+        return self._fake_cli(
+            tmp_path,
+            "import subprocess, sys, time\nfrom pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+            "                         start_new_session=True)\n"
+            f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            f"Path({str(ready)!r}).touch()\n"
+            "time.sleep(30)\n",
+        )
+
+    @staticmethod
+    def _wait_ready(ready: Path, then=None):
+        def on_proc(proc):
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                from agent_dispatch.runner import _kill_process_tree
+
+                _kill_process_tree(proc)
+                proc.wait(timeout=5)
+                pytest.fail("Test subprocess did not finish setting up")
+            if then is not None:
+                then(proc)
+
+        return on_proc
+
+    def test_stream_timeout_is_bounded_with_a_detached_stdout_holder(self, tmp_path):
+        """The timer's killpg cannot reach a detached descendant holding stdout.
+
+        `for line in proc.stdout` then blocked for the descendant's whole life,
+        and the caller's shared concurrency slot with it.
+        """
+        pid_file = tmp_path / "detached-pid"
+        ready = tmp_path / "ready"
+        cli = self._detached_stdout_holder_cli(tmp_path, pid_file, ready)
+        agent = AgentConfig(directory=tmp_path, timeout=1)
+        started = time.monotonic()
+        try:
+            with (
+                patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+                patch("agent_dispatch.runner._STREAM_ORPHAN_GRACE_SECONDS", 0.3),
+            ):
+                result = dispatch_stream(
+                    "test", "task", agent, Settings(), on_proc=self._wait_ready(ready)
+                )
+            elapsed = time.monotonic() - started
+            assert result.error_type == "timeout", result.error
+            assert result.session_id
+            assert elapsed < 5, f"dispatch_stream overran its 1s timeout by {elapsed:.1f}s"
+        finally:
+            self._kill_pid_file(pid_file)
+
+    def test_stream_cancel_is_bounded_with_a_detached_stdout_holder(self, tmp_path):
+        """dispatch_cancel kills the tree from another thread — same unreachable pipe."""
+        pid_file = tmp_path / "detached-pid"
+        ready = tmp_path / "ready"
+        cli = self._detached_stdout_holder_cli(tmp_path, pid_file, ready)
+        agent = AgentConfig(directory=tmp_path, timeout=60)
+
+        def cancel_soon(proc):
+            from agent_dispatch.runner import _kill_process_tree
+
+            threading.Timer(0.2, _kill_process_tree, args=(proc,)).start()
+
+        started = time.monotonic()
+        try:
+            with (
+                patch("agent_dispatch.runner.shutil.which", return_value=str(cli)),
+                patch("agent_dispatch.runner._STREAM_ORPHAN_GRACE_SECONDS", 0.3),
+            ):
+                result = dispatch_stream(
+                    "test", "task", agent, Settings(), on_proc=self._wait_ready(ready, cancel_soon)
+                )
+            elapsed = time.monotonic() - started
+            assert not result.success
+            assert elapsed < 5, f"cancelled dispatch_stream took {elapsed:.1f}s to return"
+        finally:
+            self._kill_pid_file(pid_file)
+
+
+class TestKillProcessTreeReapedLeader:
+    """killpg on a reaped leader's PID may signal an unrelated recycled group."""
+
+    def test_reaped_leader_is_never_killpgd(self):
+        from agent_dispatch.runner import _kill_process_tree
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait()
+        with patch("agent_dispatch.runner.os.killpg") as spy:
+            _kill_process_tree(proc)
+        spy.assert_not_called()
+
+    def test_waiting_for_the_leader_does_not_reap_it(self):
+        """The guard above is only safe because the runner's waits keep the PID reserved."""
+        from agent_dispatch.runner import _kill_process_tree, _wait_leader_exit
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            assert _wait_leader_exit(proc, 5)
+            assert proc.returncode is None  # exited, not reaped
+            assert _wait_leader_exit(proc, 0)
+            assert proc.returncode is None
+            with patch("agent_dispatch.runner.os.killpg") as spy:
+                _kill_process_tree(proc)
+            spy.assert_called_once()  # the tree kill still reaches the group
+        finally:
+            proc.wait()
+        assert proc.returncode == 0
+
+    def test_wait_for_a_running_leader_times_out(self):
+        from agent_dispatch.runner import _wait_leader_exit
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True
+        )
+        try:
+            assert not _wait_leader_exit(proc, 0)
+            assert not _wait_leader_exit(proc, 0.1)
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 class TestDispatchPayloadRobustness:
     def setup_method(self):
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_exit_zero_with_no_output_is_a_failure(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="   \n", stderr=""
@@ -1821,7 +2261,7 @@ class TestDispatchPayloadRobustness:
         assert result.session_id  # resumable
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_exit_zero_with_no_output_reports_stderr(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr="model overloaded"
@@ -1831,7 +2271,7 @@ class TestDispatchPayloadRobustness:
         assert "model overloaded" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_non_object_json_falls_back_to_text(self, mock_run, _which):
         # Valid JSON but not the CLI's result object — every data.get() below
         # would raise AttributeError out of the runner.
@@ -1843,7 +2283,7 @@ class TestDispatchPayloadRobustness:
         assert result.result == '"just a bare string"'
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_non_string_result_field_is_coerced(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -1916,7 +2356,7 @@ class TestSpawnFailureClassification:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run", side_effect=FileNotFoundError("gone"))
+    @patch("agent_dispatch.runner._run_captured", side_effect=FileNotFoundError("gone"))
     def test_missing_cwd_at_spawn_is_not_found(self, _run, _which):
         # is_dir() passing does not prove the child can chdir there, and the
         # directory can vanish between the check and the spawn.
@@ -1925,7 +2365,7 @@ class TestSpawnFailureClassification:
         assert result.error_type == "not_found"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run", side_effect=PermissionError("denied"))
+    @patch("agent_dispatch.runner._run_captured", side_effect=PermissionError("denied"))
     def test_unexecutable_cwd_is_permission(self, _run, _which):
         result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
         assert not result.success
@@ -1933,7 +2373,7 @@ class TestSpawnFailureClassification:
         assert "Hint" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run", side_effect=OSError("too many open files"))
+    @patch("agent_dispatch.runner._run_captured", side_effect=OSError("too many open files"))
     def test_other_oserror_is_cli_error(self, _run, _which):
         result = dispatch("test", "hi", AgentConfig(directory="/tmp", timeout=10), self.settings)
         assert not result.success
@@ -2032,7 +2472,7 @@ class TestOutcomeThroughDispatch:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_dispatch_sends_the_protocol(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_cli_json("ok\nSTATUS: done"), stderr=""
@@ -2052,7 +2492,7 @@ class TestOutcomeThroughDispatch:
         assert result.hint is None
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_protocol_off_sends_no_flag(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_cli_json("ok"), stderr=""
@@ -2061,7 +2501,7 @@ class TestOutcomeThroughDispatch:
         assert "--append-system-prompt" not in mock_run.call_args[0][0]
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_partial_and_blocked_carry_a_resume_hint(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_cli_json("Did half.\nSTATUS: partial"), stderr=""
@@ -2080,7 +2520,7 @@ class TestOutcomeThroughDispatch:
         assert result.result == "Need DB creds."
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_outcome_hint_follows_the_denial_hint(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -2096,7 +2536,7 @@ class TestOutcomeThroughDispatch:
         assert result.hint.index("Bash") < result.hint.index("PARTIAL")
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_status_line_in_json_mode_does_not_break_parsing(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_cli_json('{"n": 1}\nSTATUS: done'), stderr=""
@@ -2106,7 +2546,7 @@ class TestOutcomeThroughDispatch:
         assert result.outcome == "done"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_plain_text_fallback_reports_outcome(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="plain answer\nSTATUS: blocked\n", stderr=""
@@ -2127,7 +2567,7 @@ class TestOutcomeThroughDispatch:
         assert "PARTIAL" in result.hint
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_no_status_line_means_no_outcome(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_cli_json("just text"), stderr=""
@@ -2151,7 +2591,7 @@ class TestUsageJournaling:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_success_is_recorded_with_cost_duration_and_outcome(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -2170,7 +2610,7 @@ class TestUsageJournaling:
         assert entry["caller"] == "taylor"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_failures_are_recorded_with_their_error_type(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
         dispatch("infra", "hello", self.agent, self.settings)
@@ -2188,7 +2628,7 @@ class TestUsageJournaling:
         assert entry["err"] == "not_found"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_usage_log_false_records_nothing(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_ok_stdout(), stderr=""
@@ -2221,7 +2661,7 @@ class TestUsageJournaling:
         assert len(usage.load()) == 1
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_a_broken_journal_never_breaks_a_paid_dispatch(self, mock_run, _which, monkeypatch):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=_ok_stdout(), stderr=""
@@ -2258,7 +2698,7 @@ class TestUsageLimitClassification:
         assert _classify_error("permission denied for tool Bash") == "permission"
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_the_hint_names_the_reset_and_the_account_wide_scope(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -2292,7 +2732,7 @@ class TestTimeoutSuggestion:
         self.settings = Settings()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_suggests_a_value_derived_from_real_runs(self, mock_run, _which):
         for _ in range(5):
             usage.record("infra", ok=True, duration_ms=100_000)
@@ -2303,7 +2743,7 @@ class TestTimeoutSuggestion:
         assert "--timeout 150" in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_falls_back_to_doubling_without_history(self, mock_run, _which):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
         result = dispatch("infra", "hello", self.agent, self.settings)
@@ -2311,7 +2751,7 @@ class TestTimeoutSuggestion:
         assert "suggest" not in result.error
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
-    @patch("agent_dispatch.runner.subprocess.run")
+    @patch("agent_dispatch.runner._run_captured")
     def test_a_suggestion_below_the_current_timeout_is_not_offered(self, mock_run, _which):
         # The agent normally answers in a second; this run failed for some other
         # reason, and telling the caller to *lower* the timeout would be wrong.
@@ -2322,3 +2762,130 @@ class TestTimeoutSuggestion:
         result = dispatch("infra", "hello", agent, self.settings)
         assert "--timeout 1200" in result.error
         assert "suggest" not in result.error
+
+
+class TestMalformedTelemetryKeepsThePaidResult:
+    """Metadata fields come straight from the CLI's JSON. A malformed one must
+    neither raise out of the runner nor discard the answer it rides on."""
+
+    CASES = [
+        {"duration_ms": 1234.5},
+        {"duration_ms": "inf"},
+        {"num_turns": "n/a"},
+        {"num_turns": -1},
+        {"session_id": 123},
+        {"session_id": ""},
+        {"session_id": {"nested": "x"}},
+    ]
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @staticmethod
+    def _generated_session(cmd: list[str]) -> str:
+        return cmd[cmd.index("--session-id", 3) + 1]
+
+    @pytest.mark.parametrize("extra", CASES)
+    @pytest.mark.parametrize("is_error", [False, True], ids=["success", "error"])
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_dispatch(self, mock_run, _which, extra, is_error):
+        payload = {"type": "result", "is_error": is_error, "result": "paid answer", **extra}
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1 if is_error else 0, stdout=json.dumps(payload), stderr=""
+        )
+        result = dispatch("test", "hello", self.agent, self.settings)
+        assert result.success is not is_error
+        assert result.result == "paid answer"
+        expected = self._generated_session(mock_run.call_args[0][0])
+        if "session_id" in extra:
+            assert result.session_id == expected  # still resumable
+        assert isinstance(result.session_id, str) and result.session_id
+
+    @pytest.mark.parametrize("extra", CASES)
+    @pytest.mark.parametrize("is_error", [False, True], ids=["success", "error"])
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_dispatch_stream(self, mock_popen, _which, extra, is_error):
+        payload = {"type": "result", "is_error": is_error, "result": "paid answer", **extra}
+        mock_popen.return_value = _FakePopen([json.dumps(payload)])
+        result = dispatch_stream("test", "hello", self.agent, self.settings)
+        assert result.success is not is_error
+        assert result.result == "paid answer"
+        expected = self._generated_session(mock_popen.call_args[0][0])
+        if "session_id" in extra:
+            assert result.session_id == expected
+        assert isinstance(result.session_id, str) and result.session_id
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_a_valid_reported_session_id_still_wins(self, mock_run, _which):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"is_error": False, "result": "ok", "session_id": "from-cli"}),
+            stderr="",
+        )
+        assert dispatch("test", "hello", self.agent, self.settings).session_id == "from-cli"
+
+
+class TestLoneSurrogatesAreScrubbedAtParse:
+    """A ``\\udXXX`` escape without its pair is ASCII on the wire, so decoding
+    with errors="replace" never sees it; json.loads manufactures an unencodable
+    str. It must not reach DispatchResult, where model_dump_json raises."""
+
+    # What the CLI (or an agent hand-escaping an emoji) actually prints.
+    LONE = '"answer \\ud83d half"'
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    @staticmethod
+    def _serializable(result):
+        result.model_dump_json()  # raised PydanticSerializationError before
+        return result
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_dispatch_result_text(self, mock_run, _which):
+        stdout = '{"type": "result", "is_error": false, "result": ' + self.LONE + "}"
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=stdout, stderr=""
+        )
+        result = self._serializable(dispatch("test", "t", self.agent, self.settings))
+        assert result.success is True
+        assert result.result == "answer � half"
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_json_response_built_from_ascii_text(self, mock_run, _which):
+        # The likelier vector: result is clean ASCII, the *second* parse
+        # (response_format="json") is what creates the surrogate.
+        answer = '{"icon": "\\ud83d", "pair": "\\ud83d\\ude00"}'
+        stdout = json.dumps({"type": "result", "is_error": False, "result": answer})
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=stdout, stderr=""
+        )
+        result = self._serializable(
+            dispatch("test", "t", self.agent, self.settings, response_format="json")
+        )
+        assert result.parsed_result == {"icon": "�", "pair": "\U0001f600"}
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_stream_result_and_progress(self, mock_popen, _which):
+        assistant = (
+            '{"type": "assistant", "message": {"content": '
+            '[{"type": "text", "text": ' + self.LONE + "}]}}"
+        )
+        final = '{"type": "result", "is_error": false, "result": ' + self.LONE + "}"
+        mock_popen.return_value = _FakePopen([assistant, final])
+        progress: list[str] = []
+        result = self._serializable(
+            dispatch_stream("test", "t", self.agent, self.settings, on_progress=progress.append)
+        )
+        assert result.result == "answer � half"
+        for line in progress:
+            line.encode("utf-8")

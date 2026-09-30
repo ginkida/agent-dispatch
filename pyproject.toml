@@ -1,6 +1,6 @@
 [project]
 name = "agent-dispatch"
-version = "0.15.1"
+version = "0.16.0"
 description = "MCP server that lets Claude Code agents delegate tasks to agents in other project directories"
 readme = "README.md"
 license = "MIT"
@@ -59,6 +59,12 @@ packages = ["src/agent_dispatch"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# pytester: the real-claude guard's tests run conftest.py in an inner session.
+addopts = ["-p", "pytester"]
+# A thread dying of an exception is a bug in the test or the code under test,
+# never noise: without this, a background thread that tripped the real-claude
+# guard (or crashed any other way) only produced a warning and the test passed.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
 
 [tool.ruff]
 target-version = "py310"

@@ -94,13 +94,42 @@ def test_dispatch_result_error_type():
     assert r.error_type == "permission"
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "broken", 10**400])
+def test_bad_cost_metadata_preserves_the_dispatch_result(value):
+    result = DispatchResult(agent="test", success=True, result="paid result", cost_usd=value)
+    assert result.result == "paid result"
+    assert result.success is True
+    assert result.cost_usd is None
+
+
+@pytest.mark.parametrize("field", ["duration_ms", "num_turns"])
+@pytest.mark.parametrize(
+    "value", ["inf", "NaN", "n/a", -1, -0.5, True, False, None, [1], {"a": 1}, 10**400]
+)
+def test_bad_count_metadata_preserves_the_dispatch_result(field, value):
+    # These used to be strict ints: a malformed CLI field raised ValidationError
+    # out of runner.dispatch and the already-billed answer was lost.
+    result = DispatchResult(agent="test", success=True, result="paid result", **{field: value})
+    assert result.result == "paid result"
+    assert result.success is True
+    assert getattr(result, field) is None
+
+
+@pytest.mark.parametrize("field", ["duration_ms", "num_turns"])
+@pytest.mark.parametrize(("value", "expected"), [(1234.5, 1234), ("42", 42), (0, 0), (7, 7)])
+def test_count_metadata_is_coerced_to_int(field, value, expected):
+    result = DispatchResult(agent="test", success=True, result="ok", **{field: value})
+    assert getattr(result, field) == expected
+    assert type(getattr(result, field)) is int
+
+
 class TestAgentNameValidation:
     def test_valid_names(self):
         for name in ["infra", "backend-api", "agent_1", "A1"]:
             assert validate_agent_name(name) == name
 
     def test_invalid_names(self):
-        for name in ["", "-start", "_start", "has space", "special!", "a/b"]:
+        for name in ["", "-start", "_start", "has space", "special!", "a/b", "agent\n"]:
             with pytest.raises(ValueError, match="Invalid agent name"):
                 validate_agent_name(name)
 
@@ -280,6 +309,13 @@ class TestNumericBounds:
             AgentConfig(directory=tmp_path, max_budget_usd=-1)
         with pytest.raises(ValidationError):
             Settings(default_max_budget_usd=-1)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_budgets_are_rejected(self, tmp_path, value):
+        with pytest.raises(ValidationError):
+            AgentConfig(directory=tmp_path, max_budget_usd=value)
+        with pytest.raises(ValidationError):
+            Settings(default_max_budget_usd=value)
 
 
 class TestDirectoryValidation:

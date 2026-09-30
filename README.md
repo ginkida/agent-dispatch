@@ -355,6 +355,13 @@ Run multiple tasks concurrently. Much faster than sequential `dispatch` calls.
 
 Same as `dispatch` but shows live progress while the agent works. Use for long-running tasks. Not cached.
 
+Progress notifications keep the latest 100 pending messages, capped at 300
+characters each. If output arrives faster than the client can receive it,
+older notifications are omitted with a count; the final result is unaffected.
+Disconnecting or cancelling the tool call discards pending notifications and
+stops buffering new ones. The worker still holds its concurrency slot until it
+finishes.
+
 Parameters are the same as `dispatch` except `return_ref`/`summary_chars` (streaming is incompatible with ref-mode) and `group` (group context injection is supported only on `dispatch` and per-item in `dispatch_parallel`).
 
 ### `dispatch_dialogue`
@@ -396,7 +403,7 @@ Register a new project directory as an agent. Description is auto-generated from
 | `directory` | string | yes | Path to an existing project directory (`~` is expanded, relative paths resolved) |
 | `description` | string | no | What this agent can do — auto-generated if empty |
 | `timeout` | int | no | Timeout in seconds (0 = 300; this is a literal default, not `settings.default_timeout`) |
-| `max_budget_usd` | float | no | Max cost in USD per dispatch (0 = inherit `settings.default_max_budget_usd`; no cap only when that is unset too) |
+| `max_budget_usd` | float | no | Finite max cost in USD per dispatch (0 = inherit `settings.default_max_budget_usd`; no cap only when that is unset too) |
 | `permission_mode` | string | no | Permission mode (e.g. `default`, `plan`, `bypassPermissions`) |
 | `allowed_tools` | string | no | Comma-separated allowed tools (e.g. `"Bash,Read,Edit"`) |
 | `disallowed_tools` | string | no | Comma-separated disallowed tools |
@@ -422,7 +429,7 @@ Update an existing agent's configuration. Only non-empty fields are changed. Pas
 | `risky_capabilities` | string | no | Comma-separated. `"none"` to clear |
 | `instructions` | string | no | Standing orders for every dispatch (replaces the text). `"none"` to clear |
 
-Changing an agent's config drops that agent's cached results — the cache key holds the agent *name*, so a re-pointed or re-permissioned agent would otherwise keep answering from the previous config for the rest of the TTL. The same applies to `add_agent` and `remove_agent`.
+Changing an agent's config through an MCP mutation tool drops its cached results immediately. Cache keys also include the agent configuration and dispatch defaults, so edits through the CLI, another server, or YAML take effect on the next request. A worker finishing with an older configuration cannot overwrite answers for the new configuration. Unchanged agents keep their cache.
 
 ### `remove_agent`
 
@@ -477,11 +484,11 @@ dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
   -> {"id": "...", "status": "running", "timed_out_waiting": true}
 ```
 
-`dispatch_cancel(job_id)` cancels a **pending** job, and also kills a **running** job's `claude` subprocess when the job was started by the same server instance (the job is marked `cancelled` first, so the worker's trailing write can't undo it; partial work is lost but the progress tail is preserved). A running job started by a *previous* server run can't be killed safely and is left to finish. The response carries an `outcome` of `cancelled`, `cancelled_running`, `running` (not owned by this server), `already_terminal`, or `not_found`.
+`dispatch_cancel(job_id)` cancels a **pending** job, and also kills a **running** job's `claude` process group when the job was started by the same server instance (the job is marked `cancelled` first, so the worker's trailing write can't undo it; partial work is lost but the progress tail is preserved). On POSIX, descendants in that process group are killed too, releasing inherited pipes and the concurrency slot. A cancel that lands after the job was claimed but before its process spawned is honored too: the process is killed as soon as it starts. A compatibility retry that races cancellation is killed when it registers. A running job started by a *previous* server run can't be killed safely and is left to finish. The response carries an `outcome` of `cancelled`, `cancelled_running`, `running` (not owned by this server), `already_terminal`, or `not_found`.
 
 Async workers run with streaming under the hood: the job file keeps a rolling tail (last 20 lines, ~1 write/sec) of assistant text and tool-use events. `dispatch_status` shows it as `progress` while the job runs and keeps it afterwards as a post-mortem trace; `dispatch_jobs` shows `last_progress` for running jobs.
 
-`dispatch_jobs(status?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted.
+`dispatch_jobs(status?, limit=50, agent?)` lists recent jobs as summaries (filter by `pending` / `running` / `done` / `failed` / `cancelled`). `agent` matches an exact name, including agents since removed from configuration; both filters apply before the limit. `dispatch_gc(max_age_days=7)` purges terminal jobs older than the threshold — pending and running jobs are never deleted. Use `dry_run=True` to preview eligible job IDs without deleting them.
 
 Job state persists to disk at `~/.config/agent-dispatch/jobs/` (override with `AGENT_DISPATCH_JOBS_DIR`). One JSON file per job, written owner-only (`0o600`) with atomic writes — safe to read or `ls` while jobs are in flight. Caller-supplied `job_id`s are validated as 32-char hex before any file access (no path traversal). On startup the server recovers jobs a crashed instance abandoned: `running` ones stuck over an hour, and `pending` ones over 24 hours, are marked `failed` so they stop being polled forever and become collectable by `dispatch_gc`. (The `pending` threshold is deliberately long — the jobs directory is shared by every running server, so a job queued behind another server's concurrency limit must not be swept.)
 
@@ -515,7 +522,7 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 | `error_type` | Meaning | Recovery |
 |--------------|---------|----------|
 | `permission` | A tool call was denied | `update_agent(name, allowed_tools="Bash,Read")` (least privilege) or `update_agent(name, permission_mode="bypassPermissions")`, then re-dispatch. The `error` text includes a hint with the exact fix. |
-| `timeout` | Process killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=` — once the journal has history the error names the value that would have covered this agent's p90 — or use `dispatch_async`. A *streaming* dispatch that produced its answer before the deadline returns that answer with a `hint` instead of failing. |
+| `timeout` | Process group killed at the timeout | Resume the partial work: `dispatch_session(agent, "Continue where you left off", session_id=<from the error text>)`. Or retry with a bigger `timeout_seconds=` — once the journal has history the error names the value that would have covered this agent's p90 — or use `dispatch_async`. Both ordinary and streaming dispatches preserve a complete CLI result received before termination; a successful result includes a cleanup `hint`. Partial output remains a timeout. |
 | `not_found` | Agent directory or `claude` CLI missing | `list_agents()` → check `healthy`. Re-add the agent with an existing path, or run `agent-dispatch doctor` to find what's missing. |
 | `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
 | `budget` | The `claude` CLI ended the session at the `max_budget_usd` spend cap — the answer is incomplete | Raise the cap (`update_agent(name, max_budget_usd=2.0)`), switch to a cheaper `model`, or split the task. The partial session is resumable: `dispatch_session(agent, "Continue where you left off", session_id=<from the result>)`. |
@@ -587,7 +594,7 @@ settings:
   #   - Read
   #   - Edit
   max_dispatch_depth: 3     # recursion protection
-  max_concurrency: 5        # max parallel claude -p processes (per dispatch path)
+  max_concurrency: 5        # max parallel claude -p processes per server, across all tools
   # dispatch_protocol: true # send every agent the dispatch protocol (non-interactive,
   #                         # time budget, STATUS line → `outcome`). false = raw claude -p.
   # usage_log: true         # record every dispatch in usage.jsonl (cost, duration, outcome).
@@ -659,8 +666,19 @@ past dispatches and deleting them cannot be undone. Pending and running jobs are
 never touched.
 
 `agent-dispatch gc --days N` and the `dispatch_gc` tool apply the same rule as a
-one-off. Both *delete* immediately and report the count; neither previews, so
-check what is there first with `agent-dispatch jobs`.
+one-off. Preview eligible records before deleting them:
+
+```bash
+agent-dispatch gc --days 30 --dry-run
+agent-dispatch gc --days 30
+```
+
+`--dry-run` also works with `--all`. The MCP equivalent is
+`dispatch_gc(max_age_days=30, dry_run=True)`, returning `dry_run: true`,
+`purged: 0`, `would_purge`, `job_ids`, and `max_age_days`.
+A preview is a snapshot; deletion checks eligibility again, so its count can
+change as jobs finish. Unreadable records, invalid timestamps, and records whose
+internal ID differs from their filename are skipped and preserved for inspection.
 
 ### Auto-Description
 
@@ -695,8 +713,8 @@ Your Claude Code session
   ▼
 agent-dispatch MCP server
   ├─ cache check → hit? return cached result
-  ├─ semaphore → limit concurrent processes
-  └─ subprocess.run("claude -p ...", cwd=~/projects/infra/)
+  ├─ shared process limit → bound concurrency across all dispatch tools
+  └─ subprocess.Popen(["claude", "-p", ...], cwd=~/projects/infra/)
        │
        ▼
      New Claude Code session in ~/projects/infra/
@@ -715,9 +733,9 @@ agent-dispatch MCP server
 - **Path-traversal guard** — caller-supplied `job_id`/`ref` values are validated as 32-char hex before any filesystem access.
 - **Owner-only state** — job files, `agents.yaml`, the usage journal and the server registry are all written `0o600`; their directories are `0o700`.
 - **Cost control** — `max_budget_usd` per agent or globally is passed to the `claude` CLI as `--max-budget-usd`, so a runaway dispatch is stopped at the cap and comes back as `error_type: "budget"` with a resumable `session_id`. An overshoot that lands over budget without stopping is flagged post-hoc with `budget_exceeded: true` + a hint.
-- **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes. Note: the sync and async dispatch paths use separate semaphores, so the worst-case total is `2 × max_concurrency`.
-- **Timeout** — per-agent or global (default: 300s). A streaming dispatch runs the agent in its own process group, so the deadline kills the whole tree: a process the agent left running in the background can't hold the dispatch (and its concurrency slot) open past the timeout.
-- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, results flagged `budget_exceeded`, and results the agent itself reported as `partial` / `blocked` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
+- **Concurrency** — `max_concurrency` (default: 5) caps parallel `claude -p` processes across all dispatch tools within one server process. Ordinary, streaming, and background dispatches share the same limit, and waiting calls are served in arrival order, so a queue of background jobs cannot starve an interactive call. Cancelling a waiting call never starts its process; cancelling an already-started ordinary or streaming call keeps its slot occupied until the worker ends. Reloading a changed limit preserves occupied slots: lowering it lets existing work finish and holds new launches until capacity is available. Separate server processes each have their own limit.
+- **Timeout** — per-agent or global (default: 300s). Both ordinary and streaming dispatches run the agent in its own process group. On POSIX, the deadline kills that group, including descendants that inherited output pipes. Ordinary dispatch also bounds cleanup to one additional second if a descendant deliberately detached from the group; that detached process is outside the group's reach. A complete CLI result survives cleanup timeout, with a hint on successful results.
+- **Caching** — identical `(agent, task, context, caller, goal, response_format)` requests under the same agent configuration and dispatch defaults return cached results, bounded by `cache.max_size` (oldest entry evicted first). Only clean successes are cached: failures, results with `denied_tools`, results flagged `budget_exceeded`, and results the agent itself reported as `partial` / `blocked` are not, so the documented "grant access / raise the cap, then re-dispatch" recovery is never served a stale crippled answer. Changing an agent's config invalidates its entries. Sessions and dialogues are never cached. A `group=` dispatch folds the group's `shared_context` into `context`, so different groups cache separately and a plain dispatch is unaffected.
 - **Durable config** — `agents.yaml` is written atomically (temp file + rename), so an interrupted write can never truncate it. Every mutation path (CLI and MCP server alike) also takes a cross-process advisory lock, so concurrent edits don't drop one another's agents. The lock is best-effort by design: after waiting 10 seconds it logs a warning and proceeds anyway, because a wedged lock holder must not freeze the MCP server — so on a heavily contended config a lost update is possible, while a truncated one is not.
 
 See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassPermissions` escalation risk and on-disk job files).
@@ -735,12 +753,49 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 | `agent-dispatch describe <name>` | Show full configuration for one agent (tri-state tools, project files) |
 | `agent-dispatch test <name> [task] [--stream]` | Test an agent with a dispatch (`--stream` for live progress) |
 | `agent-dispatch stats [--days N --agent X --json]` | What dispatches cost: spend, durations, outcomes and failures per agent |
-| `agent-dispatch doctor` | Diagnose installation: Claude CLI (incl. `--append-system-prompt` support), running servers on stale code, MCP registration, agent health, and group membership |
-| `agent-dispatch jobs [--status --limit]` | List async dispatch jobs (most recent first) |
-| `agent-dispatch job <id>` | Show one job: status, progress tail, result preview |
+| `agent-dispatch doctor [--json --strict]` | Diagnose installation, stale servers, MCP registration, agent health, and group membership; `--strict` also fails on warnings |
+| `agent-dispatch jobs [--status STATUS --agent NAME --limit N --json]` | List recent job summaries, including results stored with `return_ref` |
+| `agent-dispatch job <id> [--json]` | Show one job; `--json` exports the full record without truncation |
 | `agent-dispatch cancel <id>` | Cancel a pending job (running jobs: use the `dispatch_cancel` MCP tool) |
-| `agent-dispatch gc [--days N \| --all]` | Purge terminal jobs older than N days (default 7; `--all` purges every age) |
+| `agent-dispatch gc [--days N \| --all] [--dry-run]` | Purge terminal jobs older than N days (default 7; `--all` purges every age); `--dry-run` previews without deleting |
 | `agent-dispatch serve` | Start MCP server (stdio, used by Claude Code) |
+
+To check an installation from a script:
+
+```bash
+agent-dispatch doctor --json --strict > diagnostics.json
+```
+
+The report contains `schema_version: 1`, overall `status` (`ok`, `warn`, or
+`fail`), `issues` and `warnings` counts, and a `checks` array. Each check has a
+`section`, `status`, `message`, and `details` array containing any remediation
+steps or supporting information. JSON is emitted even when checks fail.
+Failures exit with code 1; warnings exit with code 0 unless `--strict` is set.
+The same checks and exit policy apply to the normal human-readable output.
+This checks installation and configuration; it does not run a paid dispatch.
+
+To inspect history from scripts or save a full result:
+
+```bash
+agent-dispatch jobs --agent infra --status failed --limit 10 --json
+agent-dispatch job <job_id> --json > job.json
+```
+
+`jobs --json` returns an array of compact summaries in the same format as
+`dispatch_jobs`, or `[]` if no jobs match. Each summary includes the ID, agent,
+status, first 120 task characters, and timestamps; result cost, success, outcome,
+error type, and latest running progress are included when available.
+`job --json` returns the full stored job, including task/context, progress,
+result text, structured result, session ID, and recovery hints when present.
+Both formats preserve Unicode. Reading a failed job still exits successfully:
+check its `status` and `result.success` to determine the dispatch outcome.
+Missing/invalid job IDs and storage-open failures return `{"error": "..."}`
+with exit code 1. Invalid command-line options are reported by Click on stderr.
+
+Invalid or non-finite cost metadata is treated as unknown and omitted from
+result exports; it does not hide the stored result text. Usage summaries ignore
+unusable numeric measurements, and doctor omits uptime when a server's start
+timestamp is unreadable.
 
 ## Requirements
 

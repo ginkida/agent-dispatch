@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -63,6 +66,94 @@ class TestJobStoreCreateGet:
     def test_get_handles_corrupt_file(self, store: JobStore):
         (store.directory / "broken.json").write_text("{not valid json")
         assert store.get("broken") is None
+
+
+class TestDamagedJobRecords:
+    @pytest.mark.parametrize(
+        "operation", ["mark_running", "update_progress", "cancel", "fail", "finish"]
+    )
+    def test_mismatched_identity_cannot_overwrite_another_job(self, store, operation):
+        target = store.create("infra", "real task")
+        damaged = store.create("db", "damaged task")
+        path = store.directory / f"{damaged.id}.json"
+        payload = damaged.model_dump()
+        payload["id"] = target.id
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        original = path.read_bytes()
+
+        if operation == "fail":
+            assert store.fail(damaged.id, "failure") is None
+        elif operation == "finish":
+            result = DispatchResult(agent="db", success=True, result="done")
+            assert store.finish(damaged.id, result) is None
+        elif operation == "cancel":
+            assert store.cancel(damaged.id) == (None, "not_found")
+        elif operation == "update_progress":
+            assert store.update_progress(damaged.id, ["redirected"]) is None
+        else:
+            assert store.mark_running(damaged.id) is None
+
+        assert store.get(target.id) == target
+        assert store.get(damaged.id) is None
+        assert store.list() == [target]
+        assert path.read_bytes() == original
+
+    def test_recovery_ignores_copied_record_with_stale_timestamp(self, store):
+        live = store.create("infra", "still queued")
+        payload = live.model_dump()
+        payload["created_at"] = time.time() - 86400 * 30
+        path = store.directory / f"{'a' * 32}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert store.recover_stale() == 0
+        assert store.get(live.id) == live
+        assert path.exists()
+
+    def test_gc_preserves_records_with_mismatched_identity(self, store):
+        # The damaged record must claim the id of a job that REALLY exists: gc
+        # deletes by the record's id, so a foreign id pointing at no file makes
+        # the unlink fail harmlessly and this test would pass with the identity
+        # check gone. Pointing it at a live running job is the actual hazard —
+        # a terminal-looking copy would get the live job's file deleted.
+        live = store.create("infra", "still running")
+        assert store.mark_running(live.id) is not None
+        damaged = store.create("db", "damaged")
+        payload = damaged.model_dump()
+        payload.update(id=live.id, status="done", completed_at=1)
+        path = store.directory / f"{damaged.id}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert store.gc(0) == 0
+        assert path.exists()
+        assert (store.directory / f"{live.id}.json").exists()
+        reread = store.get(live.id)
+        assert reread is not None and reread.status == "running"
+
+    @pytest.mark.parametrize(
+        "field", ["created_at", "started_at", "completed_at", "progress_updated_at"]
+    )
+    @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "invalid"])
+    def test_invalid_timestamps_are_skipped_and_preserved(self, store, field, value):
+        job = store.create("infra", "damaged")
+        payload = job.model_dump()
+        payload[field] = value
+        path = store.directory / f"{job.id}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        original = path.read_bytes()
+
+        assert store.get(job.id) is None
+        assert store.list() == []
+        assert store.recover_stale() == 0
+        assert store.gc(0) == 0
+        assert path.read_bytes() == original
+
+    def test_newline_id_is_rejected_without_reading_a_file(self, store):
+        job_id = "a" * 32 + "\n"
+        path = store.directory / f"{job_id}.json"
+        path.write_text(Job(id=job_id, agent="infra", task="task").model_dump_json())
+        assert not is_valid_job_id(job_id)
+        assert store.get(job_id) is None
+        assert store.list() == []
 
 
 class TestJobStoreLifecycle:
@@ -191,6 +282,27 @@ class TestJobStoreList:
 
 
 class TestJobStoreGC:
+    def test_preview_matches_deletion_without_changing_records(self, store):
+        old = store.create_completed(
+            "infra", "old", DispatchResult(agent="infra", success=True, result="done")
+        )
+        old.completed_at = time.time() - 86400 * 30
+        store._write(old)
+        store.create_completed(
+            "infra", "recent", DispatchResult(agent="infra", success=True, result="done")
+        )
+        pending = store.create("infra", "pending")
+        pending.created_at = 1
+        store._write(pending)
+        running = store.create("infra", "running")
+        store.mark_running(running.id)
+        before = {p.name: p.read_bytes() for p in store.directory.glob("*.json")}
+
+        assert [j.id for j in store.gc_candidates(86400 * 7)] == [old.id]
+        assert {p.name: p.read_bytes() for p in store.directory.glob("*.json")} == before
+        assert store.gc(86400 * 7) == 1
+        assert {j.id for j in store.list()} == {name[:-5] for name in before} - {old.id}
+
     def test_gc_removes_terminal_jobs_past_threshold(self, store: JobStore):
         old = store.create("infra", "old")
         result = DispatchResult(agent="infra", success=True, result="done")
@@ -231,6 +343,47 @@ class TestJobStoreGC:
 
 
 class TestJobModel:
+    def test_summary_omits_large_payloads_but_preserves_recovery_signals(self):
+        job = Job(
+            id="a" * 32,
+            agent="infra",
+            task="x" * 1000,
+            context="private context",
+            status="failed",
+            created_at=1,
+            started_at=2,
+            completed_at=3,
+            error="denied",
+            result=DispatchResult(
+                agent="infra",
+                success=False,
+                result="y" * 10000,
+                error="denied",
+                error_type="permission",
+                cost_usd=0,
+                outcome="blocked",
+            ),
+        )
+        assert job.summary() == {
+            "id": job.id,
+            "agent": "infra",
+            "status": "failed",
+            "task": "x" * 120,
+            "created_at": 1,
+            "started_at": 2,
+            "completed_at": 3,
+            "success": False,
+            "cost_usd": 0,
+            "outcome": "blocked",
+            "error_type": "permission",
+        }
+
+    def test_summary_keeps_only_latest_running_progress(self):
+        job = Job(id="a" * 32, agent="infra", task="task", status="running", progress=["a", "b"])
+        assert job.summary()["last_progress"] == "b"
+        job.status = "done"
+        assert "last_progress" not in job.summary()
+
     def test_is_terminal(self):
         for s in ("done", "failed", "cancelled"):
             assert Job(id="x", agent="a", task="t", status=s).is_terminal()
@@ -635,3 +788,78 @@ class TestJobStoreLocking:
             pass
         assert (tmp_path / "jobs" / ".jobs.lock").exists()
         assert len(store.list()) == 1  # the .lock file is not a *.json job
+
+
+class TestRealClaudeGuard:
+    """conftest's ``_prevent_real_claude`` — lives here because the job worker is
+    the case it exists for: ``_run_job`` runs on a daemon thread and catches only
+    ``Exception``, so the guard's ``Failed`` (a BaseException) killed the thread
+    and the test that forgot to mock ``dispatch_stream`` still passed."""
+
+    @pytest.mark.parametrize(
+        ("args", "kwargs"),
+        [
+            (["claude", "-p", "x"], {}),
+            ("claude", {}),
+            (b"claude", {}),
+            (Path("/usr/local/bin/claude"), {}),
+            ([b"/opt/bin/claude", b"-p"], {}),
+            ((Path("claude"), "-p"), {}),
+            ([sys.executable, "-c", "pass"], {"executable": "claude"}),
+            ("claude -p 'x'", {"shell": True}),
+        ],
+        ids=["list", "str", "bytes", "pathlike", "bytes-argv", "tuple", "executable", "shell"],
+    )
+    def test_trips_on_every_argument_shape(self, _prevent_real_claude, args, kwargs):
+        with pytest.raises(pytest.fail.Exception):
+            subprocess.Popen(args, **kwargs)
+        assert len(_prevent_real_claude) == 1
+        _prevent_real_claude.clear()  # tripped on purpose; don't fail at teardown
+
+    def test_other_programs_and_bad_arguments_pass_through(self, _prevent_real_claude):
+        subprocess.run([sys.executable, "-c", "pass"], check=True)
+        # Popen's own error for an argument shape it rejects, not the guard's.
+        with pytest.raises(Exception):  # noqa: B017,PT011 - whatever Popen raises
+            subprocess.Popen([])
+        assert _prevent_real_claude == []
+
+    def test_records_a_spawn_from_a_background_thread(self, _prevent_real_claude):
+        caught: list[BaseException] = []
+
+        def worker():
+            try:
+                subprocess.Popen(["claude", "-p", "x"])
+            except BaseException as e:  # noqa: BLE001 - what the guard raised
+                caught.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(5)
+        assert len(caught) == 1 and isinstance(caught[0], pytest.fail.Exception)
+        assert len(_prevent_real_claude) == 1
+        _prevent_real_claude.clear()
+
+    @pytest.mark.parametrize("swallow", [True, False], ids=["swallowed", "thread-dies"])
+    def test_a_thread_spawn_fails_the_test_at_teardown(self, pytester, swallow):
+        # Run the REAL conftest in an inner session: a passing test body whose
+        # background thread tripped the guard must still come out failed —
+        # both when the thread swallows the BaseException (gather with
+        # return_exceptions) and when it dies of it (_run_job's `except Exception`).
+        pytester.makeconftest((Path(__file__).parent / "conftest.py").read_text())
+        handler = "except BaseException:" if swallow else "finally:"
+        pytester.makepyfile(
+            "import subprocess, threading\n"
+            "\n"
+            "def test_forgot_to_mock():\n"
+            "    def worker():\n"
+            "        try:\n"
+            "            subprocess.Popen(['claude', '-p', 'x'])\n"
+            f"        {handler}\n"
+            "            pass\n"
+            "    t = threading.Thread(target=worker)\n"
+            "    t.start()\n"
+            "    t.join(5)\n"
+        )
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-p", "no:asyncio")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*Real claude CLI spawned 1 time(s)*"])

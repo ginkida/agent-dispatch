@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +44,10 @@ class AgentConfig(BaseModel):
     description: str = ""
     # 0 keeps its historical meaning "inherit settings.default_timeout" (see
     # runner: `agent.timeout or settings.default_timeout`). Negative values are
-    # rejected: they reach subprocess.run(timeout=-5), which raises
-    # TimeoutExpired instantly and bricks the agent with a nonsense error.
+    # rejected: a negative process deadline expires immediately and bricks
+    # the agent with a nonsense error.
     timeout: int = Field(default=300, ge=0)
-    max_budget_usd: float | None = Field(default=None, ge=0)
+    max_budget_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     model: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
@@ -96,7 +97,7 @@ class Settings(BaseModel):
     # ge=1, not ge=0: this is the value an agent falls back to, so 0 would make
     # every dispatch time out instantly with no way to override it per agent.
     default_timeout: int = Field(default=300, ge=1)
-    default_max_budget_usd: float | None = Field(default=None, ge=0)
+    default_max_budget_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     default_permission_mode: str | None = None
     default_allowed_tools: list[str] = Field(default_factory=list)
     default_disallowed_tools: list[str] = Field(default_factory=list)
@@ -132,7 +133,7 @@ def validate_agent_name(name: str) -> str:
     """Validate agent name: alphanumeric, hyphens, underscores, no leading special chars."""
     import re
 
-    if not re.match(_AGENT_NAME_PATTERN, name):
+    if not re.fullmatch(_AGENT_NAME_PATTERN, name):
         raise ValueError(
             f"Invalid agent name: {name!r}. "
             "Use only letters, digits, hyphens, and underscores. "
@@ -238,3 +239,30 @@ class DispatchResult(BaseModel):
     # agent did not report one (protocol off, JSON mode, or it just didn't).
     # Descriptive: never flips `success`. partial/blocked are not cached.
     outcome: str | None = None
+
+    @field_validator("cost_usd", mode="before")
+    @classmethod
+    def _finite_cost(cls, value: object) -> float | None:
+        # Optional accounting metadata must not discard an already-paid result.
+        # Reuse the disk-number boundary when reading stored job records too.
+        from .usage import as_float
+
+        number = as_float(value, default=math.nan)
+        return number if math.isfinite(number) else None
+
+    @field_validator("duration_ms", "num_turns", mode="before")
+    @classmethod
+    def _plain_count(cls, value: object) -> int | None:
+        # Same rule as _finite_cost: these come straight from the CLI's JSON, and
+        # a strict `int` field turned 1234.5, "n/a" or "inf" into a ValidationError
+        # (a ValueError) that escaped runner.dispatch, the journal wrapper and the
+        # MCP guard — losing a billed answer over a telemetry field.
+        # bool first: float(True) == 1.0 would pass as "one turn".
+        if value is None or isinstance(value, bool):
+            return None
+        from .usage import as_float
+
+        number = as_float(value, default=math.nan)
+        if not math.isfinite(number) or number < 0:
+            return None
+        return int(number)

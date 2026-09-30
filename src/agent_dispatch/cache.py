@@ -16,11 +16,13 @@ logger = logging.getLogger(__name__)
 class DispatchCache:
     """Thread-safe TTL cache for dispatch results.
 
-    Keyed on (agent, task, context, caller, goal, response_format) — identical
+    Keyed on (agent, task, context, caller, goal, response_format, config_key) — identical
     requests within the TTL window return the cached result without spawning a
     new subprocess. ``caller``/``goal``/``response_format`` all affect the
     prompt sent to the agent, so they must be part of the key: otherwise two
     requests with different framing would collide and return the wrong response.
+    ``config_key`` captures the agent and dispatch settings at launch, so a
+    late result from an older configuration cannot replace current answers.
     """
 
     def __init__(self, ttl: int = 300, max_size: int = 1000) -> None:
@@ -43,6 +45,8 @@ class DispatchCache:
         caller: str | None = None,
         goal: str | None = None,
         response_format: str | None = None,
+        *,
+        config_key: str | None = None,
     ) -> str:
         canonical = json.dumps(
             {
@@ -52,6 +56,7 @@ class DispatchCache:
                 "caller": caller or "",
                 "goal": goal or "",
                 "response_format": response_format or "",
+                "config": config_key or "",
             },
             sort_keys=True,
         )
@@ -65,8 +70,12 @@ class DispatchCache:
         caller: str | None = None,
         goal: str | None = None,
         response_format: str | None = None,
+        *,
+        config_key: str | None = None,
     ) -> DispatchResult | None:
-        key = self._make_key(agent, task, context, caller, goal, response_format)
+        key = self._make_key(
+            agent, task, context, caller, goal, response_format, config_key=config_key,
+        )
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -92,6 +101,8 @@ class DispatchCache:
         caller: str | None = None,
         goal: str | None = None,
         response_format: str | None = None,
+        *,
+        config_key: str | None = None,
     ) -> None:
         if not result.success:
             return  # don't cache failures
@@ -100,7 +111,7 @@ class DispatchCache:
             # the run cost more than its cap. The documented recovery is "grant
             # access / raise the budget, then re-dispatch" — caching this would
             # serve the same crippled answer back for the whole TTL and make that
-            # recovery a no-op (the permission config is not part of the key).
+            # recovery a no-op when the underlying cause changes outside config.
             return
         if result.outcome in ("partial", "blocked"):
             # The agent itself says the work is unfinished. Whatever it was
@@ -108,7 +119,9 @@ class DispatchCache:
             # is not in the key either, so a retry after fixing it would be
             # served the same unfinished answer for the whole TTL.
             return
-        key = self._make_key(agent, task, context, caller, goal, response_format)
+        key = self._make_key(
+            agent, task, context, caller, goal, response_format, config_key=config_key,
+        )
         with self._lock:
             # Bound memory: when at capacity and inserting a new key, evict the
             # oldest entry by insertion time (FIFO). We intentionally do NOT
@@ -124,11 +137,9 @@ class DispatchCache:
     def invalidate_agent(self, agent: str) -> int:
         """Drop every cached result for *agent*. Returns the number removed.
 
-        Called whenever an agent's config changes: the cache key is
-        (agent, task, context, caller, goal, response_format), so it cannot tell
-        that the name now points at a different directory, permission set or
-        model. Without this, ``remove_agent`` + ``add_agent`` under the same name
-        keeps serving the previous project's answers for the rest of the TTL.
+        Mutation tools reclaim the old entries immediately. The configuration
+        snapshot in the key also protects against external edits and in-flight
+        workers inserting results after this invalidation.
         """
         with self._lock:
             stale = [k for k, (_ts, name, _r) in self._store.items() if name == agent]

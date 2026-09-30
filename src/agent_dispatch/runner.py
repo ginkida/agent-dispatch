@@ -6,7 +6,9 @@ import functools
 import json
 import logging
 import os
+import queue
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -148,6 +150,36 @@ def _build_system_prompt(
     return "\n\n".join(parts) if parts else None
 
 
+def _encodable(value: object) -> object:
+    """Replace lone surrogates in every string of a parsed JSON value.
+
+    ``json.loads`` turns a ``\\udXXX`` escape without its pair into a str that
+    UTF-8 cannot encode. The CLI's output is pure ASCII on the wire, so decoding
+    with ``errors="replace"`` never sees it — it is *manufactured* by the parse,
+    most often when an agent hand-escapes an emoji in a response_format="json"
+    answer. Left in place it makes ``model_dump_json`` raise out of the MCP
+    tools, and ``JobStore`` fail to persist a paid result. One total pass at the
+    parse boundary keeps every downstream serializer safe.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            # Via UTF-16: each lone surrogate becomes exactly one U+FFFD.
+            return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        return value
+    if isinstance(value, list):
+        return [_encodable(item) for item in value]
+    if isinstance(value, dict):
+        return {_encodable(k): _encodable(v) for k, v in value.items()}
+    return value
+
+
+def _loads(text: str) -> object:
+    """``json.loads`` for untrusted CLI/agent text; see :func:`_encodable`."""
+    return _encodable(json.loads(text))
+
+
 def _parse_structured_response(text: str) -> object | None:
     """Attempt to parse *text* as JSON, tolerating common wrappers.
 
@@ -169,7 +201,7 @@ def _parse_structured_response(text: str) -> object | None:
                 lines = lines[:-1]
             candidate = "\n".join(lines).strip()
     try:
-        return json.loads(candidate)
+        return _loads(candidate)
     except (json.JSONDecodeError, ValueError):
         return None
 
@@ -373,6 +405,19 @@ def _budget_error_hint(agent_name: str, budget: float | None, session_uuid: str 
     return msg
 
 
+def _session_id_from(data: dict, fallback: str | None) -> str | None:
+    """The CLI-reported session id when it is usable, else our generated one.
+
+    `data` is the subprocess's JSON: a number or object here raised a
+    ValidationError out of the runner (a billed answer lost), and a blank one
+    silently dropped resumability. The pre-generated uuid names the same run.
+    """
+    reported = data.get("session_id")
+    if isinstance(reported, str) and reported.strip():
+        return reported
+    return fallback
+
+
 def _build_error_result(
     agent_name: str,
     data: dict,
@@ -401,7 +446,7 @@ def _build_error_result(
         suffix = f" (exit code {exit_code})" if exit_code is not None else ""
         error_text = f"Agent '{agent_name}' reported an error with no details{suffix}"
 
-    session_id = data.get("session_id") or session_fallback
+    session_id = _session_id_from(data, session_fallback)
     budget_error = _is_budget_error(data)
     if budget_error:
         error_type = "budget"
@@ -509,7 +554,7 @@ def _build_success_result(
     result_text = str(raw_result) if raw_result else ""
     result_text, outcome = _split_outcome(result_text)
     parsed = _parse_structured_response(result_text) if response_format == "json" else None
-    session_id = data.get("session_id") or session_fallback
+    session_id = _session_id_from(data, session_fallback)
     hints = [
         _denial_hint(agent_name, denied) if denied else None,
         extra_hint,
@@ -593,7 +638,7 @@ _STDERR_CHUNK = 8192
 _STDERR_JOIN_SECONDS = 5  # wait for stderr we still need (no result arrived)
 _STDERR_GRACE_SECONDS = 0.2  # the agent already answered — stderr is unused
 
-_STREAM_KILLED_AFTER_RESULT = (
+_KILLED_AFTER_RESULT = (
     "The agent produced its final result but the process had not exited by the "
     "timeout and was killed. The result is complete — only cleanup was cut short."
 )
@@ -617,6 +662,29 @@ def _drain_stream(stream: object, into: list[str]) -> None:
         logger.debug("stderr drain ended early")
 
 
+# dispatch_stream reads stdout through a queue so it can stop waiting for EOF.
+_STREAM_EOF = object()
+_STREAM_POLL_SECONDS = 0.1
+# After a kill, how long a pipe held by an out-of-group descendant may keep us.
+_STREAM_ORPHAN_GRACE_SECONDS = 1.0
+
+
+def _pump_lines(stream: object, into: queue.Queue, abandoned: threading.Event) -> None:
+    """Forward *stream*'s lines into *into*, then _STREAM_EOF (always, even on error).
+
+    Once *abandoned* is set nobody reads the queue any more, so lines a
+    detached writer keeps producing are dropped instead of piling up.
+    """
+    try:
+        for line in stream:  # type: ignore[attr-defined]
+            if not abandoned.is_set():
+                into.put(line)
+    except (OSError, ValueError):  # pipe closed under us (kill / orphan cleanup)
+        logger.debug("stdout reader ended early")
+    finally:
+        into.put(_STREAM_EOF)
+
+
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Kill the dispatched process *and everything it spawned*.
 
@@ -627,11 +695,25 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
     matter what the timer does. The child is spawned with ``start_new_session``,
     so it leads its own process group and its pid *is* the group id.
     """
+    # Mark first: dispatch_stream reads this to tell "we killed it" (timer or
+    # dispatch_cancel) from a leader that merely exited, without reaping it.
+    try:
+        proc._dispatch_killed = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):  # pragma: no cover - exotic stand-ins
+        pass
     pid = getattr(proc, "pid", None)
     killpg = getattr(os, "killpg", None)
     # pid must be a real, positive id: killpg(0) would signal *our own* process
-    # group and take the dispatcher down with the agent.
-    if killpg is not None and isinstance(pid, int) and pid > 0:
+    # group and take the dispatcher down with the agent. And the leader must
+    # not have been reaped yet: once returncode is set its PID is free for
+    # reuse, possibly by an unrelated group leader. Read the attribute — poll()
+    # would itself reap. Callers therefore reap only after this decision.
+    if (
+        killpg is not None
+        and isinstance(pid, int)
+        and pid > 0
+        and getattr(proc, "returncode", None) is None
+    ):
         try:
             killpg(pid, signal.SIGKILL)
             return
@@ -645,6 +727,78 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         logger.debug("kill failed: %s", e)
 
 
+def _was_killed(proc: object) -> bool:
+    """True once _kill_process_tree has been called on *proc*."""
+    return bool(getattr(proc, "_dispatch_killed", False))
+
+
+def _wait_leader_exit(proc: subprocess.Popen, timeout: float | None) -> bool:
+    """Wait up to *timeout* seconds (None = forever) for the leader to exit.
+
+    Does NOT reap it where the platform allows: a reaped leader's PID can be
+    recycled into an unrelated process-group leader, so every killpg after
+    that point is unsafe (see _kill_process_tree). ``waitid(WNOWAIT)`` on
+    Linux, a kqueue NOTE_EXIT on macOS/BSD (which has no waitid). Elsewhere —
+    Windows, where there is no killpg to protect — or for stand-ins without a
+    pid, fall back to the reaping wait/poll.
+    """
+    if getattr(proc, "returncode", None) is not None:
+        return True
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        waitid = getattr(os, "waitid", None)
+        if waitid is not None and hasattr(os, "WNOWAIT"):
+            deadline = None if timeout is None else time.monotonic() + timeout
+            delay = 0.005
+            while True:
+                try:
+                    if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                        return True
+                except ChildProcessError:  # reaped by someone else — certainly gone
+                    return True
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    delay = min(delay, remaining)
+                time.sleep(delay)
+                delay = min(delay * 2, 0.05)
+        kqueue = getattr(select, "kqueue", None)
+        try:
+            kq = kqueue() if kqueue is not None else None
+        except OSError as e:  # out of descriptors — the reaping fallback still works
+            logger.debug("kqueue unavailable: %s", e)
+            kq = None
+        if kq is not None:
+            try:
+                event = select.kevent(
+                    pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                # An exited-but-unreaped leader comes back at once as an
+                # EV_ERROR/ESRCH event rather than NOTE_EXIT — either way a
+                # returned event means "gone".
+                return bool(kq.control([event], 1, timeout))
+            except ProcessLookupError:
+                return True
+            except OSError as e:  # pragma: no cover - fall back to the reaping wait
+                logger.debug("kevent on %s failed: %s", pid, e)
+            finally:
+                kq.close()
+    if timeout is None:
+        proc.wait()
+        return True
+    if timeout <= 0:
+        return proc.poll() is not None
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def _close_quiet(stream: object) -> None:
     """Close a subprocess pipe if it has a close(); ignore anything it raises."""
     close = getattr(stream, "close", None)
@@ -654,6 +808,117 @@ def _close_quiet(stream: object) -> None:
         close()
     except (OSError, ValueError):  # pragma: no cover - best effort
         logger.debug("Failed to close subprocess stream")
+
+
+def _run_captured(
+    cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    """Capture both pipes with a deadline covering the child and its descendants.
+
+    Unlike subprocess.run, retain the process handle until the whole group has
+    been killed on timeout. Readers own their pipes: a detached descendant may
+    keep one open even after killpg, so cleanup joins are bounded and the caller
+    never closes a pipe while its reader is alive. Binary read1 captures output
+    immediately, including a flushed JSON result without a trailing newline.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    stdout: list[bytes] = []
+    stderr: list[bytes] = []
+    readers: list[threading.Thread] = []
+    collecting = threading.Event()
+    collecting.set()
+    timed_out = False
+    finished = False
+
+    def capture(pipe, chunks: list[bytes], limit: int | None) -> None:
+        kept = 0
+        try:
+            while chunk := pipe.read1(_STDERR_CHUNK):
+                if not collecting.is_set():
+                    continue
+                if limit is None:
+                    chunks.append(chunk)
+                elif kept < limit:
+                    chunks.append(chunk[:limit - kept])
+                    kept += len(chunk)
+        except (OSError, ValueError):
+            logger.debug("Captured pipe drain ended early")
+        finally:
+            _close_quiet(pipe)
+
+    try:
+        for pipe, chunks, limit in (
+            (proc.stdout, stdout, None), (proc.stderr, stderr, _MAX_STDERR_CAPTURE),
+        ):
+            reader = threading.Thread(
+                target=capture, args=(pipe, chunks, limit), daemon=True,
+                name="dispatch-capture",
+            )
+            reader.start()
+            readers.append(reader)
+        # Completion is stdout EOF + leader exit — NOT stderr EOF. A descendant
+        # that inherited only fd 2 (a stdio MCP server started by claude, say)
+        # keeps stderr open after claude exits cleanly; waiting for it burned
+        # the whole timeout and then reported a finished run as a timeout (or
+        # turned a real stderr-only CLI error into error_type="timeout").
+        stdout_reader, stderr_reader = readers
+        stdout_reader.join(timeout=max(0, deadline - time.monotonic()))
+        if stdout_reader.is_alive():
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        # Wait for the leader WITHOUT reaping it: an unreaped leader keeps its
+        # PID — and so the process-group id — reserved, which is what makes the
+        # killpg below (and in the timeout path) safe against PID reuse.
+        if not _wait_leader_exit(proc, max(0, deadline - time.monotonic())):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        # Whatever the leader wrote to stderr is already in the pipe; this join
+        # only decides how long descendants may keep it open. Barely at all once
+        # stdout carried an answer; up to _STDERR_JOIN_SECONDS when stderr is
+        # the only explanation we will get.
+        remaining = max(0, deadline - time.monotonic())
+        stderr_reader.join(
+            timeout=_STDERR_GRACE_SECONDS if stdout else min(_STDERR_JOIN_SECONDS, remaining)
+        )
+        if stderr_reader.is_alive():
+            # A holder inside the group dies here; one that detached cannot be
+            # reached, so the second join is bounded too and the pipe is left
+            # to its daemon reader (closing it would block on the reader's lock).
+            _kill_process_tree(proc)
+            stderr_reader.join(timeout=_STDERR_GRACE_SECONDS)
+        proc.wait()  # the leader has exited — this only reaps it
+        finished = True
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        if not finished:
+            _kill_process_tree(proc)
+            # Kill is asynchronous. Bound reaping and both reader joins by ONE
+            # cleanup deadline, even if a descendant escaped the process group.
+            cleanup_deadline = time.monotonic() + 1.0
+            try:
+                proc.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                logger.warning("Dispatched process did not exit after kill")
+            for reader in readers:
+                reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        # Pipes without a started reader (e.g. thread creation failed) still
+        # belong to this thread and can safely be closed here.
+        for pipe in (proc.stdout, proc.stderr)[len(readers):]:
+            _close_quiet(pipe)
+        collecting.clear()
+
+    out = b"".join(stdout).decode("utf-8", errors="replace")
+    err = b"".join(stderr).decode("utf-8", errors="replace")
+    # A detached writer may keep its reader alive. Retain neither this result
+    # nor future output in that daemon after the dispatch has returned.
+    stdout.clear()
+    stderr.clear()
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _timeout_error(agent_name: str, timeout: int, session_uuid: str | None) -> str:
@@ -927,32 +1192,37 @@ def dispatch(
     logger.info("Dispatching to %s (timeout=%ds)", agent_name, timeout)
     logger.debug("Task: %s", task[:200])
 
+    cleanup_timed_out = False
     for attempt in (0, 1):
         try:
-            proc = subprocess.run(
+            proc = _run_captured(
                 cmd,
                 cwd=str(agent.directory),
-                capture_output=True,
-                text=True,
-                # Decoding must be total. `text=True` alone decodes strictly, so
-                # a single undecodable byte on stdout/stderr raises
-                # UnicodeDecodeError — a ValueError, caught by nothing here — and
-                # an already-billed dispatch escapes as a raw exception instead
-                # of a DispatchResult. Same rule as _read_preview.
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout,
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            return DispatchResult(
-                agent=agent_name,
-                success=False,
-                result="",
-                session_id=session_uuid,
-                error=_timeout_error(agent_name, timeout, session_uuid),
-                error_type="timeout",
-            )
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            try:
+                completed = _loads(output)
+            except (ValueError, TypeError):
+                completed = None
+            # Partial text or unrelated JSON does not prove completion. Only a
+            # full CLI result event outranks the deadline, as in streaming.
+            if not isinstance(completed, dict) or completed.get("type") != "result":
+                return DispatchResult(
+                    agent=agent_name,
+                    success=False,
+                    result="",
+                    session_id=session_uuid,
+                    error=_timeout_error(agent_name, timeout, session_uuid),
+                    error_type="timeout",
+                )
+            cleanup_timed_out = True
+            proc = subprocess.CompletedProcess(cmd, -signal.SIGKILL, output, "")
+            break
         # Spawn failures, classified exactly as dispatch_stream does — the
         # is_dir() check above does not prove the child can chdir into it, and
         # the directory can vanish between the check and the spawn.
@@ -1008,7 +1278,7 @@ def dispatch(
 
     # Parse JSON output
     try:
-        data = json.loads(proc.stdout)
+        data = _loads(proc.stdout)
         if not isinstance(data, dict):
             # Valid JSON but not the CLI's result object (a bare string/array).
             # Every field access below assumes a mapping — fall through to the
@@ -1072,6 +1342,7 @@ def dispatch(
         settings,
         session_fallback=session_uuid,
         response_format=response_format,
+        extra_hint=_KILLED_AFTER_RESULT if cleanup_timed_out else None,
     )
 
 
@@ -1216,7 +1487,16 @@ def dispatch_stream(
         )
 
     if on_proc is not None:
-        on_proc(proc)
+        try:
+            on_proc(proc)
+        except BaseException:
+            # Registration can fail (for example while reading job storage).
+            # No reader or timer exists yet to clean up the spawned process.
+            _kill_process_tree(proc)
+            proc.wait()
+            _close_quiet(proc.stdout)
+            _close_quiet(proc.stderr)
+            raise
 
     # Drain stderr concurrently — see _MAX_STDERR_CAPTURE for why this cannot
     # wait until the stdout loop is done.
@@ -1227,7 +1507,21 @@ def dispatch_stream(
         daemon=True,
         name="dispatch-stderr",
     )
-    stderr_reader.start()
+
+    # Read stdout on its own thread too, so the loop below can stop waiting for
+    # EOF. killpg reaches only the process group: a descendant that detached
+    # (setsid / start_new_session) and inherited fd 1 keeps the pipe open
+    # after the timer or dispatch_cancel killed everything else, and a bare
+    # `for line in proc.stdout` would then block forever — holding the
+    # caller's concurrency slot. _run_captured bounds the same case.
+    lines: queue.Queue = queue.Queue()
+    abandoned = threading.Event()
+    stdout_reader = threading.Thread(
+        target=_pump_lines,
+        args=(proc.stdout, lines, abandoned),
+        daemon=True,
+        name="dispatch-stdout",
+    )
 
     # Kill the process if it exceeds the timeout
     timed_out = threading.Event()
@@ -1237,54 +1531,138 @@ def dispatch_stream(
         _kill_process_tree(proc)
 
     timer = threading.Timer(timeout, _kill)
-    timer.start()
+    try:
+        stderr_reader.start()
+        stdout_reader.start()
+        timer.start()
+    except BaseException:
+        # "can't start new thread" leaves a live claude with no timer and no
+        # reader: it would run (and bill) unsupervised after we raise. The
+        # leader is unreaped here, so the group kill is still PID-safe.
+        abandoned.set()
+        timer.cancel()
+        _kill_process_tree(proc)
+        try:
+            proc.wait(timeout=_STDERR_JOIN_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("Dispatched process did not exit after kill")
+        for reader, pipe in ((stderr_reader, proc.stderr), (stdout_reader, proc.stdout)):
+            if reader.ident is not None:
+                reader.join(timeout=_STDERR_GRACE_SECONDS)
+            if not reader.is_alive():
+                _close_quiet(pipe)
+        raise
+
+    def _emit_progress(text: str) -> None:
+        # Progress is best-effort. An async job's callback writes the job file,
+        # so ENOSPC/EACCES there used to escape this loop, kill the process tree
+        # mid-task and drop the paid result together with its resumable session.
+        try:
+            on_progress(text)
+        except Exception:  # noqa: BLE001 - any callback failure is non-fatal here
+            logger.warning("on_progress callback failed; continuing", exc_info=True)
 
     result_data: dict | None = None
+    stdout_eof = False
+    killed_gone_at: float | None = None
     try:
-        for line in proc.stdout:  # type: ignore[union-attr]
+        while True:
+            try:
+                line = lines.get(timeout=_STREAM_POLL_SECONDS)
+            except queue.Empty:
+                line = None
+            if line is _STREAM_EOF:
+                stdout_eof = True
+                break
+            # Only after a kill (timer or dispatch_cancel) whose leader is gone
+            # may we stop short of EOF: whoever still holds stdout then is out
+            # of our reach. A leader that exited on its own keeps us waiting —
+            # an in-group grandchild may still hold the pipe, and the timer's
+            # killpg is what ends it.
+            if (timed_out.is_set() or _was_killed(proc)) and _wait_leader_exit(proc, 0):
+                now = time.monotonic()
+                if killed_gone_at is None:
+                    killed_gone_at = now
+                elif now - killed_gone_at >= _STREAM_ORPHAN_GRACE_SECONDS:
+                    logger.warning(
+                        "stdout of %s still open after its process group was killed "
+                        "(a detached descendant likely inherited it); abandoning the pipe",
+                        agent_name,
+                    )
+                    break
+            if line is None:
+                continue
             line = line.strip()
             if not line:
                 continue
             try:
-                data = json.loads(line)
+                data = _loads(line)
             except json.JSONDecodeError:
                 logger.debug("Non-JSON line in stream: %s", line[:200])
+                continue
+            if not isinstance(data, dict):
                 continue
 
             msg_type = data.get("type")
             if msg_type == "result":
                 result_data = data
             elif msg_type == "assistant" and on_progress:
-                content = data.get("message", {}).get("content", [])
+                message = data.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content", [])
                 if isinstance(content, list):
                     for block in content:
-                        if block.get("type") == "text" and block.get("text"):
-                            on_progress(block["text"][:500])
+                        if not isinstance(block, dict):
+                            continue
+                        if (
+                            block.get("type") == "text"
+                            and isinstance(block.get("text"), str)
+                            and block["text"]
+                        ):
+                            _emit_progress(block["text"][:500])
                         elif block.get("type") == "tool_use":
-                            on_progress(f"Using tool: {block.get('name', '?')}")
+                            _emit_progress(f"Using tool: {block.get('name', '?')}")
 
-        proc.wait()
+        # Wait for the leader to exit, with the timer still armed (a leader that
+        # closed stdout but lingers is killed by it) and WITHOUT reaping: the
+        # tree-kill decision below needs the group id still reserved.
+        _wait_leader_exit(proc, None)
     finally:
         timer.cancel()
-        # Ensure the process is not left orphaned on any exit path
-        if proc.poll() is None:
+        # A timer already mid-_kill must finish before we reap below, or its
+        # killpg could race the PID being freed.
+        join_timer = getattr(timer, "join", None)
+        if join_timer is not None:
+            join_timer(timeout=1)
+        abandoned.set()
+        # Ensure nothing is left orphaned on any exit path: a live leader, or
+        # anyone in its group still holding stdout. Decide BEFORE reaping.
+        if not stdout_eof or not _wait_leader_exit(proc, 0):
             _kill_process_tree(proc)
-            proc.wait()
         # Usually the child is gone and the drain thread hits EOF at once. Not
         # always: EOF needs *every* holder of the write end to close it, and a
         # stdio MCP server (or any grandchild) inherits fd 2 and can outlive
-        # `claude`. Only the no-result path below reads this text, so wait for
-        # it just long enough to be useful and never longer.
-        stderr_reader.join(timeout=_STDERR_GRACE_SECONDS if result_data else _STDERR_JOIN_SECONDS)
-        stderr = "".join(stderr_chunks)
-        _close_quiet(proc.stdout)
+        # `claude`. Only the no-result, not-timed-out path below reads this
+        # text, so wait for it just long enough to be useful and never longer.
+        need_stderr = result_data is None and not timed_out.is_set() and stdout_eof
+        stderr_reader.join(timeout=_STDERR_JOIN_SECONDS if need_stderr else _STDERR_GRACE_SECONDS)
         if stderr_reader.is_alive():
-            # NEVER close a pipe another thread is still reading: close() waits
-            # on the BufferedReader lock that the blocked read() holds, and that
-            # wait is untimed — it would hang dispatch_stream forever (and with
-            # it the caller's semaphore slot), which is exactly what the bounded
-            # join above exists to prevent. The daemon thread and Popen's
-            # finalizer release the fd once the last writer goes away.
+            # Same as _run_captured: an in-group holder is an orphan now — the
+            # leader is still unreaped, so the group id is still ours to kill.
+            _kill_process_tree(proc)
+            stderr_reader.join(timeout=_STDERR_GRACE_SECONDS)
+        proc.wait()
+        stderr = "".join(stderr_chunks)
+        # NEVER close a pipe another thread is still reading: close() waits on
+        # the BufferedReader lock that the blocked read() holds, and that wait
+        # is untimed — it would hang dispatch_stream forever (and with it the
+        # caller's semaphore slot), which is exactly what the bounded joins
+        # exist to prevent. The daemon threads and Popen's finalizer release
+        # the fds once the last writer goes away.
+        if not stdout_reader.is_alive():
+            _close_quiet(proc.stdout)
+        if stderr_reader.is_alive():
             logger.log(
                 logging.DEBUG if result_data else logging.WARNING,
                 "stderr of %s still open (a grandchild likely inherited it); "
@@ -1317,7 +1695,7 @@ def dispatch_stream(
             settings,
             session_fallback=new_session,
             response_format=response_format,
-            extra_hint=_STREAM_KILLED_AFTER_RESULT if timed_out.is_set() else None,
+            extra_hint=_KILLED_AFTER_RESULT if timed_out.is_set() else None,
         )
 
     if timed_out.is_set():
