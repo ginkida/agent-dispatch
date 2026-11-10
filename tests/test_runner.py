@@ -27,6 +27,7 @@ from agent_dispatch.runner import (
     _extract_denied_tools,
     _permission_hint,
     _split_outcome,
+    _token_usage,
     dispatch,
     dispatch_stream,
 )
@@ -2614,12 +2615,95 @@ def _ok_stdout(**extra) -> str:
     return json.dumps(payload)
 
 
+class TestTokenUsage:
+    def test_real_payload(self):
+        assert _token_usage({
+            "total_cost_usd": 0.5664,
+            "num_turns": 1,
+            "usage": {
+                "input_tokens": 2, "cache_creation_input_tokens": 35247,
+                "cache_read_input_tokens": 11382, "output_tokens": 4, "other": 999,
+            },
+            "modelUsage": {"claude-fable-5-2": {"inputTokens": 2, "costUSD": 0.5664}},
+        }) == {"in": 2, "out": 4, "cr": 11382, "cw": 35247, "model": "claude-fable-5-2"}
+
+    @pytest.mark.parametrize("value", [None, [], "junk", True, 1e400])
+    def test_non_dict_usage_blocks(self, value):
+        assert _token_usage({"usage": value, "modelUsage": value}) is None
+        assert _token_usage(value) is None
+
+    @pytest.mark.parametrize("value", ["2", "abc", -1, -0.5, None, True, False, 1e400,
+                                      float("nan"), 10**400, 10**12, [], {}])
+    def test_invalid_counts_are_omitted(self, value):
+        assert _token_usage({"usage": {
+            "input_tokens": value, "output_tokens": value,
+            "cache_read_input_tokens": value, "cache_creation_input_tokens": value,
+        }}) is None
+
+    def test_valid_counts_are_bounded_ints_and_missing_fields_stay_absent(self):
+        assert _token_usage({"usage": {"input_tokens": 0, "output_tokens": 10**12 - 1}}) == {
+            "in": 0, "out": 999999999999,
+        }
+        assert _token_usage({"usage": {"input_tokens": 2.9}}) == {"in": 2}
+        assert _token_usage({}) is None
+
+    @pytest.mark.parametrize(("models", "expected"), [
+        ({}, None),
+        ({"first": {}, "second": {}}, "first"),
+        ({"first": {"costUSD": 1}, "second": {"costUSD": 1}}, "first"),
+        ({"first": {"costUSD": float("nan")}, "second": {"costUSD": 2}}, "second"),
+        ({"first": None, "second": {"costUSD": float("nan")}}, "first"),
+        ({"first": {"costUSD": 0.1}, "second": {"costUSD": 0.5}}, "second"),
+        ({"first": {"costUSD": True}, "second": {"costUSD": 0}}, "second"),
+        ({"first": {"costUSD": "9"}, "second": {"costUSD": 0}}, "second"),
+        ({"first": {"costUSD": 10**400}, "second": {"costUSD": 0}}, "second"),
+        ({"first": {"costUSD": float("inf")}, "second": {"costUSD": 0}}, "second"),
+        ({"first": {"costUSD": -2}, "second": {"costUSD": -1}}, "second"),
+        ({"x" * 100: []}, "x" * 60),
+        ({1: {"costUSD": 10}, "valid": {}}, "valid"),
+    ])
+    def test_model_selection(self, models, expected):
+        assert _token_usage({"modelUsage": models}) == (
+            {"model": expected} if expected is not None else None
+        )
+
+
 class TestUsageJournaling:
     """Every dispatch lands in the usage journal — that is what makes spend visible."""
 
     def setup_method(self):
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("error", [None, "cli_error", "budget"])
+    def test_tokens_reach_the_journal_on_both_paths(self, stream, error):
+        payload = {
+            "type": "result", "is_error": error is not None,
+            "result": "paid answer" if error is None else "failed",
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                      "cache_read_input_tokens": 11382, "cache_creation_input_tokens": 35247},
+            "modelUsage": {"cheap": {"costUSD": 0.01}, "main": {"costUSD": 0.5}},
+        }
+        if error == "budget":
+            payload.pop("result")
+            payload["subtype"] = "error_max_budget_usd"
+        with patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude"):
+            if stream:
+                with patch("agent_dispatch.runner.subprocess.Popen",
+                           return_value=_FakePopen([json.dumps(payload)])):
+                    result = dispatch_stream("infra", "go", self.agent, self.settings)
+            else:
+                with patch("agent_dispatch.runner._run_captured", return_value=
+                           subprocess.CompletedProcess([], 0, json.dumps(payload), "")):
+                    result = dispatch("infra", "go", self.agent, self.settings)
+        (entry,) = usage.load()
+        assert {key: entry[key] for key in ("in", "out", "cr", "cw", "model")} == {
+            "in": 2, "out": 4, "cr": 11382, "cw": 35247, "model": "main",
+        }
+        assert result.success is (error is None)
+        assert result.error_type == error
+        assert "token_usage" not in result.model_dump_json()
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner._run_captured")

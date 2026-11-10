@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -418,6 +419,42 @@ def _session_id_from(data: dict, fallback: str | None) -> str | None:
     return fallback
 
 
+def _token_usage(data: dict) -> dict | None:
+    """Extract bounded journal telemetry from the untrusted CLI result."""
+    if not isinstance(data, dict):
+        return None
+    tokens: dict = {}
+    counts = data.get("usage")
+    if isinstance(counts, dict):
+        for source, key in (
+            ("input_tokens", "in"), ("output_tokens", "out"),
+            ("cache_read_input_tokens", "cr"), ("cache_creation_input_tokens", "cw"),
+        ):
+            value = counts.get(source)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            number = usage.as_float(value, default=math.nan)
+            if 0 <= number < 10**12:
+                tokens[key] = int(number)
+    models = data.get("modelUsage")
+    if isinstance(models, dict):
+        best_cost = -math.inf
+        for name, details in models.items():
+            if not isinstance(name, str):
+                continue
+            cost = details.get("costUSD") if isinstance(details, dict) else None
+            number = (
+                usage.as_float(cost, default=-math.inf)
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool) else -math.inf
+            )
+            # Missing/nonfinite costs fall back to the first model; strict >
+            # preserves that order on ties, including when no cost is valid.
+            if "model" not in tokens or number > best_cost:
+                tokens["model"] = name[:60]
+                best_cost = number
+    return tokens or None
+
+
 def _build_error_result(
     agent_name: str,
     data: dict,
@@ -468,6 +505,7 @@ def _build_error_result(
             cost_usd=data.get("total_cost_usd"),
             duration_ms=data.get("duration_ms"),
             num_turns=data.get("num_turns"),
+            token_usage=_token_usage(data),
             error=error_text,
             error_type=error_type,
             denied_tools=denied,
@@ -514,6 +552,7 @@ def _journaled(fn: Callable) -> Callable:
                     outcome=result.outcome,
                     error_type=result.error_type,
                     caller=kwargs.get("caller"),
+                    tokens=result.token_usage,
                 )
             except Exception as e:  # noqa: BLE001 - see below
                 # `usage.record` already swallows everything, so this arm is
@@ -570,6 +609,7 @@ def _build_success_result(
             cost_usd=data.get("total_cost_usd"),
             duration_ms=data.get("duration_ms"),
             num_turns=data.get("num_turns"),
+            token_usage=_token_usage(data),
             parsed_result=parsed,
             denied_tools=denied,
             hint=hint,

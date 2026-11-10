@@ -64,6 +64,7 @@ _CALLER_MAX_CHARS = 60
 # the finite range, so the report is finite by construction.
 _MAX_PLAUSIBLE_MS = 1e9
 _MAX_PLAUSIBLE_COST_USD = 1e6
+_MAX_PLAUSIBLE_TOKENS = 10**12
 
 # Memo of the last profile computation, keyed by the journal's identity and
 # fingerprint (size + mtime). The file only changes when a dispatch finishes,
@@ -119,6 +120,7 @@ def record(
     error_type: str | None = None,
     cached: bool = False,
     caller: str | None = None,
+    tokens: dict | None = None,
     path: Path | None = None,
 ) -> None:
     """Append one dispatch record. Never raises, never blocks on a lock."""
@@ -144,6 +146,16 @@ def record(
             entry["cached"] = True
         if caller:
             entry["caller"] = str(caller)[:_CALLER_MAX_CHARS]
+        if isinstance(tokens, dict):
+            for key in ("in", "out", "cr", "cw"):
+                value = tokens.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                number = as_float(value, default=math.nan)
+                if 0 <= number < _MAX_PLAUSIBLE_TOKENS:
+                    entry[key] = int(number)
+            if isinstance(tokens.get("model"), str):
+                entry["model"] = tokens["model"][:60]
         line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         if len(line) > _MAX_LINE_BYTES:  # pragma: no cover - fields are capped above
             # Atomicity beats completeness: drop the optional text fields rather
@@ -260,6 +272,8 @@ def _stats(entries: list[dict]) -> dict:
     costs = values("cost", _MAX_PLAUSIBLE_COST_USD)
     outcomes: dict[str, int] = {}
     errors: dict[str, int] = {}
+    tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "records": 0}
+    models: dict[str, int] = {}
     ok = 0
     for e in live:
         if e.get("ok"):
@@ -268,6 +282,22 @@ def _stats(entries: list[dict]) -> dict:
             outcomes[e["outcome"]] = outcomes.get(e["outcome"], 0) + 1
         if isinstance(e.get("err"), str):
             errors[e["err"]] = errors.get(e["err"], 0) + 1
+        measured = False
+        for key, field in (
+            ("in", "input"), ("out", "output"), ("cr", "cache_read"), ("cw", "cache_write"),
+        ):
+            value = e.get(key)
+            if isinstance(value, bool):
+                continue
+            number = as_float(value, default=math.nan)
+            if 0 <= number < _MAX_PLAUSIBLE_TOKENS:
+                tokens[field] += int(number)
+                measured = True
+        if measured:
+            tokens["records"] += 1
+        if isinstance(e.get("model"), str):
+            name = e["model"][:60]
+            models[name] = models.get(name, 0) + 1
     summary: dict = {
         "dispatches": len(live),
         "cached_hits": len(entries) - len(live),
@@ -286,6 +316,13 @@ def _stats(entries: list[dict]) -> dict:
         summary["outcomes"] = dict(sorted(outcomes.items()))
     if errors:
         summary["errors"] = dict(sorted(errors.items()))
+    if tokens["records"]:
+        summary["tokens"] = tokens
+        total_input = tokens["input"] + tokens["cache_read"] + tokens["cache_write"]
+        if total_input:
+            summary["cache_read_share"] = round(tokens["cache_read"] / total_input, 3)
+    if models:
+        summary["models"] = models
     return summary
 
 

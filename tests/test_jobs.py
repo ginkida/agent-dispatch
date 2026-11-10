@@ -157,6 +157,19 @@ class TestDamagedJobRecords:
 
 
 class TestJobStoreLifecycle:
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_token_usage_is_not_persisted(self, store: JobStore, completed):
+        result = DispatchResult(
+            agent="infra", success=True, result="paid answer", token_usage={"in": 2, "model": "m"}
+        )
+        if completed:
+            job = store.create_completed("infra", "task", result)
+        else:
+            job = store.create("infra", "task")
+            store.finish(job.id, result)
+        assert "token_usage" not in (store.directory / f"{job.id}.json").read_text()
+        assert store.get(job.id).result.token_usage is None
+
     def test_mark_running_sets_timestamp(self, store: JobStore):
         job = store.create("infra", "task")
         before = time.time()
