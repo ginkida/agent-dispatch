@@ -284,8 +284,13 @@ def session_total(session_id: str | None, path: Path | None = None) -> float | N
             return None
         sid = session_id[:_SESSION_ID_MAX_CHARS]
         p = path or journal_path()
-        lines = _read_tail(p.with_name(p.name + ".1"), _TAIL_BYTES) + _read_tail(p, _TAIL_BYTES)
-        for line in reversed(lines):
+        # Live generation FIRST, then the rotated one. Read the other way round,
+        # a rotation landing between the two reads hides the newest records
+        # (they move into `.1` after it was read) and an obsolete total wins;
+        # in this order the worst case is seeing the same lines twice.
+        newest_first = list(reversed(_read_tail(p, _TAIL_BYTES)))
+        newest_first += reversed(_read_tail(p.with_name(p.name + ".1"), _TAIL_BYTES))
+        for line in newest_first:
             if sid not in line:  # cheap prefilter: parse only this session's lines
                 continue
             try:
@@ -294,15 +299,18 @@ def session_total(session_id: str | None, path: Path | None = None) -> float | N
                 continue
             if not isinstance(entry, dict) or entry.get("sid") != sid:
                 continue
-            for field in ("cum", "cost"):
-                value = entry.get(field)
-                if isinstance(value, bool) or value is None:
-                    continue
-                number = as_float(value, default=math.nan)
-                if 0 <= number < _MAX_PLAUSIBLE_COST_USD:
-                    return number
-            # A record of this session without a usable cost (a timeout): keep
-            # looking further back for the last figure the CLI did report.
+            # `cum` when the record has one — even a mangled one: its `cost` is
+            # then a resumed call's own share, never the session total.
+            value = entry["cum"] if "cum" in entry else entry.get("cost")
+            if isinstance(value, bool) or value is None:
+                continue
+            number = as_float(value, default=math.nan)
+            if 0 <= number < _MAX_PLAUSIBLE_COST_USD:
+                return number
+            # No usable figure on this record (a timeout, a mangled line): keep
+            # looking further back for the last total the CLI did report. The
+            # next call's cost then includes what the costless one spent — the
+            # sum stays right, the split between the two calls does not.
         return None
     except Exception as e:  # noqa: BLE001 - bookkeeping must never break a dispatch
         logger.debug("Could not read session total for %s: %s", session_id, e)

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent_dispatch import runner as runner_module
 from agent_dispatch import usage
 from agent_dispatch.models import AgentConfig, Settings
 from agent_dispatch.runner import (
@@ -2793,6 +2794,10 @@ class TestUsageJournaling:
         assert result.success
 
 
+# conftest replaces the probe per test; keep the real one (bound at import).
+_REAL_VERSION_PROBE = runner_module._cli_reports_session_totals
+
+
 class TestResumedSessionCost:
     """`total_cost_usd` is per SESSION on --resume; a call must cost only its own share.
 
@@ -2864,11 +2869,56 @@ class TestResumedSessionCost:
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner._run_captured")
-    def test_a_per_call_total_from_an_old_cli_is_left_alone(self, mock_run, _w):
+    def test_a_total_below_the_baseline_is_left_alone(self, mock_run, _w):
         self._run(mock_run, 0.40)
-        # Smaller than the session's known total: this CLI reports per call.
         result = self._run(mock_run, 0.10, session_id="s-live")
         assert result.cost_usd == 0.10
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_an_old_cli_reporting_per_call_is_never_adjusted(self, mock_run, _w, monkeypatch):
+        # $0.10 then $0.20 per call looks exactly like a cumulative pair, so
+        # the amounts cannot decide — the CLI version does.
+        monkeypatch.setattr(runner_module, "_cli_reports_session_totals", lambda _p: False)
+        self._run(mock_run, 0.10)
+        result = self._run(mock_run, 0.20, session_id="s-live")
+        assert result.cost_usd == 0.20
+        assert usage.summarize(usage.load())["total"]["cost_usd"] == pytest.approx(0.30)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_an_unchanged_total_costs_nothing_despite_journal_rounding(self, mock_run, _w):
+        self._run(mock_run, 0.0798)
+        self._run(mock_run, 0.0953468, session_id="s-live")  # journaled as 0.095347
+        failed = self._run(mock_run, 0.0953468, session_id="s-live", is_error=True)
+        assert failed.cost_usd == 0.0
+        assert failed.budget_exceeded is None
+        total = usage.summarize(usage.load())["total"]["cost_usd"]
+        assert total == pytest.approx(0.0953, abs=1e-4)
+
+    @pytest.mark.parametrize(
+        ("stdout", "expected"),
+        [
+            ("2.1.322 (Claude Code)\n", True),
+            ("2.1.277 (Claude Code)\n", True),
+            ("2.1.276 (Claude Code)\n", False),
+            ("1.9.999\n", False),
+            ("3.0.0\n", True),
+            ("no version here\n", False),
+        ],
+    )
+    def test_version_probe(self, stdout, expected):
+        runner_module._session_totals_memo.clear()
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        with patch("agent_dispatch.runner.subprocess.run", return_value=done) as run:
+            assert _REAL_VERSION_PROBE("/nonexistent/claude") is expected
+            assert _REAL_VERSION_PROBE("/nonexistent/claude") is expected
+        assert run.call_count == 1  # memoized per binary
+
+    def test_version_probe_failure_means_do_not_adjust(self):
+        runner_module._session_totals_memo.clear()
+        with patch("agent_dispatch.runner.subprocess.run", side_effect=OSError("gone")):
+            assert _REAL_VERSION_PROBE("/nonexistent/claude") is False
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner._run_captured")
@@ -2910,6 +2960,21 @@ class TestResumedSessionCost:
         )
         # The mangled record has no usable figure; the search continues back.
         assert usage.session_total("s-live", path) == 0.4
+        # A resumed record whose `cum` alone is mangled: its `cost` is that
+        # call's share, not the session total, so it must not become the baseline.
+        with path.open("a") as fh:
+            fh.write('{"t":4,"agent":"a","ok":true,"cost":0.1,"cum":"abc","sid":"s-live"}\n')
+        assert usage.session_total("s-live", path) == 0.4
+
+    def test_session_total_prefers_the_live_generation(self, tmp_path):
+        path = tmp_path / "j.jsonl"
+        path.with_name("j.jsonl.1").write_text(
+            '{"t":1,"agent":"a","ok":true,"cost":0.1,"sid":"s-live"}\n'
+        )
+        path.write_text('{"t":2,"agent":"a","ok":true,"cost":0.3,"cum":0.4,"sid":"s-live"}\n')
+        assert usage.session_total("s-live", path) == 0.4
+        path.unlink()  # only the rotated generation left
+        assert usage.session_total("s-live", path) == 0.1
         assert usage.session_total("absent", path) is None
         assert usage.session_total(None, path) is None
         assert usage.session_total("s-live", tmp_path / "missing.jsonl") is None

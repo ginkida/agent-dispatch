@@ -92,6 +92,13 @@ def _isolated_local_state(tmp_path: Path, monkeypatch):
     # The profile memo is a module-level global keyed by the journal's
     # fingerprint; clearing it keeps one test's timings out of the next.
     usage._profile_memo = None
+    # `dispatch(..., session_id=...)` asks the CLI for its version to decide
+    # whether a resumed total is cumulative; answer for it here, or every resume
+    # test would try to run the (mocked-path) binary.
+    from agent_dispatch import runner
+
+    runner._session_totals_memo.clear()
+    monkeypatch.setattr(runner, "_cli_reports_session_totals", lambda _path: True)
     yield
     usage._profile_memo = None
     if servers._registration_fd is not None:  # a test that registered this process

@@ -455,6 +455,52 @@ def _token_usage(data: dict) -> dict | None:
     return tokens or None
 
 
+_COST_EPSILON = 1e-6
+
+# First claude release whose --resume reports total_cost_usd for the whole
+# session rather than for the call.
+_SESSION_TOTALS_SINCE = (2, 1, 277)
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_session_totals_memo: dict[tuple, bool] = {}
+
+
+def _cli_reports_session_totals(claude_path: str) -> bool:
+    """Whether this claude reports a resumed session's cumulative cost.
+
+    Amounts cannot tell the two conventions apart — an older CLI's per-call
+    $0.10 then $0.20 looks exactly like a cumulative pair — so the version
+    decides. Probed once per binary (keyed on its mtime, so an upgrade under a
+    long-lived server is noticed); any failure means "unknown", which keeps the
+    reported figure untouched, i.e. the behaviour before this existed.
+    """
+    try:
+        key = (claude_path, os.stat(claude_path).st_mtime_ns)
+    except OSError:
+        key = (claude_path, -1)
+    known = _session_totals_memo.get(key)
+    if known is not None:
+        return known
+    answer = False
+    try:
+        proc = subprocess.run(
+            [claude_path, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        match = _VERSION_RE.search(proc.stdout or "")
+        if match:
+            answer = tuple(int(part) for part in match.groups()) >= _SESSION_TOTALS_SINCE
+    except (OSError, subprocess.SubprocessError, ValueError):
+        answer = False
+    _session_totals_memo.clear()  # one binary at a time; never grows
+    _session_totals_memo[key] = answer
+    return answer
+
+
 def _call_cost(data: dict, prior_total: float | None) -> tuple[object, dict | None]:
     """``(cost of this call, journal telemetry)`` from a CLI result payload.
 
@@ -463,8 +509,9 @@ def _call_cost(data: dict, prior_total: float | None) -> tuple[object, dict | No
     difference, and the reported cumulative figure rides along as ``cum`` in the
     journal telemetry for the next resume to subtract. The subtraction happens
     only when the payload is a plain finite number no smaller than the prior
-    total: an older CLI reports per-call totals, and a smaller figure is the
-    evidence of that — it is then left as reported. Anything else (missing,
+    total (the caller passes a prior total only for a CLI new enough to report
+    session totals — see `_cli_reports_session_totals`); a smaller figure means
+    the baseline is not this session's, and is left as reported. Anything else (missing,
     malformed) passes through untouched, exactly as before; DispatchResult
     validation and the journal's own coercion deal with it.
     """
@@ -473,11 +520,15 @@ def _call_cost(data: dict, prior_total: float | None) -> tuple[object, dict | No
     if prior_total is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return raw, telemetry
     total = usage.as_float(raw, default=math.nan)
-    if not (math.isfinite(total) and 0 <= prior_total <= total):
+    # The journal keeps the prior total rounded to 6 places, so an unchanged
+    # session total (a resume that failed before spending anything) can read as
+    # a hair *below* it; without the tolerance that call was charged the whole
+    # session again.
+    if not (math.isfinite(total) and 0 <= prior_total <= total + _COST_EPSILON):
         return raw, telemetry
     telemetry = dict(telemetry or {})
     telemetry["cum"] = total
-    return round(total - prior_total, 6), telemetry
+    return max(0.0, round(total - prior_total, 6)), telemetry
 
 
 def _build_error_result(
@@ -1266,7 +1317,9 @@ def dispatch(
     # Read before the spawn: afterwards another process may have resumed it too.
     prior_total = (
         usage.session_total(session_id)
-        if session_id and getattr(settings, "usage_log", True)
+        if session_id
+        and getattr(settings, "usage_log", True)
+        and _cli_reports_session_totals(claude_path)
         else None
     )
 
