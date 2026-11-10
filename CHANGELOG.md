@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-10
+
+The cost round, driven by measurements on the live CLI rather than by reading
+code: what a dispatch pays for before the agent does anything, and what the
+journal was getting wrong about resumed sessions.
+
 ### Added
 - Per-agent startup-context trims, both opt-in: `agent-dispatch update <name>
   --no-skills` (sends `--disable-slash-commands`) and `--strict-mcp` (sends
@@ -932,7 +938,8 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/ginkida/agent-dispatch/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/ginkida/agent-dispatch/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/ginkida/agent-dispatch/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/ginkida/agent-dispatch/compare/v0.14.0...v0.15.0
