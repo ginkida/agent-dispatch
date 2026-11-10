@@ -57,6 +57,7 @@ _MAX_JOURNAL_BYTES = 2_000_000
 _PROFILE_TAIL_BYTES = 128 * 1024
 
 _CALLER_MAX_CHARS = 60
+_SESSION_ID_MAX_CHARS = 64
 
 # Plausibility ceilings for journal numbers. A dispatch is capped at 7200 s by
 # `timeout_seconds`, and no single run costs a million dollars; these are far
@@ -121,9 +122,15 @@ def record(
     cached: bool = False,
     caller: str | None = None,
     tokens: dict | None = None,
+    session_id: str | None = None,
     path: Path | None = None,
 ) -> None:
-    """Append one dispatch record. Never raises, never blocks on a lock."""
+    """Append one dispatch record. Never raises, never blocks on a lock.
+
+    ``session_id`` (``sid``) and, for a resumed session, the CLI's cumulative
+    total (``cum``, carried in *tokens*) are what `session_total` reads back to
+    turn the next resume's cumulative figure into a per-call cost.
+    """
     try:
         entry: dict[str, object] = {
             "t": int(time.time()),
@@ -156,6 +163,13 @@ def record(
                     entry[key] = int(number)
             if isinstance(tokens.get("model"), str):
                 entry["model"] = tokens["model"][:60]
+            cum = tokens.get("cum")
+            if isinstance(cum, (int, float)) and not isinstance(cum, bool):
+                cum = as_float(cum, default=math.nan)
+                if 0 <= cum < _MAX_PLAUSIBLE_COST_USD:
+                    entry["cum"] = round(cum, 6)
+        if session_id and isinstance(session_id, str):
+            entry["sid"] = session_id[:_SESSION_ID_MAX_CHARS]
         line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         if len(line) > _MAX_LINE_BYTES:  # pragma: no cover - fields are capped above
             # Atomicity beats completeness: drop the optional text fields rather
@@ -247,6 +261,52 @@ def load(
             continue
         out.append(entry)
     return out
+
+
+def session_total(session_id: str | None, path: Path | None = None) -> float | None:
+    """What the journal last saw session *session_id* cost in total, or None.
+
+    Since claude 2.1.277 a resumed session reports ``total_cost_usd`` for the
+    whole session, not for the call (verified live on 2.1.322: $0.0798, then
+    $0.0953 after a resume that cost $0.0155). Journaling that figure as the
+    call's cost counted the first turn again on every resume. The runner asks
+    here for the previous total and records the difference.
+
+    The newest record wins. Its ``cum`` is the cumulative total as the CLI
+    reported it; a record without one was the session's first call, where the
+    call's cost *is* the total. None when the session is not in the retained
+    tail (first seen before this version, rotated away, journal off) — the
+    caller then keeps the reported figure, which is the old behaviour. Never
+    raises.
+    """
+    try:
+        if not session_id or not isinstance(session_id, str):
+            return None
+        sid = session_id[:_SESSION_ID_MAX_CHARS]
+        p = path or journal_path()
+        lines = _read_tail(p.with_name(p.name + ".1"), _TAIL_BYTES) + _read_tail(p, _TAIL_BYTES)
+        for line in reversed(lines):
+            if sid not in line:  # cheap prefilter: parse only this session's lines
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("sid") != sid:
+                continue
+            for field in ("cum", "cost"):
+                value = entry.get(field)
+                if isinstance(value, bool) or value is None:
+                    continue
+                number = as_float(value, default=math.nan)
+                if 0 <= number < _MAX_PLAUSIBLE_COST_USD:
+                    return number
+            # A record of this session without a usable cost (a timeout): keep
+            # looking further back for the last figure the CLI did report.
+        return None
+    except Exception as e:  # noqa: BLE001 - bookkeeping must never break a dispatch
+        logger.debug("Could not read session total for %s: %s", session_id, e)
+        return None
 
 
 def _percentile(values: list[float], pct: float) -> float:

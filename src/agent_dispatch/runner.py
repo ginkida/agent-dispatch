@@ -455,6 +455,31 @@ def _token_usage(data: dict) -> dict | None:
     return tokens or None
 
 
+def _call_cost(data: dict, prior_total: float | None) -> tuple[object, dict | None]:
+    """``(cost of this call, journal telemetry)`` from a CLI result payload.
+
+    On ``--resume`` the CLI's ``total_cost_usd`` covers the whole session (see
+    `usage.session_total`), so with a known *prior_total* the call's cost is the
+    difference, and the reported cumulative figure rides along as ``cum`` in the
+    journal telemetry for the next resume to subtract. The subtraction happens
+    only when the payload is a plain finite number no smaller than the prior
+    total: an older CLI reports per-call totals, and a smaller figure is the
+    evidence of that — it is then left as reported. Anything else (missing,
+    malformed) passes through untouched, exactly as before; DispatchResult
+    validation and the journal's own coercion deal with it.
+    """
+    raw = data.get("total_cost_usd")
+    telemetry = _token_usage(data)
+    if prior_total is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return raw, telemetry
+    total = usage.as_float(raw, default=math.nan)
+    if not (math.isfinite(total) and 0 <= prior_total <= total):
+        return raw, telemetry
+    telemetry = dict(telemetry or {})
+    telemetry["cum"] = total
+    return round(total - prior_total, 6), telemetry
+
+
 def _build_error_result(
     agent_name: str,
     data: dict,
@@ -464,6 +489,7 @@ def _build_error_result(
     *,
     session_fallback: str | None,
     exit_code: int | None = None,
+    prior_total: float | None = None,
 ) -> DispatchResult:
     """Build the DispatchResult for a CLI payload with ``is_error: true``.
 
@@ -496,16 +522,17 @@ def _build_error_result(
         error_type = _classify_error(error_text)
         error_text += _classification_hint(agent_name, error_type, error_text)
 
+    cost_usd, telemetry = _call_cost(data, prior_total)
     return _apply_budget(
         DispatchResult(
             agent=agent_name,
             success=False,
             result=result_text,
             session_id=session_id,
-            cost_usd=data.get("total_cost_usd"),
+            cost_usd=cost_usd,
             duration_ms=data.get("duration_ms"),
             num_turns=data.get("num_turns"),
-            token_usage=_token_usage(data),
+            token_usage=telemetry,
             error=error_text,
             error_type=error_type,
             denied_tools=denied,
@@ -553,6 +580,7 @@ def _journaled(fn: Callable) -> Callable:
                     error_type=result.error_type,
                     caller=kwargs.get("caller"),
                     tokens=result.token_usage,
+                    session_id=result.session_id,
                 )
             except Exception as e:  # noqa: BLE001 - see below
                 # `usage.record` already swallows everything, so this arm is
@@ -577,6 +605,7 @@ def _build_success_result(
     session_fallback: str | None,
     response_format: str | None,
     extra_hint: str | None = None,
+    prior_total: float | None = None,
 ) -> DispatchResult:
     """Build the DispatchResult for a non-error CLI payload.
 
@@ -600,16 +629,17 @@ def _build_success_result(
         _outcome_hint(agent_name, outcome, session_id),
     ]
     hint = " ".join(h for h in hints if h) or None
+    cost_usd, telemetry = _call_cost(data, prior_total)
     return _apply_budget(
         DispatchResult(
             agent=agent_name,
             success=True,
             result=result_text,
             session_id=session_id,
-            cost_usd=data.get("total_cost_usd"),
+            cost_usd=cost_usd,
             duration_ms=data.get("duration_ms"),
             num_turns=data.get("num_turns"),
-            token_usage=_token_usage(data),
+            token_usage=telemetry,
             parsed_result=parsed,
             denied_tools=denied,
             hint=hint,
@@ -1231,6 +1261,14 @@ def dispatch(
     # return something resumable. When resuming, the caller's id is the one.
     new_session = None if session_id else str(uuid.uuid4())
     session_uuid = session_id or new_session
+    # A resumed session reports its cumulative cost; what it had cost before
+    # this call is what turns that into the cost of the call (see _call_cost).
+    # Read before the spawn: afterwards another process may have resumed it too.
+    prior_total = (
+        usage.session_total(session_id)
+        if session_id and getattr(settings, "usage_log", True)
+        else None
+    )
 
     timeout = agent.timeout or settings.default_timeout
     try:
@@ -1401,6 +1439,7 @@ def dispatch(
             settings,
             session_fallback=session_uuid,
             exit_code=proc.returncode,
+            prior_total=prior_total,
         )
 
     return _build_success_result(
@@ -1412,6 +1451,7 @@ def dispatch(
         session_fallback=session_uuid,
         response_format=response_format,
         extra_hint=_KILLED_AFTER_RESULT if cleanup_timed_out else None,
+        prior_total=prior_total,
     )
 
 

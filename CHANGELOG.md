@@ -8,11 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-agent startup-context trims, both opt-in: `agent-dispatch update <name>
+  --no-skills` (sends `--disable-slash-commands`) and `--strict-mcp` (sends
+  `--strict-mcp-config` with the agent directory's own `.mcp.json`). A dispatch
+  with a new task re-writes the whole session preamble to the prompt cache —
+  about 32k tokens on claude 2.1.322 — and these cut the cold-start cost by 27%
+  and 11% (43% together) in a live measurement. `describe` and `inspect_agent`
+  show them when set; `doctor` checks that the installed CLI knows the flags.
+  Restart running sessions before enabling them: a server on an older release
+  drops keys it does not know the next time it saves the config.
 - Usage journal records input, output, cache-read and cache-write tokens plus
   the highest-cost model reported by the CLI, including failed and budget-stopped
   runs. `agent-dispatch stats` shows token totals, cache percentages and each
   agent's most frequent model; `--json` includes counts and measurement coverage.
   Token metadata stays out of tool responses, job files and discovery profiles.
+
+### Fixed
+- A resumed session's cost was counted again on every `dispatch_session`.
+  Since claude 2.1.277 `total_cost_usd` covers the whole session on `--resume`;
+  the result and the journal now carry the call's own cost (the difference from
+  the session's last journaled total), so `stats` no longer overstates spend and
+  a cheap follow-up no longer raises `budget_exceeded` on the session's history.
+  Sessions the journal has not seen, and runs with `usage_log: false`, keep the
+  reported figure.
+- `return_ref` payloads dropped `budget_exceeded`.
 
 ## [0.16.0] - 2026-09-30
 

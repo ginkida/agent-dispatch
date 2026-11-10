@@ -55,7 +55,10 @@ mcp = FastMCP(
         "1. list_agents() — see who's available and what they can do\n"
         "2. inspect_agent(name) — cheap detailed lookup (MCP, stack, CLAUDE.md preview)\n"
         "3. dispatch(agent, task) — one-shot delegation (cached)\n"
-        "4. dispatch_session(agent, task, session_id?) — multi-turn conversation\n"
+        "4. dispatch_session(agent, task, session_id?) — multi-turn conversation. "
+        "For a follow-up to an agent you dispatched within the last hour, pass the "
+        "session_id from its result here instead of a fresh dispatch: the agent keeps "
+        "its findings and its startup context is already cached (several times cheaper)\n"
         "5. dispatch_parallel(dispatches, aggregate?) — concurrent tasks\n"
         "6. dispatch_stream(agent, task) — live progress updates\n"
         "7. dispatch_dialogue(requester, responder, topic) — two agents collaborate\n"
@@ -395,6 +398,8 @@ def _ref_payload(
         payload["denied_tools"] = result.denied_tools
     if result.outcome:
         payload["outcome"] = result.outcome
+    if result.budget_exceeded:
+        payload["budget_exceeded"] = True
     if result.hint:
         payload["hint"] = result.hint
     if result.parsed_result is not None:

@@ -2793,6 +2793,128 @@ class TestUsageJournaling:
         assert result.success
 
 
+class TestResumedSessionCost:
+    """`total_cost_usd` is per SESSION on --resume; a call must cost only its own share.
+
+    Figures are the live ones from claude 2.1.322: a first call at $0.0798, then
+    a resume reporting $0.0953468 that really cost $0.0155468.
+    """
+
+    def setup_method(self):
+        self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
+        self.settings = Settings()
+
+    def _run(self, mock_run, total, *, session_id=None, sid="s-live", is_error=False, **settings):
+        payload = {"result": "ok", "is_error": is_error, "session_id": sid}
+        if total is not None:
+            payload["total_cost_usd"] = total
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+        cfg = Settings(**settings) if settings else self.settings
+        return dispatch("infra", "go", self.agent, cfg, None, session_id)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_resume_costs_the_difference_and_the_journal_sums_to_the_session(self, mock_run, _w):
+        first = self._run(mock_run, 0.0798)
+        assert first.cost_usd == 0.0798
+        second = self._run(mock_run, 0.0953468, session_id="s-live")
+        assert second.cost_usd == pytest.approx(0.0155468, abs=1e-6)
+        third = self._run(mock_run, 0.0992679, session_id="s-live")
+        assert third.cost_usd == pytest.approx(0.0039211, abs=1e-6)
+
+        rows = usage.load()
+        assert [r["sid"] for r in rows] == ["s-live"] * 3
+        assert "cum" not in rows[0]  # a first call's cost is its total
+        assert rows[1]["cum"] == 0.095347 and rows[2]["cum"] == 0.099268
+        # What the session really cost, not 0.0798 + 0.0953 + 0.0993 = 0.2744.
+        assert usage.summarize(rows)["total"]["cost_usd"] == pytest.approx(0.0993, abs=1e-4)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_cumulative_total_no_longer_trips_the_per_run_budget(self, mock_run, _w):
+        agent = AgentConfig(directory="/tmp", timeout=10, max_budget_usd=0.5)
+        self.agent = agent
+        self._run(mock_run, 0.40)
+        resumed = self._run(mock_run, 0.70, session_id="s-live")
+        assert resumed.cost_usd == pytest.approx(0.30)
+        assert resumed.budget_exceeded is None
+        # ...while a resume that itself overshoots is still flagged.
+        over = self._run(mock_run, 1.30, session_id="s-live")
+        assert over.cost_usd == pytest.approx(0.60)
+        assert over.budget_exceeded is True
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_an_error_result_on_resume_is_adjusted_too(self, mock_run, _w):
+        self._run(mock_run, 0.40)
+        failed = self._run(mock_run, 0.45, session_id="s-live", is_error=True)
+        assert not failed.success
+        assert failed.cost_usd == pytest.approx(0.05)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_unknown_session_keeps_the_reported_figure(self, mock_run, _w):
+        # Nothing in the journal for this session (created before this version,
+        # or rotated away): no basis to subtract, so report what the CLI said.
+        result = self._run(mock_run, 0.70, session_id="s-live")
+        assert result.cost_usd == 0.70
+        assert "cum" not in usage.load()[0]
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_a_per_call_total_from_an_old_cli_is_left_alone(self, mock_run, _w):
+        self._run(mock_run, 0.40)
+        # Smaller than the session's known total: this CLI reports per call.
+        result = self._run(mock_run, 0.10, session_id="s-live")
+        assert result.cost_usd == 0.10
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_a_costless_record_in_between_does_not_reset_the_baseline(self, mock_run, _w):
+        self._run(mock_run, 0.40)
+        self._run(mock_run, None, session_id="s-live")  # e.g. a payload without a cost
+        result = self._run(mock_run, 0.55, session_id="s-live")
+        assert result.cost_usd == pytest.approx(0.15)
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_another_session_is_never_the_baseline(self, mock_run, _w):
+        self._run(mock_run, 0.40, sid="s-other")
+        result = self._run(mock_run, 0.70, session_id="s-live")
+        assert result.cost_usd == 0.70
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_journal_off_means_no_lookup_and_the_old_behaviour(self, mock_run, _w, monkeypatch):
+        self._run(mock_run, 0.40)
+        monkeypatch.setattr(usage, "session_total", lambda *_a, **_k: pytest.fail("looked up"))
+        result = self._run(mock_run, 0.70, session_id="s-live", usage_log=False)
+        assert result.cost_usd == 0.70
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_malformed_totals_pass_through_untouched(self, mock_run, _w):
+        self._run(mock_run, 0.40)
+        assert self._run(mock_run, True, session_id="s-live").success
+        assert self._run(mock_run, None, session_id="s-live").cost_usd is None
+
+    def test_session_total_survives_a_mangled_journal(self, tmp_path):
+        path = tmp_path / "j.jsonl"
+        path.write_text(
+            '{"t":1,"agent":"a","ok":true,"cost":0.4,"sid":"s-live"}\n'
+            '{"t":2,"agent":"a","ok":true,"cost":"abc","cum":"1e999","sid":"s-live"}\n'
+            "not json s-live\n"
+            '{"t":3,"agent":"a","ok":true,"cost":9,"sid":"s-live-longer"}\n'
+        )
+        # The mangled record has no usable figure; the search continues back.
+        assert usage.session_total("s-live", path) == 0.4
+        assert usage.session_total("absent", path) is None
+        assert usage.session_total(None, path) is None
+        assert usage.session_total("s-live", tmp_path / "missing.jsonl") is None
+
+
 class TestUsageLimitClassification:
     """The account's own rate limit is its own error type, observed live."""
 

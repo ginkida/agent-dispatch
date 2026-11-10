@@ -2149,6 +2149,13 @@ class TestDeniedToolsSurfacing:
         assert "grant Bash" in data["hint"]
 
     @pytest.mark.asyncio
+    async def test_ref_payload_keeps_budget_exceeded(self):
+        over = DispatchResult(agent="a", success=True, result="x", budget_exceeded=True)
+        assert server._ref_payload("0" * 32, over)["budget_exceeded"] is True
+        fine = DispatchResult(agent="a", success=True, result="x")
+        assert "budget_exceeded" not in server._ref_payload("0" * 32, fine)
+
+    @pytest.mark.asyncio
     async def test_ref_payload_includes_denied_and_hint(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
