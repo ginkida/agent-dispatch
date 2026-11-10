@@ -1007,6 +1007,33 @@ def _reject_flaglike(label: str, value: str) -> None:
         )
 
 
+def _startup_trim_flags(agent: AgentConfig) -> list[str]:
+    """CLI flags for the agent's opt-in startup-context trims (see AgentConfig).
+
+    Applied on --resume as well: the preamble is rebuilt on every launch, so a
+    resumed session that suddenly loaded every user-scope server again would
+    both cost more and see different tools than its first turn did.
+
+    ``--mcp-config`` is variadic in the CLI, so the path is always followed by
+    another flag here (never by a bare value it could swallow), and the path
+    itself is the resolved agent directory plus a fixed name — absolute, so it
+    cannot be read as a flag.
+    """
+    flags: list[str] = []
+    if not agent.skills:
+        flags.append("--disable-slash-commands")
+    if agent.strict_mcp:
+        project_mcp = agent.directory / ".mcp.json"
+        try:
+            has_project_mcp = project_mcp.is_file()
+        except OSError:
+            has_project_mcp = False
+        if has_project_mcp:
+            flags.extend(["--mcp-config", str(project_mcp)])
+        flags.append("--strict-mcp-config")
+    return flags
+
+
 def _build_command(
     claude_path: str,
     task: str,
@@ -1033,6 +1060,8 @@ def _build_command(
         # a timed-out dispatch can still hand back a resumable session_id —
         # the partial transcript survives the kill.
         cmd.extend(["--session-id", new_session_id])
+
+    cmd.extend(_startup_trim_flags(agent))
 
     budget = agent.max_budget_usd or settings.default_max_budget_usd
     if budget:

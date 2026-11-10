@@ -421,6 +421,18 @@ def list_agents() -> None:
     default=None,
     help="Standing orders for every dispatch (replaces the text). Use 'none' to clear.",
 )
+@click.option(
+    "--skills/--no-skills",
+    default=None,
+    help="Load the skill/command listing at startup (default: on). "
+    "--no-skills trims the per-dispatch startup context.",
+)
+@click.option(
+    "--strict-mcp/--no-strict-mcp",
+    default=None,
+    help="Load only the agent directory's .mcp.json, not user-scope MCP servers "
+    "(default: off). Trims startup context; the agent can no longer dispatch others.",
+)
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -435,6 +447,8 @@ def update(
     capabilities: str | None,
     risky_capabilities: str | None,
     instructions: str | None,
+    skills: bool | None,
+    strict_mcp: bool | None,
 ) -> None:
     """Update an existing agent's configuration."""
     _check_timeout_or_exit(timeout)
@@ -459,6 +473,8 @@ def update(
             capabilities=capabilities,
             risky_capabilities=risky_capabilities,
             instructions=instructions,
+            skills=skills,
+            strict_mcp=strict_mcp,
         )
 
         if not updated:
@@ -482,6 +498,8 @@ def _apply_cli_updates(
     capabilities: str | None,
     risky_capabilities: str | None,
     instructions: str | None = None,
+    skills: bool | None = None,
+    strict_mcp: bool | None = None,
 ) -> list[str]:
     """Apply `update`'s explicitly-passed options in place; return the fields touched."""
     updated: list[str] = []
@@ -533,6 +551,12 @@ def _apply_cli_updates(
         stripped = instructions.strip()
         agent.instructions = "" if stripped.lower() == "none" else stripped
         updated.append("instructions")
+    if skills is not None:
+        agent.skills = skills
+        updated.append("skills")
+    if strict_mcp is not None:
+        agent.strict_mcp = strict_mcp
+        updated.append("strict_mcp")
 
     return updated
 
@@ -663,6 +687,10 @@ def describe(name: str) -> None:
         click.echo(f"  instructions:     {first}")
         for line in rest:
             click.echo(f"                    {line}")
+    if not agent.skills:
+        click.echo("  skills:           off (--disable-slash-commands)")
+    if agent.strict_mcp:
+        click.echo("  strict_mcp:       on (only the directory's .mcp.json)")
     click.echo(f"  allowed_tools:    {_render_tools(agent.allowed_tools)}")
     click.echo(f"  disallowed_tools: {_render_tools(agent.disallowed_tools)}")
 
@@ -935,6 +963,43 @@ def _protocol_flag_verdict(
     return "warn", msg, details
 
 
+# (flag the runner sends, AgentConfig predicate, the `update` option that stops sending it)
+_TRIM_FLAGS = (
+    ("--disable-slash-commands", lambda a: not a.skills, "--skills"),
+    ("--strict-mcp-config", lambda a: a.strict_mcp, "--no-strict-mcp"),
+)
+
+
+def _trim_flag_verdicts(
+    config: DispatchConfig | None, claude_path: str
+) -> list[tuple[str, str, list[str]]]:
+    """Doctor lines for the opt-in startup trims (AgentConfig.skills / strict_mcp).
+
+    Silent unless some agent actually uses a trim: the flags are only sent for
+    those agents, so an old CLI is a problem for them alone.
+    """
+    if config is None:
+        return []
+    verdicts: list[tuple[str, str, list[str]]] = []
+    for flag, uses, undo in _TRIM_FLAGS:
+        names = [name for name, agent in config.agents.items() if uses(agent)]
+        if not names:
+            continue
+        supported = _claude_supports_flag(claude_path, flag)
+        if supported is True:
+            verdicts.append(("ok", f"claude CLI supports {flag} (used by {', '.join(names)})", []))
+        elif supported is False:
+            verdicts.append((
+                "warn",
+                f"claude CLI predates {flag}: dispatches to {', '.join(names)} will fail",
+                ["    Upgrade claude (recommended), or stop sending the flag:"]
+                + [f"      agent-dispatch update {name} {undo}" for name in names],
+            ))
+        else:
+            verdicts.append(("warn", f"Could not run `claude --help` to check {flag} support", []))
+    return verdicts
+
+
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Output a structured diagnostic report.")
 @click.option("--strict", is_flag=True, help="Exit with code 1 for warnings as well as failures.")
@@ -995,6 +1060,8 @@ def doctor(as_json: bool, strict: bool) -> None:
             emit(*_protocol_flag_verdict(config, cp))
         else:
             warn("Could not run `claude --help` to check --append-system-prompt support")
+        for status, msg, details in _trim_flag_verdicts(config, claude_path):
+            emit(status, msg, details)
     else:
         fail("claude CLI not found on PATH")
         detail("    Install: https://docs.anthropic.com/en/docs/claude-code")

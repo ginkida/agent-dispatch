@@ -1799,6 +1799,90 @@ class TestInstructionsCli:
         assert "instructions:" not in runner.invoke(cli, ["describe", "proj"]).output
 
 
+class TestStartupTrims:
+    """`update --no-skills / --strict-mcp`: opt-in startup-context trims."""
+
+    def _add(self, tmp_path: Path) -> None:
+        agent_dir = tmp_path / "proj"
+        agent_dir.mkdir()
+        assert runner.invoke(cli, ["add", "proj", str(agent_dir), "-d", "T"]).exit_code == 0
+
+    def test_set_show_and_reset(self, tmp_path: Path, _isolated_config):
+        self._add(tmp_path)
+        plain = runner.invoke(cli, ["describe", "proj"]).output
+        assert "skills:" not in plain and "strict_mcp:" not in plain
+
+        result = runner.invoke(cli, ["update", "proj", "--no-skills", "--strict-mcp"])
+        assert result.exit_code == 0, result.output
+        assert "skills" in result.output and "strict_mcp" in result.output
+        agent = load_config().agents["proj"]
+        assert agent.skills is False and agent.strict_mcp is True
+        shown = runner.invoke(cli, ["describe", "proj"]).output
+        assert "skills:           off" in shown and "strict_mcp:       on" in shown
+
+        result = runner.invoke(cli, ["update", "proj", "--skills", "--no-strict-mcp"])
+        assert result.exit_code == 0, result.output
+        agent = load_config().agents["proj"]
+        assert agent.skills is True and agent.strict_mcp is False
+        raw = _isolated_config.read_text()
+        assert "skills" not in raw and "strict_mcp" not in raw  # defaults are pruned
+
+    def test_other_updates_leave_the_trims_alone(self, tmp_path: Path, _isolated_config):
+        self._add(tmp_path)
+        runner.invoke(cli, ["update", "proj", "--no-skills"])
+        assert runner.invoke(cli, ["update", "proj", "--timeout", "90"]).exit_code == 0
+        assert load_config().agents["proj"].skills is False
+
+    def _doctor(self, help_text: str, *args: str):
+        def run(cmd, **kw):
+            if cmd[1:] == ["--help"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=help_text, stderr=""
+                )
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="agent-dispatch: x serve - Connected\n", stderr=""
+            )
+
+        with (
+            patch("agent_dispatch.cli.shutil.which", side_effect=lambda n: f"/usr/bin/{n}"),
+            patch("agent_dispatch.cli.subprocess.run", side_effect=run),
+        ):
+            return runner.invoke(cli, ["doctor", *args])
+
+    _NEW_CLI = "  --append-system-prompt\n  --disable-slash-commands\n  --strict-mcp-config\n"
+
+    def test_doctor_is_silent_when_no_agent_uses_a_trim(self, tmp_path: Path, _isolated_config):
+        self._add(tmp_path)
+        output = self._doctor("  --append-system-prompt\n").output
+        assert "--disable-slash-commands" not in output
+        assert "--strict-mcp-config" not in output
+
+    def test_doctor_confirms_supported_flags(self, tmp_path: Path, _isolated_config):
+        self._add(tmp_path)
+        runner.invoke(cli, ["update", "proj", "--no-skills", "--strict-mcp"])
+        output = self._doctor(self._NEW_CLI).output
+        assert "[OK] claude CLI supports --disable-slash-commands (used by proj)" in output
+        assert "[OK] claude CLI supports --strict-mcp-config (used by proj)" in output
+
+    def test_doctor_remedy_for_an_old_cli_is_runnable(self, tmp_path: Path, _isolated_config):
+        self._add(tmp_path)
+        runner.invoke(cli, ["update", "proj", "--no-skills", "--strict-mcp"])
+        result = self._doctor("  --append-system-prompt\n")
+        assert "[WARN] claude CLI predates --disable-slash-commands" in result.output
+        assert "[WARN] claude CLI predates --strict-mcp-config" in result.output
+        # Run the commands it prints; afterwards the warnings must be gone.
+        remedies = [
+            line.strip() for line in result.output.splitlines()
+            if line.strip().startswith("agent-dispatch update proj")
+        ]
+        assert len(remedies) == 2
+        for remedy in remedies:
+            assert runner.invoke(cli, remedy.split()[1:]).exit_code == 0, remedy
+        strict = self._doctor("  --append-system-prompt\n", "--strict")
+        assert strict.exit_code == 0, strict.output
+        assert "predates --disable" not in strict.output
+
+
 class TestDoctorProtocolProbe:
     """doctor checks that the installed claude knows --append-system-prompt."""
 

@@ -60,6 +60,19 @@ class AgentConfig(BaseModel):
     # protocol — so they hold across every task, unlike `context`, which is
     # per call. Empty = nothing appended. Pruned from YAML when empty.
     instructions: str = ""
+    # Startup-context trims. Every dispatch with a new task re-writes the whole
+    # per-session preamble to the prompt cache (measured on claude 2.1.322:
+    # ~32k tokens, most of a short run's cost), so what the agent does not need
+    # is paid for on every call. Both default to "unchanged behaviour" and are
+    # pruned from YAML at their defaults.
+    #   skills=False     -> --disable-slash-commands: no skill/command listing
+    #                       (user-level skills included). ~27% of the preamble.
+    #   strict_mcp=True  -> --strict-mcp-config: only the agent directory's own
+    #                       .mcp.json is loaded; user-scope servers and
+    #                       connectors (agent-dispatch itself among them, so no
+    #                       nested dispatch) are not. ~11%.
+    skills: bool = True
+    strict_mcp: bool = False
 
     @field_validator("directory", mode="before")
     @classmethod

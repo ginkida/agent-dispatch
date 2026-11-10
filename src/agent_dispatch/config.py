@@ -225,6 +225,11 @@ def save_config(config: DispatchConfig, path: Path | None = None) -> None:
         for key in ("capabilities", "risky_capabilities", "instructions"):
             if not agent_data.get(key):
                 agent_data.pop(key, None)
+        # Booleans at their defaults: same reason, opposite polarity each.
+        if agent_data.get("skills") is True:
+            agent_data.pop("skills", None)
+        if agent_data.get("strict_mcp") is False:
+            agent_data.pop("strict_mcp", None)
     # `groups` also defaults to {} (not None), so exclude_none keeps it — prune
     # the whole block when empty, and drop empty per-group member lists. Empty
     # LISTS only, mirroring capabilities; empty strings (description /

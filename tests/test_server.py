@@ -4012,6 +4012,16 @@ class TestInstructionsAndOutcome:
         assert "instructions" not in json.loads(await server.inspect_agent("proj", preview_lines=0))
 
     @pytest.mark.asyncio
+    async def test_inspect_shows_startup_trims_only_when_set(self, tmp_path: Path):
+        plain = AgentConfig(directory=tmp_path)
+        lean = AgentConfig(directory=tmp_path, skills=False, strict_mcp=True)
+        config = DispatchConfig(agents={"plain": plain, "lean": lean})
+        with patch.object(server, "_get_config", return_value=config):
+            shown_plain = json.loads(await server.inspect_agent("plain", preview_lines=0))
+            shown_lean = json.loads(await server.inspect_agent("lean", preview_lines=0))
+        assert "skills" not in shown_plain and "strict_mcp" not in shown_plain
+        assert shown_lean["skills"] is False and shown_lean["strict_mcp"] is True
+
     async def test_update_instructions_invalidates_cache(self, tmp_path: Path, monkeypatch):
         config_file = tmp_path / "agents.yaml"
         monkeypatch.setenv("AGENT_DISPATCH_CONFIG", str(config_file))

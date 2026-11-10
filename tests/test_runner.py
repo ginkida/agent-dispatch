@@ -130,6 +130,37 @@ class TestBuildCommand:
         cmd = _build_command("claude", "hello", self.agent, self.settings)
         assert cmd == ["claude", "-p", "hello", "--output-format", "json"]
 
+    def test_no_skills_disables_the_listing(self):
+        agent = AgentConfig(directory="/tmp", skills=False)
+        cmd = _build_command("claude", "hello", agent, self.settings)
+        assert "--disable-slash-commands" in cmd
+        assert "--strict-mcp-config" not in cmd
+
+    def test_strict_mcp_names_the_project_config_when_present(self, tmp_path):
+        (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+        agent = AgentConfig(directory=tmp_path, strict_mcp=True)
+        cmd = _build_command("claude", "hello", agent, self.settings)
+        i = cmd.index("--mcp-config", 3)
+        assert cmd[i + 1] == str(agent.directory / ".mcp.json")
+        # --mcp-config is variadic in the CLI: what follows the path must be a
+        # flag, or it would be swallowed as a second config.
+        assert cmd[i + 2] == "--strict-mcp-config"
+        assert "--disable-slash-commands" not in cmd
+
+    def test_strict_mcp_without_a_project_config_loads_no_servers(self, tmp_path):
+        agent = AgentConfig(directory=tmp_path, strict_mcp=True)
+        cmd = _build_command("claude", "hello", agent, self.settings)
+        assert "--strict-mcp-config" in cmd
+        assert "--mcp-config" not in cmd
+
+    def test_trims_survive_resume_and_follow_the_prompt(self, tmp_path):
+        agent = AgentConfig(directory=tmp_path, skills=False, strict_mcp=True)
+        cmd = _build_command("claude", "--strict-mcp-config", agent, self.settings, session_id="s1")
+        assert cmd[2] == "--strict-mcp-config"  # the prompt, untouched
+        assert cmd.index("--strict-mcp-config", 3) > 3
+        assert "--disable-slash-commands" in cmd[3:]
+        assert "--resume" in cmd
+
     def test_with_session_id(self):
         cmd = _build_command("claude", "hello", self.agent, self.settings, session_id="abc-123")
         assert "--resume" in cmd

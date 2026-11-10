@@ -696,6 +696,10 @@ async def inspect_agent(
         info["risky_capabilities"] = agent.risky_capabilities
     if agent.instructions:
         info["instructions"] = agent.instructions
+    if not agent.skills:
+        info["skills"] = False
+    if agent.strict_mcp:
+        info["strict_mcp"] = True
     # What this agent has actually cost and taken, so the caller can size
     # timeout_seconds from data instead of from the description's prose.
     if config.settings.usage_log and (profile := usage.agent_profile(name)):

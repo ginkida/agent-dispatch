@@ -467,3 +467,20 @@ class TestYamlLoaderChoice:
             p,
         )
         assert load_config(p).agents["ru"].description == "Диагностика приложения"
+
+
+def test_save_config_prunes_startup_trims_at_their_defaults(tmp_path: Path):
+    f = tmp_path / "test.yaml"
+    config = DispatchConfig(
+        agents={
+            "plain": AgentConfig(directory=tmp_path),
+            "lean": AgentConfig(directory=tmp_path, skills=False, strict_mcp=True),
+        }
+    )
+    save_config(config, f)
+    raw = yaml.safe_load(f.read_text())["agents"]
+    assert "skills" not in raw["plain"] and "strict_mcp" not in raw["plain"]
+    assert raw["lean"]["skills"] is False and raw["lean"]["strict_mcp"] is True
+    loaded = load_config(f)
+    assert loaded.agents["plain"].skills is True and loaded.agents["plain"].strict_mcp is False
+    assert loaded.agents["lean"].skills is False and loaded.agents["lean"].strict_mcp is True
