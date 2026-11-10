@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Usage journal records input, output, cache-read and cache-write tokens plus
+  the highest-cost model reported by the CLI, including failed and budget-stopped
+  runs. `agent-dispatch stats` shows token totals, cache percentages and each
+  agent's most frequent model; `--json` includes counts and measurement coverage.
+  Token metadata stays out of tool responses, job files and discovery profiles.
+
 ## [0.16.0] - 2026-09-30
 
 The process-control round. One concurrency limit now covers every dispatch

@@ -613,7 +613,11 @@ Config is reloaded on every tool call — add agents without restarting.
 
 Every dispatch appends one line to `~/.config/agent-dispatch/usage.jsonl`
 (override with `AGENT_DISPATCH_USAGE_LOG`): agent, success, cost, duration,
-turns, `outcome`, error type, caller. Cache hits are recorded too, flagged
+turns, `outcome`, error type, caller, plus token counts and the model when the
+CLI reports them. Token fields are `in` (uncached input), `out` (output),
+`cr` (cache read), and `cw` (cache write). `model` is the highest-cost model
+in that dispatch's `modelUsage` (first on ties or when no cost is reported).
+Cache hits are recorded too, flagged
 `cached`, so the report can show what the cache saves.
 
 ```console
@@ -621,18 +625,33 @@ $ agent-dispatch stats --days 7
 Usage (last 7 day(s))
   dispatches: 33, 1 served from cache
   spend:      $13.0390
+  tokens:     in 1.2M (cache read 62%, cache write 35%), out 310k
   duration:   median 87s, p90 2m40s, max 10m00s
   outcomes:   blocked 1, done 27, partial 3
   failures:   timeout 1, usage_limit 1
 
 Per agent
   analytic           18 runs  $  8.9441  median  2m04s  p90  2m51s
+      tokens:     in 800k (cache read 62%, cache write 35%), out 210k
+      model:      claude-fable-5-2 +1 more
       done 15, partial 3
   gitlab             12 runs  $  3.7949  median    60s  p90    86s
+      tokens:     in 400k (cache read 62%, cache write 35%), out 100k
+      model:      claude-fable-5-2
       done 12  |  1 cached
 ```
 
 `--agent NAME` narrows it, `--json` emits the same report as JSON.
+The text's `in` includes uncached input, cache reads, and cache writes; its
+percentages use that combined input. JSON keeps those counts separate in
+`tokens: {input, output, cache_read, cache_write, records}`, adds
+`cache_read_share` rounded to three decimals when total input is nonzero,
+and counts dispatches by primary model in `models`. `records` counts live
+dispatches with valid token measurements; older records and cache hits do
+not dilute the share. Each agent's text shows its most frequent model and
+how many other models were recorded. Runs that fail or reach the spend cap
+still contribute their reported usage. Token telemetry is journal-only:
+tool responses, job files, and discovery's `typical` block stay compact.
 
 The journal is what makes three other things work: the `typical` block in
 `list_agents` / `inspect_agent`, the timeout error naming a value derived from

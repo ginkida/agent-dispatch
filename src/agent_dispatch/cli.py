@@ -1372,6 +1372,24 @@ def _fmt_counts(counts: dict[str, int]) -> str:
     return ", ".join(f"{k} {v}" for k, v in counts.items())
 
 
+def _fmt_token_count(count: int) -> str:
+    for scale, suffix in ((1_000_000, "M"), (1_000, "k")):
+        if count >= scale:
+            return f"{count / scale:.1f}".rstrip("0").rstrip(".") + suffix
+    return str(count)
+
+
+def _fmt_tokens(tokens: dict[str, int]) -> str:
+    total_input = tokens["input"] + tokens["cache_read"] + tokens["cache_write"]
+    cache = ""
+    if total_input:
+        cache = (
+            f" (cache read {tokens['cache_read'] / total_input:.0%}, "
+            f"cache write {tokens['cache_write'] / total_input:.0%})"
+        )
+    return f"in {_fmt_token_count(total_input)}{cache}, out {_fmt_token_count(tokens['output'])}"
+
+
 @cli.command("stats")
 @click.option("--days", default=0, type=int, help="Only count the last N days (default: all).")
 @click.option("--agent", default=None, help="Only this agent.")
@@ -1413,6 +1431,8 @@ def usage_stats(days: int, agent: str | None, as_json: bool) -> None:
     cached = f", {total['cached_hits']} served from cache" if total["cached_hits"] else ""
     click.echo(f"  dispatches: {total['dispatches']}{cached}")
     click.echo(f"  spend:      ${total['cost_usd']:.4f}")
+    if "tokens" in total:
+        click.echo(f"  tokens:     {_fmt_tokens(total['tokens'])}")
     if "median_ms" in total:
         click.echo(
             f"  duration:   median {_fmt_seconds(total['median_ms'])}, "
@@ -1436,6 +1456,12 @@ def usage_stats(days: int, agent: str | None, as_json: bool) -> None:
                 f"  median {_fmt_seconds(st['median_ms']):>6}  p90 {_fmt_seconds(st['p90_ms']):>6}"
             )
         click.echo(head)
+        if "tokens" in st:
+            click.echo(f"      tokens:     {_fmt_tokens(st['tokens'])}")
+        if st.get("models"):
+            model = max(st["models"], key=st["models"].get)
+            more = f" +{len(st['models']) - 1} more" if len(st["models"]) > 1 else ""
+            click.echo(f"      model:      {model}{more}")
         detail = []
         if st.get("outcomes"):
             detail.append(_fmt_counts(st["outcomes"]))

@@ -1935,6 +1935,54 @@ class TestDoctorProtocolProbe:
 
 
 class TestStatsCommand:
+    def _seed_tokens(self):
+        from agent_dispatch import usage
+
+        usage.record("analytic", ok=True, cost_usd=0.5,
+                     tokens={"in": 36000, "cr": 372000, "cw": 192000, "out": 155000,
+                             "model": "claude-fable-5-2"})
+        usage.record("analytic", ok=True, cost_usd=0.5,
+                     tokens={"in": 36000, "cr": 372000, "cw": 192000, "out": 155000,
+                             "model": "claude-fable-5-2"})
+        usage.record("analytic", ok=False, tokens={"model": "cheap"})
+        usage.record("legacy", ok=True)
+
+    def test_token_text_reports_totals_per_agent_and_most_frequent_model(self):
+        self._seed_tokens()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert result.output.count(
+            "tokens:     in 1.2M (cache read 62%, cache write 32%), out 310k"
+        ) == 2
+        assert "model:      claude-fable-5-2 +1 more" in result.output
+        legacy = result.output.split("legacy", 1)[1]
+        assert "tokens:" not in legacy and "model:" not in legacy
+
+    def test_token_json_preserves_exact_counts_and_coverage(self):
+        self._seed_tokens()
+        result = runner.invoke(cli, ["stats", "--json"])
+        assert result.exit_code == 0, result.output
+        report = json.loads(result.output, parse_constant=pytest.fail)
+        assert report["total"]["tokens"] == {
+            "input": 72000, "output": 310000, "cache_read": 744000,
+            "cache_write": 384000, "records": 2,
+        }
+        assert report["total"]["cache_read_share"] == 0.62
+        assert report["total"]["models"] == {"claude-fable-5-2": 2, "cheap": 1}
+        assert report["agents"]["analytic"]["tokens"] == report["total"]["tokens"]
+        assert "tokens" not in report["agents"]["legacy"]
+
+    def test_zero_input_tokens_do_not_print_cache_percentages(self):
+        from agent_dispatch import usage
+
+        usage.record("a", ok=True, tokens={"out": 4, "model": "m"})
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert result.output.count("tokens:     in 0, out 4") == 2
+        assert "cache read" not in result.output
+        assert "model:      m\n" in result.output
+        assert "+0 more" not in result.output
+
     @pytest.mark.parametrize("as_json", [False, True])
     def test_nonfinite_metrics_are_ignored(self, as_json):
         from agent_dispatch import usage
@@ -1983,6 +2031,7 @@ class TestStatsCommand:
         assert result.output.index("analytic") < result.output.index("gitlab")
         assert "5 runs" in result.output
         assert "1 run " in result.output
+        assert "tokens:" not in result.output and "model:" not in result.output
 
     def test_json_is_valid_json_even_with_no_records(self):
         # A fresh install is exactly when a script first pipes this somewhere.

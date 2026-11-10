@@ -17,6 +17,46 @@ def _write(path: Path, entries: list[dict]) -> None:
 
 
 class TestRecord:
+    def test_token_fields_roundtrip_in_one_bounded_write(self, monkeypatch):
+        writes = []
+        real_write = os.write
+
+        def capture(fd, data):
+            writes.append(data)
+            return real_write(fd, data)
+
+        monkeypatch.setattr(os, "write", capture)
+        usage.record(
+            "界" * 500, ok=False, caller="界" * 500, outcome="界" * 200,
+            error_type="界" * 200,
+            tokens={"in": 0, "out": 12, "cr": 999999999999, "cw": 42,
+                    "model": "界" * 500, "other": "ignore"},
+        )
+        (entry,) = usage.load()
+        assert {key: entry[key] for key in ("in", "out", "cr", "cw", "model")} == {
+            "in": 0, "out": 12, "cr": 999999999999, "cw": 42, "model": "界" * 60,
+        }
+        assert "other" not in entry
+        assert len(writes) == 1
+        assert len(writes[0]) <= usage._MAX_LINE_BYTES
+        assert len(writes[0]) < 4096
+
+    @pytest.mark.parametrize("value", ["2", "abc", -1, -0.5, None, True, 1e400,
+                                      float("nan"), 10**12, 10**400, [], {}])
+    def test_invalid_tokens_do_not_lose_the_dispatch_record(self, value):
+        usage.record("a", ok=True, tokens={"in": value, "out": value,
+                                         "cr": value, "cw": value, "model": value})
+        (entry,) = usage.load()
+        assert not set(entry) & {"in", "out", "cr", "cw"}
+        assert entry.get("model") == (value[:60] if isinstance(value, str) else None)
+        assert entry["ok"] is True
+
+    @pytest.mark.parametrize("tokens", [None, [], "junk", 42])
+    def test_non_dict_tokens_are_ignored(self, tokens):
+        usage.record("a", ok=True, tokens=tokens)
+        (entry,) = usage.load()
+        assert set(entry) == {"t", "agent", "ok"}
+
     def test_roundtrip_keeps_only_the_fields_that_were_given(self):
         usage.record("infra", ok=True, cost_usd=0.25, duration_ms=1500, num_turns=3, outcome="done")
         (entry,) = usage.load()
@@ -124,6 +164,64 @@ class TestRotation:
 
 
 class TestSummarize:
+    def test_mixed_token_history_counts_only_measured_live_records(self):
+        report = usage.summarize([
+            {"agent": "a", "ok": True, "cost": 0.5},  # older CLI
+            {"agent": "a", "ok": True, "in": 100, "out": 20, "cr": 600, "cw": 300,
+             "model": "main"},
+            {"agent": "a", "ok": False, "in": 50, "out": 10, "cr": 300, "cw": 150,
+             "model": "main"},
+            {"agent": "b", "ok": True, "out": 7, "model": "cheap"},
+            {"agent": "a", "ok": True, "cached": True, "in": 999, "cr": 999,
+             "model": "ignored"},
+        ])
+        assert report["total"]["tokens"] == {
+            "input": 150, "output": 37, "cache_read": 900, "cache_write": 450, "records": 3,
+        }
+        assert report["total"]["cache_read_share"] == 0.6
+        assert report["total"]["models"] == {"main": 2, "cheap": 1}
+        assert report["agents"]["a"]["tokens"]["records"] == 2
+        assert report["agents"]["b"]["tokens"]["output"] == 7
+        assert "cache_read_share" not in report["agents"]["b"]
+
+    @pytest.mark.parametrize("value", ["abc", None, True, False, -1, -0.5, float("nan"),
+                                      float("inf"), 1e308, 10**12, 10**400, [], {}])
+    def test_corrupt_tokens_cannot_poison_statistics(self, value):
+        report = usage.summarize([
+            {"agent": "a", "in": value, "out": value, "cr": value, "cw": value,
+             "model": []},
+            {"agent": "a", "in": 10, "out": 20, "cr": 60, "cw": 30, "model": "m"},
+        ])
+        assert report["total"]["tokens"] == {
+            "input": 10, "output": 20, "cache_read": 60, "cache_write": 30, "records": 1,
+        }
+        assert report["total"]["cache_read_share"] == 0.6
+        assert report["total"]["models"] == {"m": 1}
+        json.dumps(report, allow_nan=False)
+
+    def test_disk_numbers_are_coerced_and_zero_is_a_measurement(self):
+        total = usage.summarize([{"agent": "a", "in": "0", "out": "42"}])["total"]
+        assert total["tokens"] == {
+            "input": 0, "output": 42, "cache_read": 0, "cache_write": 0, "records": 1,
+        }
+        assert "cache_read_share" not in total
+
+    def test_share_is_rounded_and_invalid_fields_do_not_drop_valid_siblings(self):
+        total = usage.summarize([
+            {"agent": "a", "in": 1, "cr": 1, "cw": 1, "out": "broken"},
+        ])["total"]
+        assert total["cache_read_share"] == 0.333
+        assert total["tokens"] == {
+            "input": 1, "output": 0, "cache_read": 1, "cache_write": 1, "records": 1,
+        }
+
+    def test_old_and_model_only_records_do_not_invent_tokens(self):
+        old = usage.summarize([{"agent": "a", "ok": True}])["total"]
+        assert not set(old) & {"tokens", "cache_read_share", "models"}
+        model_only = usage.summarize([{"agent": "a", "model": "m"}])["total"]
+        assert model_only["models"] == {"m": 1}
+        assert "tokens" not in model_only
+
     def _sample(self) -> list[dict]:
         return [
             {"t": 1, "agent": "infra", "ok": True, "ms": 1000, "cost": 0.1, "outcome": "done"},
@@ -157,6 +255,14 @@ class TestSummarize:
 
 
 class TestProfiles:
+    def test_tokens_and_models_do_not_expand_discovery_profiles(self):
+        for _ in range(3):
+            usage.record("a", ok=True, duration_ms=1000, cost_usd=0.2,
+                         tokens={"in": 10, "cr": 60, "cw": 30, "out": 20, "model": "m"})
+        assert usage.profiles()["a"] == {
+            "dispatches": 3, "median_seconds": 1.0, "p90_seconds": 1.0, "median_cost_usd": 0.2,
+        }
+
     def _record_runs(self, agent: str, n: int, ms: int = 60000) -> None:
         for _ in range(n):
             usage.record(agent, ok=True, duration_ms=ms, cost_usd=0.2, outcome="done")

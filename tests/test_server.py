@@ -1729,6 +1729,27 @@ class TestStructuredResponseMCP:
 
 
 class TestReturnRef:
+    @pytest.mark.parametrize("return_ref", [False, True])
+    async def test_token_usage_stays_out_of_live_and_cached_payloads(self, tmp_path, return_ref):
+        from agent_dispatch import usage
+
+        config = _make_config(tmp_path)
+        result = DispatchResult(
+            agent="infra", success=True, result="paid answer", token_usage={"in": 2, "model": "m"}
+        )
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch("agent_dispatch.server.runner.dispatch", return_value=result) as run,
+        ):
+            live = json.loads(await server.dispatch("infra", "task", return_ref=return_ref))
+            cached = json.loads(await server.dispatch("infra", "task", return_ref=return_ref))
+            assert run.call_count == 1
+        assert "token_usage" not in live and "token_usage" not in cached
+        assert cached["cached"] is True
+        (entry,) = usage.load()
+        assert entry["cached"] is True
+        assert not set(entry) & {"in", "out", "cr", "cw", "model"}
+
     @pytest.mark.asyncio
     async def test_dispatch_return_ref_compact_response(self, tmp_path: Path):
         config = _make_config(tmp_path)

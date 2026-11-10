@@ -82,6 +82,15 @@ def test_dispatch_result_success():
     assert r.error_type is None
 
 
+def test_token_usage_is_journal_only():
+    result = DispatchResult(
+        agent="test", success=True, result="paid answer", token_usage={"in": 2, "model": "m"}
+    )
+    assert result.token_usage == {"in": 2, "model": "m"}
+    assert "token_usage" not in result.model_dump()
+    assert "token_usage" not in result.model_dump_json()
+
+
 def test_dispatch_result_error_type():
     r = DispatchResult(
         agent="test",

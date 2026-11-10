@@ -218,6 +218,8 @@ class DispatchResult(BaseModel):
     cost_usd: float | None = None
     duration_ms: int | None = None
     num_turns: int | None = None
+    # Journal-only telemetry: never inflate tool responses or persisted jobs.
+    token_usage: dict[str, Any] | None = Field(default=None, exclude=True)
     error: str | None = None
     error_type: str | None = None  # permission, timeout, recursion, not_found, budget, cli_error
     # Set when response_format="json" was requested AND the agent's result
