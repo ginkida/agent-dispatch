@@ -16,6 +16,12 @@ agents:
     instructions: |
       Read-only unless the task explicitly asks to restart or redeploy.
       Quote exact log lines with timestamps; never paraphrase an error.
+    # Startup-context trims: every dispatch pays for the session preamble, so
+    # drop what this agent never uses. `skills: false` removes the skill/command
+    # listing; `strict_mcp: true` loads only this directory's .mcp.json (no
+    # user-scope MCP servers — the agent can no longer dispatch others).
+    skills: false
+    strict_mcp: true
 
   # Analytics gateway — a browser + Yandex Metrica agent, no codebase of its own.
   # Its value is its MCP servers + access, not its source. Shared across groups.

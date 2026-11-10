@@ -271,6 +271,8 @@ Check container logs for recent errors related to the scheduler service
 
 That last line is lifted out of `result` into **`outcome`** — the agent's own verdict, deterministic to check: `"done"` means complete; `"partial"` / `"blocked"` mean the agent says the work is unfinished, the result names what is missing, and a `hint` spells out the continuation (usually `dispatch_session(..., session_id=...)`). Read `outcome` before reading the text. It never flips `success`, `partial` / `blocked` results are **not cached**, and a `dispatch_parallel(..., aggregate=...)` labels such members for the aggregator so a blocked report is not synthesized as a finished one. Absent when the agent did not report one — the protocol is off (`settings.dispatch_protocol: false`), `response_format="json"` was requested (the JSON footer governs the reply shape there), or the agent simply skipped it.
 
+**Startup cost.** Each dispatch is a fresh `claude` session, and a session's preamble — the project's `CLAUDE.md`, the skill listing, MCP server instructions and tool names — is written to the prompt cache again for every new task text (the task sits in front of it, so two different tasks share none of it). Measured on claude 2.1.322 in a gateway directory: ~32k tokens per dispatch before the agent does anything, which is most of what a short run costs. Two opt-in per-agent switches trim it — `agent-dispatch update <name> --no-skills` (no skill/command listing, user-level skills included: −27% in that measurement) and `--strict-mcp` (only the directory's own `.mcp.json`, no user-scope servers or connectors: −11%; the agent then cannot dispatch others, and loses any tool it got from a user-scope server). Check what an agent actually uses before turning either on; `--skills` / `--no-strict-mcp` undo them. The larger levers stay outside this tool: a cheaper `model` for gateway agents and a shorter agent `CLAUDE.md`.
+
 **Standing orders.** Per-agent `instructions` (set via `add_agent` / `update_agent` or `agent-dispatch update <name> --instructions "..."`) follow the protocol in the same system prompt on **every** dispatch — "read-only SQL only", "never restart a stack unless the task says so", "answer with exact log lines". Unlike `context`, which is per call, and unlike the project's own `CLAUDE.md`, which is written for an interactive session, these are the rules for *being dispatched*.
 
 ```json
@@ -557,6 +559,8 @@ agents:
       - deploy_debug
     risky_capabilities:     # high-risk labels, surfaced for visibility
       - restart_services
+    # skills: false         # no skill/command listing at startup (cheaper dispatches)
+    # strict_mcp: true      # load only this directory's .mcp.json, no user-scope MCP servers
     # instructions: |       # standing orders, appended to the system prompt on every dispatch
     #   Read-only: never restart or redeploy unless the task says so.
     #   Quote exact log lines with timestamps.
@@ -746,7 +750,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model (including the `bypassP
 |---------|-------------|
 | `agent-dispatch init` | Create config + register MCP server with Claude Code |
 | `agent-dispatch add <name> <dir>` | Add an agent (auto-generates description) |
-| `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, `--instructions`, etc.) |
+| `agent-dispatch update <name>` | Update agent config (permissions, timeout, model, `--instructions`, `--no-skills`, `--strict-mcp`, etc.) |
 | `agent-dispatch remove <name>` | Remove an agent |
 | `agent-dispatch list` | List agents with health status and permissions |
 | `agent-dispatch group <add\|list\|inspect\|update\|remove>` | Manage [groups](#groups) — cross-project working sets of agents |
