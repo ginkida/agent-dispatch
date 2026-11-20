@@ -293,7 +293,8 @@ def _get_dispatch_limiter(config: DispatchConfig) -> DispatchLimiter:
 
 
 async def _start_guarded(
-    config: DispatchConfig, work: Callable[[], DispatchResult],
+    config: DispatchConfig,
+    work: Callable[[], DispatchResult],
 ) -> asyncio.Future[DispatchResult]:
     """Submit work with a reservation owned by the worker's completion future."""
     limiter = _get_dispatch_limiter(config)
@@ -1999,8 +2000,7 @@ def _run_owned_job(
             job = store.get(job_id)
             if job is None:
                 logger.warning(
-                    "Async job %s: record unreadable at spawn; leaving its "
-                    "subprocess running",
+                    "Async job %s: record unreadable at spawn; leaving its subprocess running",
                     job_id,
                 )
             elif job.is_terminal():
@@ -2407,13 +2407,15 @@ async def dispatch_gc(
     store = _get_job_store()
     if dry_run:
         candidates = store.gc_candidates(max_age_seconds)
-        return _dumps({
-            "dry_run": True,
-            "purged": 0,
-            "would_purge": len(candidates),
-            "job_ids": [job.id for job in candidates],
-            "max_age_days": max_age_days,
-        })
+        return _dumps(
+            {
+                "dry_run": True,
+                "purged": 0,
+                "would_purge": len(candidates),
+                "job_ids": [job.id for job in candidates],
+                "max_age_days": max_age_days,
+            }
+        )
     purged = store.gc(max_age_seconds=max_age_seconds)
     if ctx:
         await ctx.info(f"Purged {purged} terminal jobs older than {max_age_days}d")
