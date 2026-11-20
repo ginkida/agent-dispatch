@@ -1310,6 +1310,35 @@ class TestDispatchAsync:
             assert not any(t.name == beat for t in threading.enumerate())
 
     @pytest.mark.asyncio
+    async def test_the_heartbeat_does_not_outlive_the_dispatch_deadline(self, tmp_path):
+        # A worker stuck past its own timeout must come to look abandoned.
+        config = _make_config(tmp_path)
+        started, release = threading.Event(), threading.Event()
+
+        def stuck(name, task, agent_config, settings, context=None, on_progress=None, **kw):
+            started.set()
+            release.wait(5)
+            return _ok_dispatch_result("infra")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server, "_JOB_HEARTBEAT_INTERVAL", 0.01),
+            patch.object(server, "_JOB_HEARTBEAT_GRACE", -1e9),  # deadline already passed
+            patch.object(server.runner, "dispatch_stream", side_effect=stuck),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "long"))["job_id"]
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                path = server._get_job_store().directory / f"{job_id}.json"
+                old = time.time() - 7200
+                os.utime(path, (old, old))
+                await asyncio.sleep(0.15)  # fifteen intervals
+                assert path.stat().st_mtime < old + 1
+            finally:
+                release.set()
+            await _wait_terminal(job_id)
+
+    @pytest.mark.asyncio
     async def test_resume_can_retry_after_worker_thread_fails_to_start(self, tmp_path):
         config = _make_config(tmp_path)
         result = _ok_dispatch_result("infra")

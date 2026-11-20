@@ -1446,7 +1446,7 @@ def dispatch(
                 agent=agent_name,
                 success=False,
                 result="",
-                error=f"Could not start claude: {e}",
+                error=f"Could not run claude: {e}",
                 error_type="cli_error",
             )
         # Self-heal on old claude CLIs that don't know --session-id: strip the
@@ -1697,7 +1697,7 @@ def dispatch_stream(
             agent=agent_name,
             success=False,
             result="",
-            error=f"Could not start claude: {e}",
+            error=f"Could not run claude: {e}",
             error_type="cli_error",
         )
 

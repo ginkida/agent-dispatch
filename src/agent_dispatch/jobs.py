@@ -223,11 +223,20 @@ class JobStore:
                         age = now - (existing.started_at or existing.created_at)
                         raise ActiveSessionJobError(existing, age)
                 for old in expired:
-                    self.fail(
+                    age = now - old.created_at
+                    retired = self.fail(
                         old.id,
-                        f"Abandoned in 'pending' for {now - old.created_at:.0f}s — "
+                        f"Abandoned in 'pending' for {age:.0f}s — "
                         f"job {job.id} took over its session.",
                     )
+                    # fail() also returns None when it could not READ the
+                    # record. Publishing the replacement then would leave the
+                    # old job runnable beside it, so only a job positively
+                    # seen terminal gives up the session.
+                    if retired is None:
+                        current = self.get(old.id)
+                        if current is None or not current.is_terminal():
+                            raise ActiveSessionJobError(old, age)
             self._write(job)
         return job
 

@@ -847,6 +847,19 @@ class TestSessionReservation:
             assert store.get(job.id).status == "failed"
             assert store.mark_running(job.id) is None
 
+    def test_an_expired_job_that_cannot_be_retired_still_holds_the_session(self, store: JobStore):
+        # fail() returns None for an unreadable record as well as a terminal
+        # one. Replacing the job anyway would leave both runnable.
+        job = store.create("infra", "queued", resume_session_id="s1")
+        job.created_at = time.time() - 25 * 3600
+        store._write(job)
+        store.fail = lambda *a, **kw: None  # type: ignore[method-assign]
+
+        with pytest.raises(ActiveSessionJobError):
+            store.create("infra", "next", resume_session_id="s1")
+        assert [j.id for j in store.list()] == [job.id]
+        assert store.get(job.id).status == "pending"
+
     def test_the_check_and_the_write_are_one_critical_section(self, store: JobStore):
         # Every submitter arrives before any record exists. If the scan ran
         # outside the lock they would all see an empty directory and all

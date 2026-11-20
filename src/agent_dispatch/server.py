@@ -138,6 +138,7 @@ _MAX_TIMEOUT_OVERRIDE = 7200  # seconds; ceiling for per-call timeout_seconds
 _JOB_PROGRESS_MAX_LINES = 20  # rolling tail kept in the job file
 _JOB_PROGRESS_WRITE_INTERVAL = 1.0  # seconds between progress file writes
 _JOB_HEARTBEAT_INTERVAL = 60.0  # seconds between liveness touches of a running job's file
+_JOB_HEARTBEAT_GRACE = 300.0  # the heartbeat outlives the dispatch timeout by this much, no more
 
 
 class ConfigLoadError(RuntimeError):
@@ -2010,12 +2011,20 @@ def _run_owned_job(
                 runner._kill_process_tree(proc)
 
     # Liveness is independent of progress: see JobStore.touch. The thread
-    # lives exactly as long as the dispatch below; if it cannot start the job
-    # still runs, it is merely as exposed as before to a quiet hour.
+    # lives as long as the dispatch below — and no longer than the dispatch is
+    # allowed to: a worker stuck after its own deadline (a blocked write on a
+    # dead mount, say) must come to look abandoned, not hold its session
+    # forever. If the thread cannot start the job still runs, merely as
+    # exposed as before to a quiet hour.
     stop_heartbeat = threading.Event()
+    heartbeat_until = (
+        time.monotonic() + (agent_config.timeout or settings.default_timeout) + _JOB_HEARTBEAT_GRACE
+    )
 
     def heartbeat() -> None:
-        while not stop_heartbeat.wait(_JOB_HEARTBEAT_INTERVAL):
+        while (
+            not stop_heartbeat.wait(_JOB_HEARTBEAT_INTERVAL) and time.monotonic() < heartbeat_until
+        ):
             store.touch(job_id)
 
     try:
