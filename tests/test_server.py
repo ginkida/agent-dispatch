@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -1187,6 +1188,102 @@ async def _wait_terminal(job_id: str, timeout: float = 2.0):
 
 class TestDispatchAsync:
     @pytest.mark.asyncio
+    async def test_resume_rejects_pending_and_running_job_then_allows_next_turn(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.settings.max_concurrency = 1
+        limiter = server._get_dispatch_limiter(config)
+        started = threading.Event()
+        release = threading.Event()
+
+        def stream(name, task, *args, session_id=None, **kwargs):
+            started.set()
+            release.wait(5)
+            return _ok_dispatch_result(name, task, session_id=session_id)
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=stream) as runner,
+        ):
+            with limiter:
+                first = json.loads(await server.dispatch_async("infra", "first", session_id="s1"))
+                job_id = first["job_id"]
+                assert server._get_job_store().get(job_id).status == "pending"
+                pending = json.loads(
+                    await server.dispatch_async("infra", "second", session_id="s1")
+                )
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                other_store = server.JobStore(server._get_job_store().directory)
+                assert other_store.get(job_id).status == "running"
+                with patch.object(server, "_job_store", other_store):
+                    running = json.loads(
+                        await server.dispatch_async("infra", "second", session_id="s1")
+                    )
+            finally:
+                release.set()
+                await _wait_terminal(job_id)
+
+            for status, conflict in (("pending", pending), ("running", running)):
+                assert conflict.keys() == {"error", "active_job_id"}
+                assert conflict["active_job_id"] == job_id
+                assert status in conflict["error"]
+                assert "or use dispatch_session" in conflict["error"]
+            assert len(server._get_job_store().list()) == 1
+            assert runner.call_count == 1
+
+            second = json.loads(await server.dispatch_async("infra", "second", session_id="s1"))
+            assert second["job_id"] != job_id
+            finished = json.loads(await server.dispatch_wait(second["job_id"]))
+            assert finished["result"]["session_id"] == "s1"
+            assert finished["result"]["result"] == "second"
+
+    @pytest.mark.asyncio
+    async def test_resume_ignores_stale_running_job_but_respects_recent_progress(self, tmp_path):
+        config = _make_config(tmp_path)
+        store = server._get_job_store()
+        previous = store.create("infra", "first", resume_session_id="s1")
+        running = store.mark_running(previous.id)
+        running.started_at = time.time() - 4000
+        store._write(running)
+        path = store.directory / f"{running.id}.json"
+
+        result = _ok_dispatch_result("infra", session_id="s1")
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", return_value=result) as stream,
+        ):
+            conflict = json.loads(await server.dispatch_async("infra", "next", session_id="s1"))
+            assert "error" in conflict
+            stream.assert_not_called()
+
+            os.utime(path, (running.started_at, running.started_at))
+            resumed = json.loads(await server.dispatch_async("infra", "next", session_id="s1"))
+            assert "error" not in resumed
+            assert resumed["job_id"] != previous.id
+            assert (await _wait_terminal(resumed["job_id"])).status == "done"
+            stream.assert_called_once()
+        assert "running" in conflict["error"]
+        assert int(conflict["error"].split("age ", 1)[1].split("s", 1)[0]) >= 4000
+
+    @pytest.mark.asyncio
+    async def test_resume_can_retry_after_worker_thread_fails_to_start(self, tmp_path):
+        config = _make_config(tmp_path)
+        result = _ok_dispatch_result("infra")
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", return_value=result),
+        ):
+            with patch.object(threading.Thread, "start", side_effect=RuntimeError("no threads")):
+                failed = json.loads(await server.dispatch_async("infra", "task", session_id="s1"))
+            assert "no threads" in failed["error"]
+            status = json.loads(await server.dispatch_status(failed["job_id"]))
+            assert status["status"] == "failed"
+
+            retried = json.loads(await server.dispatch_async("infra", "task", session_id="s1"))
+            assert retried["job_id"] != failed["job_id"]
+            assert (await _wait_terminal(retried["job_id"])).status == "done"
+
+    @pytest.mark.asyncio
     async def test_dispatch_async_returns_job_id(self, tmp_path: Path):
         config = _make_config(tmp_path)
 
@@ -1259,6 +1356,124 @@ class TestDispatchAsync:
 
 
 class TestDispatchStatusWait:
+    @pytest.mark.asyncio
+    async def test_wait_can_resume_after_timeout_and_returns_the_same_compact_ref_as_status(
+        self, tmp_path
+    ):
+        config = _make_config(tmp_path)
+        started = threading.Event()
+        release = threading.Event()
+        task_prefix = "проверить\r\nлоги\n"
+        task = task_prefix + "x" * 200
+        preview = "проверить логи " + "x" * (120 - len(task_prefix))
+        answer = "длинный ответ " * 200
+
+        def stream(name, task, *args, **kwargs):
+            started.set()
+            release.wait(5)
+            return _ok_dispatch_result(name, answer, session_id="new-session")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", side_effect=stream) as runner,
+        ):
+            started_job = json.loads(await server.dispatch_async("infra", task, return_ref=True))
+            job_id = started_job["job_id"]
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                status = json.loads(await server.dispatch_status(job_id))
+                waited = json.loads(await server.dispatch_wait(job_id, timeout_seconds=1))
+                assert waited.pop("timed_out_waiting") is True
+                assert waited == status
+                assert waited["status"] == "running"
+                assert waited["task_preview"] == preview
+                assert "task" not in waited and "result" not in waited
+            finally:
+                release.set()
+                await _wait_terminal(job_id)
+
+            waited = json.loads(await server.dispatch_wait(job_id, timeout_seconds=2))
+            assert waited == json.loads(await server.dispatch_status(job_id))
+            assert waited["status"] == "done"
+            assert waited["task_preview"] == preview and "task" not in waited
+            assert waited["result"]["ref"] == job_id
+            assert waited["result"]["summary"] == answer[:500]
+            assert waited["result"]["session_id"] == "new-session"
+            assert "result" not in waited["result"]
+            full = json.loads(await server.fetch_result(waited["result"]["ref"]))
+            assert full["result"] == answer
+            assert full["session_id"] == "new-session"
+            path = server._get_job_store().directory / f"{job_id}.json"
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            assert stored["task"] == task and stored["result"] == full
+            assert runner.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_ref_requested_for_failure_keeps_the_error(self, tmp_path):
+        config = _make_config(tmp_path)
+        result = DispatchResult(
+            agent="infra",
+            success=False,
+            result="diagnostic",
+            session_id="s1",
+            error="permission denied",
+            error_type="permission",
+        )
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch_stream", return_value=result),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "task", return_ref=True))[
+                "job_id"
+            ]
+            waited = json.loads(await server.dispatch_wait(job_id))
+        assert waited == json.loads(await server.dispatch_status(job_id))
+        assert waited["status"] == "failed"
+        assert waited["error"] == result.error
+        assert waited["result"] == result.model_dump(exclude_none=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("context", ["", "Shared context\r\nCaller facts\n" + "x" * 200])
+    async def test_old_job_keeps_history_and_full_task_outside_mcp_polling(self, context):
+        from click.testing import CliRunner
+
+        from agent_dispatch.cli import cli
+
+        job_id = "a" * 32
+        task = "legacy task\n" + "x" * 200
+        result = _ok_dispatch_result("infra", "full answer", session_id="legacy-session")
+        stored = {
+            "id": job_id,
+            "agent": "infra",
+            "task": task,
+            "status": "done",
+            "context": context,
+            "created_at": 1,
+            "completed_at": 2,
+            "result": result.model_dump(exclude_none=True),
+        }
+        path = server._get_job_store().directory / f"{job_id}.json"
+        path.write_text(json.dumps(stored), encoding="utf-8")
+        before = path.read_bytes()
+
+        expected = dict(stored)
+        del expected["task"]
+        del expected["context"]
+        expected["task_preview"] = task[:120].replace("\n", " ")
+        if context:
+            expected["context_preview"] = " ".join(context[:120].splitlines())
+        assert json.loads(await server.dispatch_status(job_id)) == expected
+        assert json.loads(await server.dispatch_wait(job_id)) == expected
+        mcp_list = json.loads(await server.dispatch_jobs())
+        assert mcp_list[0]["task"] == task[:120]
+        exported = CliRunner().invoke(cli, ["job", job_id, "--json"])
+        assert exported.exit_code == 0, exported.output
+        assert json.loads(exported.output) == stored
+        listed = CliRunner().invoke(cli, ["jobs", "--json"])
+        assert listed.exit_code == 0, listed.output
+        assert json.loads(listed.output) == mcp_list
+        assert path.read_bytes() == before
+
     @pytest.mark.asyncio
     async def test_dispatch_status_returns_job(self, tmp_path: Path):
         config = _make_config(tmp_path)
@@ -1729,6 +1944,25 @@ class TestStructuredResponseMCP:
 
 
 class TestReturnRef:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending", "running", "failed"])
+    async def test_fetch_result_without_result_uses_polling_view(self, status):
+        store = server._get_job_store()
+        task = "task " * 40
+        context = "context\r\n" + "facts " * 40
+        job = store.create("infra", task, context=context, resume_session_id="s1", return_ref=True)
+        if status == "running":
+            store.mark_running(job.id)
+        if status == "failed":
+            store.fail(job.id, "worker could not start")
+
+        payload = json.loads(await server.fetch_result(job.id))
+        assert payload == json.loads(await server.dispatch_status(job.id))
+        assert payload["status"] == status
+        assert payload["task_preview"] == task[:120]
+        assert payload["context_preview"] == context[:120].replace("\r\n", " ")
+        assert {"task", "context", "return_ref", "resume_session_id"}.isdisjoint(payload)
+
     @pytest.mark.parametrize("return_ref", [False, True])
     async def test_token_usage_stays_out_of_live_and_cached_payloads(self, tmp_path, return_ref):
         from agent_dispatch import usage
@@ -2938,6 +3172,81 @@ class TestGroups:
         m = data["members"][0]
         assert m["unknown"] is True
         assert "directory" not in m  # never touched config.agents[gone]
+
+    @pytest.mark.asyncio
+    async def test_async_and_session_share_group_context_and_async_bypasses_cache(self, tmp_path):
+        from mcp.shared.memory import create_connected_server_and_client_session
+
+        config = self._cfg(tmp_path)
+        group = next(iter(config.groups))
+        agent = config.groups[group].members[0].agent
+        result = _ok_dispatch_result(agent, session_id="s1")
+        async with create_connected_server_and_client_session(server.mcp) as client:
+            with (
+                patch.object(server, "_get_config", return_value=config),
+                patch.object(server.runner, "dispatch", return_value=result) as dispatch,
+                patch.object(server.runner, "dispatch_stream", return_value=result) as stream,
+            ):
+                arguments = {"agent": agent, "task": "task", "context": "extra", "group": group}
+                first = await client.call_tool("dispatch", arguments)
+                assert not first.isError
+                baseline = dispatch.call_args.args[4]
+                assert baseline.index(config.groups[group].shared_context) < baseline.index("extra")
+
+                arguments["session_id"] = "s1"
+                follow_up = await client.call_tool("dispatch_session", arguments)
+                assert not follow_up.isError
+                assert dispatch.call_args.args[4:6] == (baseline, "s1")
+
+                with patch.object(server, "_get_cache", side_effect=AssertionError("cache used")):
+                    for _ in range(2):
+                        response = await client.call_tool("dispatch_async", arguments)
+                        assert not response.isError
+                        job_id = json.loads(response.content[0].text)["job_id"]
+                        job = await _wait_terminal(job_id)
+                        assert job.context == baseline
+                        assert stream.call_args.args[4] == baseline
+                        assert stream.call_args.kwargs["session_id"] == "s1"
+                        polled = await client.call_tool("dispatch_status", {"job_id": job_id})
+                        view = json.loads(polled.content[0].text)
+                        assert view["context_preview"] == " ".join(baseline[:120].splitlines())
+                        assert "context" not in view
+                assert stream.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", [server.dispatch_async, server.dispatch_session])
+    @pytest.mark.parametrize(
+        ("group", "message"), [("missing", "Unknown group"), ("shop", "not a member")]
+    )
+    async def test_async_and_session_reject_invalid_group_before_dispatch(
+        self, tmp_path, tool, group, message
+    ):
+        config = self._cfg(tmp_path)
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server.runner, "dispatch") as dispatch,
+            patch.object(server.runner, "dispatch_stream") as stream,
+        ):
+            raw = await tool("monitoring", "task", group=group)
+        assert message in json.loads(raw)["error"]
+        assert server._get_job_store().list() == []
+        dispatch.assert_not_called()
+        stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mcp_async_session_and_wait_schemas_match_instructions(self):
+        tools = {
+            tool.name: tool.inputSchema["properties"] for tool in await server.mcp.list_tools()
+        }
+        assert {"group", "session_id", "return_ref"} <= tools["dispatch_async"].keys()
+        assert "group" in tools["dispatch_session"]
+        assert "timeout_seconds" in tools["dispatch_wait"]
+        assert {"group", "session_id", "return_ref"}.isdisjoint(tools["dispatch_stream"])
+        instructions = server.mcp.instructions
+        assert "dispatch_wait(job_id, timeout_seconds" in instructions
+        assert "dispatch_async(agent, task, group" in instructions
+        assert "dispatch_session(agent, task, session_id?, group" in instructions
+        assert "active_job_id" in instructions
 
     @pytest.mark.asyncio
     async def test_dispatch_group_injects_shared_context(self, tmp_path: Path):

@@ -149,7 +149,7 @@ Members reference agents by name; membership is many-to-many (a shared gateway c
 
 **`inspect_group(name)`** — one group's full brief: `description`, the complete `shared_context`, and the member list. For a deep dive on a specific member, call `inspect_agent(member)` — `inspect_group` deliberately stays a cheap membership readout.
 
-**Using a group** — pass `group=` to `dispatch` (or per-item in `dispatch_parallel`). The agent must be a member; its group's `shared_context` rides along automatically:
+Pass `group=` to `dispatch`, `dispatch_session`, `dispatch_async`, or an item in `dispatch_parallel`. The agent must be a member of the group. The group’s `shared_context` goes before the caller’s context.
 
 ```python
 # From the shop-web codebase, hand the deploy to the infra gateway.
@@ -216,7 +216,7 @@ dispatch(
 }
 ```
 
-**`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `budget` (the `claude` CLI stopped the session at `max_budget_usd`), `usage_limit` (the Claude *account* hit its rate/session limit), `cli_error` (other failures). Permission, budget, usage-limit and timeout errors include an actionable hint.
+**`error_type` values:** `permission` (tool/action denied), `timeout`, `recursion` (dispatch depth exceeded), `not_found` (missing directory or CLI), `budget` (the `claude` CLI stopped the session at `max_budget_usd`), `usage_limit` (Claude reached a usage limit), `cli_error` (other failures). Permission, budget, usage-limit and timeout errors include an actionable hint.
 
 **Resumable timeouts:** every fresh dispatch pre-assigns a session UUID (`--session-id`), so a timed-out dispatch still returns a `session_id` — the partial transcript survives the kill. The timeout error spells out the recovery: resume with `dispatch_session(agent, "Continue where you left off", session_id=...)`, retry with a bigger `timeout_seconds`, or use `dispatch_async`.
 
@@ -300,6 +300,7 @@ Multi-turn: continue a conversation with an agent. First call starts a session, 
 | `caller` | string | no | Who is dispatching |
 | `goal` | string | no | Broader objective |
 | `timeout_seconds` | int | no | One-off timeout override (0 = agent default; clamped to 10–7200) |
+| `group` | string | no | Require group membership and prepend the group's `shared_context` to `context` |
 
 `dispatch_session` is also the **timeout recovery path**: a timed-out `dispatch` returns a `session_id` — pass it here with `task="Continue where you left off"` to salvage the partial work instead of restarting.
 
@@ -364,7 +365,7 @@ Disconnecting or cancelling the tool call discards pending notifications and
 stops buffering new ones. The worker still holds its concurrency slot until it
 finishes.
 
-Parameters are the same as `dispatch` except `return_ref`/`summary_chars` (streaming is incompatible with ref-mode) and `group` (group context injection is supported only on `dispatch` and per-item in `dispatch_parallel`).
+`dispatch_stream` accepts `agent`, `task`, `context`, `caller`, `goal`, `response_format`, and `timeout_seconds`.
 
 ### `dispatch_dialogue`
 
@@ -462,10 +463,17 @@ fetch_result(ref="8f3a...e1", max_chars=2000)  -> truncated, plus {"truncated": 
 ```
 
 Refs reuse the same storage as `dispatch_async` jobs (under `~/.config/agent-dispatch/jobs/`), so any `job_id` returned by `dispatch_async` is also a valid `ref` for `fetch_result`. `parsed_result` (when `response_format="json"` is set) is small and is always inlined directly in the ref response — no second fetch needed.
+If the job has yet to produce a result, `fetch_result` returns the same snapshot as `dispatch_status`.
 
 ### Async dispatch — `dispatch_async`, `dispatch_status`, `dispatch_wait`, `dispatch_cancel`, `dispatch_jobs`, `dispatch_gc`
 
-When a dispatched task is going to take a while, you don't want to block your own tool slot for minutes. Async dispatch returns a `job_id` immediately and lets you check back when you're ready.
+Async dispatch returns a `job_id` immediately. It accepts `agent`, `task`, `context`, `caller`, `goal`, `response_format`, and `timeout_seconds`, plus the following optional parameters. Async results bypass the result cache.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `group` | string | `""` | Require group membership and prepend the group's `shared_context` to `context`. An unknown group or non-member is rejected before creating a job. |
+| `session_id` | string | `""` | Continue an existing session for the same agent. A conflict returns `error` and `active_job_id`. The error gives the job's status and age and points to `dispatch_session`. |
+| `return_ref` | bool | `False` | On success, `dispatch_status` and `dispatch_wait` return `result.ref` and `result.summary` in place of `result.result`. Call `fetch_result(ref)` for the full text. Failed jobs retain their error and result. |
 
 ```
 // 1. fire and forget (timeout_seconds= works here too for known-long tasks)
@@ -475,16 +483,22 @@ dispatch_async(agent="infra", task="audit every container log for OOM kills toda
 // 2. do other work, then check progress (non-blocking)
 //    `progress` is a rolling tail of what the agent is doing right now
 dispatch_status(job_id="8f3a...e1")
-  -> {"id": "8f3a...e1", "status": "running", "started_at": 1730000123.4,
+  -> {"id": "8f3a...e1", "status": "running", "task_preview": "audit every container log...",
+      "started_at": 1730000123.4,
       "progress": ["Using tool: Bash", "Scanning container logs for OOM events..."], ...}
 
 // 3. or block until done (timeout_seconds default: 60, capped at 3600)
 dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
-  -> {"id": "8f3a...e1", "status": "done", "result": {"agent": "infra", "success": true, ...}}
+  -> {"id": "8f3a...e1", "status": "done",
+      "result": {"agent": "infra", "success": true, "session_id": "sess-abc", ...}}
 
-// If the timeout fires, the job keeps running:
+// If the timeout fires, the job keeps running. Call dispatch_wait again with the same job_id.
   -> {"id": "...", "status": "running", "timed_out_waiting": true}
 ```
+
+Both polling tools show one-line previews of the first 120 characters as `task_preview` and, when a context was supplied or added by a group, `context_preview`. The job file and `agent-dispatch job <id> --json` retain the complete task and context. Use the completed job's `result.session_id` for a follow-up with `dispatch_async` or `dispatch_session`.
+
+Async continuation skips a stale running job when its start time and last file update are both at least an hour old.
 
 `dispatch_cancel(job_id)` cancels a **pending** job, and also kills a **running** job's `claude` process group when the job was started by the same server instance (the job is marked `cancelled` first, so the worker's trailing write can't undo it; partial work is lost but the progress tail is preserved). On POSIX, descendants in that process group are killed too, releasing inherited pipes and the concurrency slot. A cancel that lands after the job was claimed but before its process spawned is honored too: the process is killed as soon as it starts. A compatibility retry that races cancellation is killed when it registers. A running job started by a *previous* server run can't be killed safely and is left to finish. The response carries an `outcome` of `cancelled`, `cancelled_running`, `running` (not owned by this server), `already_terminal`, or `not_found`.
 
@@ -528,7 +542,7 @@ Failures are deterministic: check `success`, then branch on `error_type`.
 | `not_found` | Agent directory or `claude` CLI missing | `list_agents()` → check `healthy`. Re-add the agent with an existing path, or run `agent-dispatch doctor` to find what's missing. |
 | `recursion` | Dispatch nesting exceeded `max_dispatch_depth` (default 3) | Don't dispatch from dispatched agents; if the nesting is intentional, raise `max_dispatch_depth` in settings. |
 | `budget` | The `claude` CLI ended the session at the `max_budget_usd` spend cap — the answer is incomplete | Raise the cap (`update_agent(name, max_budget_usd=2.0)`), switch to a cheaper `model`, or split the task. The partial session is resumable: `dispatch_session(agent, "Continue where you left off", session_id=<from the result>)`. |
-| `usage_limit` | The Claude **account** hit its usage/rate limit — not this agent, and nothing was billed | Wait for the reset named in the `error` text. Dispatching a *different* agent is not a workaround: every agent runs on the same account. If it recurs under load, lower `settings.max_concurrency`. |
+| `usage_limit` | Claude reached a usage limit, including model-specific limits and time windows | Wait for the reset before retrying. The `hint` and `error` include the model or period and reset time when Claude reports them. If this recurs under load, lower `settings.max_concurrency`. |
 | `cli_error` | Anything else from the `claude` subprocess | Read the `error` text; run `agent-dispatch doctor` for environment issues; retry once if transient. |
 
 Three soft signals that arrive with `success: true`:

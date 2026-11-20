@@ -982,6 +982,27 @@ class TestDispatchStream:
         self.agent = AgentConfig(directory="/tmp", description="test", timeout=10)
         self.settings = Settings()
 
+    @pytest.mark.parametrize("is_error", [False, True])
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner.subprocess.Popen")
+    def test_resume_uses_only_resume_flag_and_accounts_for_this_turn(
+        self, mock_popen, _which, is_error
+    ):
+        usage.record("infra", ok=True, cost_usd=0.4, session_id="s1")
+        event = {"type": "result", "is_error": is_error, "result": "answer", "total_cost_usd": 0.5}
+        mock_popen.return_value = _FakePopen([json.dumps(event)])
+
+        result = dispatch_stream("infra", "follow-up", self.agent, self.settings, session_id="s1")
+
+        cmd = mock_popen.call_args.args[0]
+        assert cmd[cmd.index("--resume") + 1] == "s1"
+        assert "--session-id" not in cmd
+        assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+        assert result.success is not is_error
+        assert result.session_id == "s1"  # CLI did not supply it.
+        assert result.cost_usd == pytest.approx(0.1)
+        assert usage.session_total("s1") == pytest.approx(0.5)
+
     @pytest.mark.parametrize("event", [
         None, [], 42, "noise",
         {"type": "assistant", "message": None},
@@ -2999,9 +3020,87 @@ class TestUsageLimitClassification:
     def test_a_permission_error_is_still_a_permission_error(self):
         assert _classify_error("permission denied for tool Bash") == "permission"
 
+    @pytest.mark.parametrize(
+        ("output", "message", "scope", "reset"),
+        [
+            ("stderr", "You've hit your Fable limit · resets 3pm", "Fable", "3pm"),
+            ("plain", "You've hit your weekly limit", "weekly", None),
+            ("json", "You've hit your Opus 4 limit · resets at 3pm", "Opus 4", "3pm"),
+            ("stream_stderr", "Weekly limit reached", "weekly", None),
+            (
+                "stream_json",
+                "You've hit your Fable 5 limit · resets Nov 24, 3pm",
+                "Fable 5",
+                "Nov 24, 3pm",
+            ),
+            ("plain", "5-hour limit reached ∙ resets 3pm", "5-hour", "3pm"),
+            (
+                "stderr",
+                "You've hit your limit · resets 3pm (Asia/Almaty)",
+                "usage",
+                "3pm (Asia/Almaty)",
+            ),
+            ("json", "You've hit your Claude Opus 4 limit", "Claude Opus 4", None),
+            ("stream_json", "Usage limit reached", "usage", None),
+        ],
+    )
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    def test_limit_errors_include_retry_hint_and_are_journaled(
+        self, _which, output, message, scope, reset
+    ):
+        payload = json.dumps({"type": "result", "is_error": True, "errors": [message]})
+        if output.startswith("stream"):
+            lines = [payload] if output == "stream_json" else []
+            fake = _FakePopenWithStderr(lines, returncode=1, stderr_text="" if lines else message)
+            with patch("agent_dispatch.runner.subprocess.Popen", return_value=fake):
+                result = dispatch_stream("infra", "test", self.agent, self.settings)
+        else:
+            stdout = {"json": payload, "plain": message}.get(output, "")
+            captured = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=stdout,
+                stderr=message if output == "stderr" else "",
+            )
+            with patch("agent_dispatch.runner._run_captured", return_value=captured):
+                result = dispatch("infra", "test", self.agent, self.settings)
+
+        assert not result.success
+        assert result.error_type == "usage_limit"
+        assert f"{scope} limit is exhausted" in result.hint
+        assert "Wait for the reset before retrying" in result.hint
+        assert "settings.max_concurrency" in result.hint
+        assert "every agent" not in result.hint.lower()
+        if reset:
+            assert f"It resets {reset}." in result.hint
+        assert message in result.error
+        rows = usage.load()
+        assert len(rows) == 1
+        assert rows[0]["err"] == result.error_type
+
+    @pytest.mark.parametrize("is_error", [False, True])
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner._run_captured")
-    def test_the_hint_names_the_reset_and_the_account_wide_scope(self, mock_run, _which):
+    def test_tool_api_rate_limit_in_agent_result_is_not_a_claude_limit(
+        self, mock_run, _which, is_error
+    ):
+        message = "rate limit exceeded for tool X"
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=int(is_error),
+            stdout=json.dumps({"type": "result", "is_error": is_error, "result": message}),
+            stderr="",
+        )
+        result = dispatch("infra", "hello", self.agent, self.settings)
+        assert result.success is not is_error
+        assert result.result == message
+        assert result.error_type == ("cli_error" if is_error else None)
+        assert result.hint is None
+        assert usage.load()[0].get("err") == result.error_type
+
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    @patch("agent_dispatch.runner._run_captured")
+    def test_the_hint_names_the_reset_and_session_scope(self, mock_run, _which):
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=1,
@@ -3011,9 +3110,8 @@ class TestUsageLimitClassification:
         result = dispatch("infra", "hello", self.agent, self.settings)
         assert result.error_type == "usage_limit"
         assert "resets 6pm" in result.error
-        assert "ACCOUNT" in result.error
-        # The actionable part: another agent is not a workaround.
-        assert "different agent" in result.error
+        assert "session limit is exhausted" in result.hint
+        assert "settings.max_concurrency" in result.hint
 
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
@@ -3023,7 +3121,7 @@ class TestUsageLimitClassification:
         )
         result = dispatch_stream("infra", "go", self.agent, self.settings)
         assert result.error_type == "usage_limit"
-        assert "ACCOUNT" in result.error
+        assert "session limit is exhausted" in result.hint
 
 
 class TestTimeoutSuggestion:

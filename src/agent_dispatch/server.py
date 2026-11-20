@@ -30,7 +30,7 @@ from .config import (
     load_config,
     save_config,
 )
-from .jobs import JobStore, default_jobs_dir, is_valid_job_id
+from .jobs import ActiveSessionJobError, Job, JobStore, default_jobs_dir, is_valid_job_id
 from .models import (
     AgentConfig,
     DispatchConfig,
@@ -55,7 +55,7 @@ mcp = FastMCP(
         "1. list_agents() — see who's available and what they can do\n"
         "2. inspect_agent(name) — cheap detailed lookup (MCP, stack, CLAUDE.md preview)\n"
         "3. dispatch(agent, task) — one-shot delegation (cached)\n"
-        "4. dispatch_session(agent, task, session_id?) — multi-turn conversation. "
+        "4. dispatch_session(agent, task, session_id?, group?) — multi-turn conversation. "
         "For a follow-up to an agent you dispatched within the last hour, pass the "
         "session_id from its result here instead of a fresh dispatch: the agent keeps "
         "its findings and its startup context is already cached (several times cheaper)\n"
@@ -75,7 +75,8 @@ mcp = FastMCP(
         "- inspect_group(name) — the group's brief + members + shared facts\n"
         "- dispatch(agent, task, group=name) — agent must be a member; the "
         "group's shared_context (stack names, ids, conventions) is auto-prepended "
-        "to your context. Works on dispatch and per-item in dispatch_parallel.\n\n"
+        "to your context. Works on dispatch, dispatch_session, dispatch_async, and "
+        "per item in dispatch_parallel.\n\n"
         "TIMEOUTS: pass timeout_seconds= per call for known-long tasks (no config "
         "edit needed). If a dispatch times out anyway, the error includes a "
         "session_id — resume the partial work via dispatch_session(agent, "
@@ -85,13 +86,19 @@ mcp = FastMCP(
         "incomplete. Grant access via update_agent(allowed_tools=...) or "
         "permission_mode='bypassPermissions', then re-dispatch.\n\n"
         "ASYNC DISPATCH (don't block on long tasks):\n"
-        "- dispatch_async(agent, task) — fire-and-forget, returns job_id\n"
-        "- dispatch_status(job_id) — check state + live progress tail, non-blocking\n"
-        "- dispatch_wait(job_id, timeout?) — block until done (or timeout)\n"
+        "- dispatch_async(agent, task, group?, session_id?, return_ref?) — "
+        "start a background job and return job_id. A pending or running job for the supplied "
+        "session_id is reported as an error with active_job_id.\n"
+        "- dispatch_status(job_id) — check state, task and context previews, and progress\n"
+        "- dispatch_wait(job_id, timeout_seconds?) — wait for completion. "
+        "A wait timeout leaves the job running so you can wait again.\n"
         "- dispatch_cancel(job_id) — cancel a pending job, or kill a running one\n"
         "- dispatch_jobs(status?) — list recent async jobs\n\n"
         "SAVING CONTEXT for big results:\n"
         "- dispatch(..., return_ref=True) — returns just ref+summary, not full text\n"
+        "- dispatch_async(..., return_ref=True) — a successful job's result in "
+        "dispatch_status and dispatch_wait contains ref, summary, and the agent's session_id "
+        "when available\n"
         "- fetch_result(ref, max_chars?) — load the full text only when needed\n\n"
         "MANAGING AGENTS:\n"
         "- add_agent(name, directory) — register a project, auto-generates description\n"
@@ -124,7 +131,6 @@ _JOB_GC_MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 _DEFAULT_SUMMARY_CHARS = 500
 _MAX_SUMMARY_CHARS = 100_000  # upper bound for return_ref summaries
 _MAX_JOBS_LIMIT = 1000  # upper bound for dispatch_jobs pagination
-_STALE_RUNNING_SECONDS = 3600  # recover jobs stuck 'running' longer than this
 _MIN_TIMEOUT_OVERRIDE = 10  # seconds; floor for per-call timeout_seconds
 _MAX_TIMEOUT_OVERRIDE = 7200  # seconds; ceiling for per-call timeout_seconds
 _JOB_PROGRESS_MAX_LINES = 20  # rolling tail kept in the job file
@@ -478,6 +484,8 @@ def _validate_group_member(config: DispatchConfig, group: str, agent: str) -> st
     actual shared_context merge is a separate pure function (_merge_group_context)
     — this split keeps dispatch_parallel's up-front-rejection contract intact.
     """
+    if not group:
+        return None
     if err := _validate_group(config, group):
         return err
     members = [m.agent for m in config.groups[group].members]
@@ -510,7 +518,9 @@ def _merge_group_context(config: DispatchConfig, group: str, context: str | None
     different effective context and therefore a different key, while group=""
     leaves the context byte-identical to today (full backward compatibility).
     """
-    shared = config.groups[group].shared_context.strip() if group in config.groups else ""
+    if not group:
+        return context or None
+    shared = config.groups[group].shared_context.strip()
     ctx = (context or "").strip()
     if shared and ctx:
         return f"Shared context (group {group!r}):\n{shared}\n\n{ctx}"
@@ -904,14 +914,14 @@ async def dispatch(
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
-    if group and (err := _validate_group_member(config, group, agent)):
+    if err := _validate_group_member(config, group, agent):
         return err
 
     rf = response_format or None
     # Fold the group's shared facts into the context once, then reuse the same
     # string at every cache/runner/persist site below — store-under-merged /
     # fetch-under-raw would otherwise make every group dispatch a cache miss.
-    effective_context = _merge_group_context(config, group, context) if group else (context or None)
+    effective_context = _merge_group_context(config, group, context)
 
     # Check cache. caller/goal/response_format are part of the key because
     # they change the prompt sent to Claude and therefore the response.
@@ -1008,6 +1018,7 @@ async def dispatch_session(
     response_format: str = "",
     timeout_seconds: int = 0,
     ctx: Context | None = None,
+    group: str = "",
 ) -> str:
     """Multi-turn dispatch: continue a conversation with an agent.
 
@@ -1030,11 +1041,16 @@ async def dispatch_session(
         goal: The broader objective.
         timeout_seconds: One-off timeout override (0 = agent default;
             clamped to [10, 7200]).
+        group: Group name. The agent must be a member. Its shared_context
+            is prepended to the caller's context.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
+    if err := _validate_group_member(config, group, agent):
+        return err
 
+    effective_context = _merge_group_context(config, group, context)
     agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
     if ctx:
         turn = "new session" if not session_id else f"resuming {session_id[:12]}..."
@@ -1046,7 +1062,7 @@ async def dispatch_session(
         task,
         agent_config,
         config.settings,
-        context or None,
+        effective_context,
         session_id or None,
         caller=caller or None,
         goal=goal or None,
@@ -1944,7 +1960,8 @@ def _run_owned_job(
     """_run_job's body, run while the job is registered in _owned_jobs."""
     # mark_running refuses (returns None) if the job was cancelled while
     # queued — honor that and skip the dispatch entirely.
-    if store.mark_running(job_id) is None:
+    job = store.mark_running(job_id)
+    if job is None:
         logger.info("Async job %s skipped (cancelled or missing)", job_id)
         return
     logger.info("Async job %s running (agent=%s)", job_id, agent)
@@ -2001,6 +2018,7 @@ def _run_owned_job(
             goal=goal,
             response_format=response_format,
             on_proc=on_proc,
+            session_id=job.resume_session_id,
         )
         # Flush trailing progress lines the throttle skipped, so the
         # finished job's trace is complete.
@@ -2036,6 +2054,9 @@ async def dispatch_async(
     response_format: str = "",
     timeout_seconds: int = 0,
     ctx: Context | None = None,
+    group: str = "",
+    session_id: str = "",
+    return_ref: bool = False,
 ) -> str:
     """Start a dispatch in the background and return immediately with a job_id.
 
@@ -2056,19 +2077,33 @@ async def dispatch_async(
         timeout_seconds: One-off timeout override (0 = agent default;
             clamped to [10, 7200]). Prefer this over editing the agent
             config for known-long tasks.
+        group: Group name. The agent must be a member. Its shared_context
+            is prepended to the caller's context.
+        session_id: Continue an agent session. If a pending or running job
+            already uses this session, the error includes active_job_id.
+        return_ref: On success, status and wait return a ref and summary
+            in the job's result. Use fetch_result(ref) for the full text.
     """
     config = _get_config()
     if err := _validate_agent(config, agent):
         return err
+    if err := _validate_group_member(config, group, agent):
+        return err
 
+    effective_context = _merge_group_context(config, group, context)
     store = _get_job_store()
-    job = store.create(
-        agent,
-        task,
-        context=context or None,
-        caller=caller or None,
-        goal=goal or None,
-    )
+    try:
+        job = store.create(
+            agent,
+            task,
+            context=effective_context,
+            caller=caller or None,
+            goal=goal or None,
+            resume_session_id=session_id or None,
+            return_ref=return_ref,
+        )
+    except ActiveSessionJobError as e:
+        return _dumps({"error": str(e), "active_job_id": e.job_id})
 
     sem = _get_dispatch_limiter(config)
     agent_config = _apply_timeout(config.agents[agent], timeout_seconds)
@@ -2080,7 +2115,7 @@ async def dispatch_async(
             task,
             agent_config,
             config.settings,
-            context or None,
+            effective_context,
             caller or None,
             goal or None,
             response_format or None,
@@ -2089,7 +2124,12 @@ async def dispatch_async(
         daemon=True,
         name=f"dispatch-{job.id[:8]}",
     )
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError as e:
+        error = f"Could not start async worker: {e}"
+        store.fail(job.id, error)
+        return _dumps({"error": error, "job_id": job.id})
 
     if ctx:
         await ctx.info(f"Started async dispatch {job.id} to {agent}")
@@ -2100,6 +2140,29 @@ async def dispatch_async(
     )
 
 
+def _job_text_preview(text: str) -> str:
+    return " ".join(text[:120].splitlines())
+
+
+def _job_poll_payload(job: Job) -> dict:
+    """Build the MCP polling view of a job."""
+    payload = job.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude={"task", "context", "result", "resume_session_id", "return_ref"},
+    )
+    payload["task_preview"] = _job_text_preview(job.task)
+    if job.context:
+        payload["context_preview"] = _job_text_preview(job.context)
+    if job.result is not None:
+        payload["result"] = (
+            _ref_payload(job.id, job.result)
+            if job.return_ref and job.status == "done" and job.result.success
+            else job.result.model_dump(mode="json", exclude_none=True)
+        )
+    return payload
+
+
 @mcp.tool()
 @_io_guard
 async def dispatch_status(
@@ -2108,9 +2171,10 @@ async def dispatch_status(
 ) -> str:
     """Check the current state of an async job without blocking.
 
-    Returns the job record including status (pending/running/done/failed),
-    timestamps, a rolling tail of the agent's recent activity (``progress``)
-    while running, and the DispatchResult once complete.
+    Returns status, timestamps, one-line previews of the task and any context
+    (first 120 characters each), and the agent's activity (``progress``).
+    Once complete, the result includes the agent's session_id when available.
+    With return_ref=True, a successful result contains a ref and summary.
 
     Args:
         job_id: ID returned by dispatch_async.
@@ -2121,7 +2185,7 @@ async def dispatch_status(
     job = store.get(job_id)
     if job is None:
         return _dumps({"error": f"Job not found: {job_id}"})
-    return job.model_dump_json(indent=2, exclude_none=True)
+    return _dumps(_job_poll_payload(job), indent=2)
 
 
 @mcp.tool()
@@ -2152,9 +2216,9 @@ async def dispatch_wait(
         if job is None:
             return _dumps({"error": f"Job not found: {job_id}"})
         if job.is_terminal():
-            return job.model_dump_json(indent=2, exclude_none=True)
+            return _dumps(_job_poll_payload(job), indent=2)
         if time.monotonic() >= deadline:
-            d = json.loads(job.model_dump_json(exclude_none=True))
+            d = _job_poll_payload(job)
             d["timed_out_waiting"] = True
             if ctx:
                 await ctx.info(
@@ -2259,7 +2323,7 @@ async def dispatch_jobs(
     """List recent async jobs as summaries (most recent first).
 
     Each entry includes: id, agent, status, task (truncated), created_at,
-    completed_at, success (if terminal). Full record available via
+    completed_at, success (if terminal). Job details available via
     dispatch_status(job_id).
 
     Args:
@@ -2292,8 +2356,8 @@ async def fetch_result(
 ) -> str:
     """Fetch the full DispatchResult behind a ref returned by ``return_ref=True``.
 
-    Also works with job_ids returned by ``dispatch_async`` (the underlying
-    storage is the same).
+    Also accepts job_ids returned by ``dispatch_async``. Until there is a
+    DispatchResult, the response has the same shape as dispatch_status.
 
     Args:
         ref: The ref/job_id whose result you want.
@@ -2308,10 +2372,7 @@ async def fetch_result(
     if job is None:
         return _dumps({"error": f"Ref not found: {ref}"})
     if job.result is None:
-        # Not yet completed (e.g. async job still running) or failed before
-        # producing a DispatchResult. Return the job record so the caller
-        # can see the status.
-        return job.model_dump_json(indent=2, exclude_none=True)
+        return _dumps(_job_poll_payload(job), indent=2)
 
     payload = json.loads(job.result.model_dump_json(exclude_none=True))
     text = payload.get("result") or ""
@@ -2428,7 +2489,7 @@ def _startup_maintenance() -> None:
     # Recover jobs abandoned in 'running'/'pending' by a previous crashed or
     # killed server so callers don't poll them forever.
     try:
-        recovered = store.recover_stale(_STALE_RUNNING_SECONDS)
+        recovered = store.recover_stale()
         if recovered:
             logger.info("Recovered %d stale job(s) from a prior run", recovered)
     except OSError as e:

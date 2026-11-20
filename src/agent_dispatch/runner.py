@@ -207,33 +207,34 @@ def _parse_structured_response(text: str) -> object | None:
         return None
 
 
-# The account's own rate/usage limit, observed live 2026-09-09: three concurrent
-# dispatches came back with `You've hit your session limit · resets 6pm
-# (Asia/Almaty)`. It used to classify as a generic `cli_error`, which is the
-# least useful thing to tell a caller — the distinguishing facts are that the
-# limit is on the ACCOUNT (so every agent shares it, and a "try another agent"
-# retry fails identically) and that it clears at a stated time, so retrying
-# before then is pure waste.
+# Claude can report a usage limit for a model or for a time window.
 _USAGE_LIMIT_PATTERNS = [
-    "session limit",
     "usage limit",
-    "rate limit",
-    "rate_limit",
     "too many requests",
     "quota exceeded",
 ]
+_SCOPED_USAGE_LIMIT_RE = re.compile(
+    r"\bhit\s+your\s+(?:(?P<name>[\w-]+(?:\s+[\w-]+){0,2}?)\s+)?limit\b"
+    r"|\b(?P<period>session|hourly|daily|weekly|monthly|\d+-(?:hour|day|week|month))\s+limit\b",
+    re.IGNORECASE,
+)
+# A result can describe rate limiting from a tool's API.
+_RATE_LIMIT_RE = re.compile(r"rate[ _]limit(?!\s+(?:exceeded\s+)?for\s+tool\b)", re.IGNORECASE)
 _RESET_RE = re.compile(r"resets?\s+(?:at\s+)?([^\n.]{1,40})", re.IGNORECASE)
 
 
 def _usage_limit_hint(error_text: str) -> str:
-    """Actionable guidance for an account-wide usage limit."""
-    m = _RESET_RE.search(error_text or "")
-    when = f" It resets {m.group(1).strip()}." if m else ""
+    """Actionable guidance for a Claude usage limit."""
+    match = _SCOPED_USAGE_LIMIT_RE.search(error_text)
+    scope = "usage"
+    if match:
+        scope = match["name"] or (match["period"] or scope).lower()
+    reset = _RESET_RE.search(error_text)
+    when = f" It resets {reset.group(1).strip()}." if reset else ""
     return (
-        f"\n\nHint: this is the Claude ACCOUNT's usage limit, not this agent's.{when} "
-        "Every agent shares it, so dispatching a different agent (or retrying now) "
-        "fails the same way — wait for the reset, or reduce concurrent dispatches "
-        "(settings.max_concurrency). Nothing was billed for this call."
+        f"\n\nHint: Claude's {scope} limit is exhausted.{when} "
+        "Wait for the reset before retrying. If this recurs under load, "
+        "reduce concurrent dispatches (settings.max_concurrency)."
     )
 
 
@@ -258,11 +259,13 @@ def _classify_error(error_text: object) -> str:
     """
     text = str(error_text) if error_text else ""
     lower = text.lower()
-    # Checked before permissions: an account limit is a specific, actionable
-    # state, and "limit" text carries none of the permission vocabulary anyway.
-    for pattern in _USAGE_LIMIT_PATTERNS:
-        if pattern in lower:
-            return "usage_limit"
+    # Check for usage limits before the permission patterns.
+    if (
+        _SCOPED_USAGE_LIMIT_RE.search(text)
+        or _RATE_LIMIT_RE.search(text)
+        or any(pattern in lower for pattern in _USAGE_LIMIT_PATTERNS)
+    ):
+        return "usage_limit"
     for pattern in _PERMISSION_PATTERNS:
         if pattern in lower:
             return "permission"
@@ -270,17 +273,21 @@ def _classify_error(error_text: object) -> str:
 
 
 def _classification_hint(agent_name: str, error_type: str, error_text: str) -> str:
-    """The advisory that belongs to a text-classified error type ("" when none).
-
-    Declared once because four call sites classify an error and then attach its
-    hint; when `usage_limit` was added, three of the four would otherwise have
-    kept silently attaching nothing.
-    """
+    """The advisory appended to a text-classified error ("" when none)."""
     if error_type == "permission":
         return _permission_hint(agent_name)
     if error_type == "usage_limit":
         return _usage_limit_hint(error_text)
     return ""
+
+
+def _classify_failure(agent_name: str, error: str) -> tuple[str, str, str | None]:
+    error_type = _classify_error(error)
+    advisory = _classification_hint(agent_name, error_type, error)
+    # Keep the advisory in error for existing callers. A usage limit also
+    # exposes it as a hint so clients can act on it without parsing error text.
+    hint = advisory.removeprefix("\n\nHint: ") if error_type == "usage_limit" else None
+    return error_type, error + advisory, hint
 
 
 def _permission_hint(agent_name: str) -> str:
@@ -501,6 +508,19 @@ def _cli_reports_session_totals(claude_path: str) -> bool:
     return answer
 
 
+def _prior_session_total(
+    session_id: str | None, claude_path: str, settings: Settings
+) -> float | None:
+    """Read the cost baseline before spawning a resumed session."""
+    if (
+        session_id
+        and getattr(settings, "usage_log", True)
+        and _cli_reports_session_totals(claude_path)
+    ):
+        return usage.session_total(session_id)
+    return None
+
+
 def _call_cost(data: dict, prior_total: float | None) -> tuple[object, dict | None]:
     """``(cost of this call, journal telemetry)`` from a CLI result payload.
 
@@ -562,6 +582,7 @@ def _build_error_result(
 
     session_id = _session_id_from(data, session_fallback)
     budget_error = _is_budget_error(data)
+    hint = None
     if budget_error:
         error_type = "budget"
         error_text += _budget_error_hint(agent_name, _effective_budget(agent, settings), session_id)
@@ -570,8 +591,7 @@ def _build_error_result(
         error_type = "permission"
         error_text += _permission_hint(agent_name)
     else:
-        error_type = _classify_error(error_text)
-        error_text += _classification_hint(agent_name, error_type, error_text)
+        error_type, error_text, hint = _classify_failure(agent_name, error_text)
 
     cost_usd, telemetry = _call_cost(data, prior_total)
     return _apply_budget(
@@ -587,6 +607,7 @@ def _build_error_result(
             error=error_text,
             error_type=error_type,
             denied_tools=denied,
+            hint=hint,
             # The cap was hit by definition — flag it even if the reported cost
             # lands a hair under the budget after rounding.
             budget_exceeded=True if budget_error else None,
@@ -1315,13 +1336,7 @@ def dispatch(
     # A resumed session reports its cumulative cost; what it had cost before
     # this call is what turns that into the cost of the call (see _call_cost).
     # Read before the spawn: afterwards another process may have resumed it too.
-    prior_total = (
-        usage.session_total(session_id)
-        if session_id
-        and getattr(settings, "usage_log", True)
-        and _cli_reports_session_totals(claude_path)
-        else None
-    )
+    prior_total = _prior_session_total(session_id, claude_path, settings)
 
     timeout = agent.timeout or settings.default_timeout
     try:
@@ -1426,14 +1441,14 @@ def dispatch(
 
     if proc.returncode != 0 and not proc.stdout.strip():
         error_text = proc.stderr.strip() or f"claude exited with code {proc.returncode}"
-        error_type = _classify_error(error_text)
-        error_text += _classification_hint(agent_name, error_type, error_text)
+        error_type, error_text, hint = _classify_failure(agent_name, error_text)
         return DispatchResult(
             agent=agent_name,
             success=False,
             result="",
             error=error_text,
             error_type=error_type,
+            hint=hint,
         )
 
     # Parse JSON output
@@ -1467,8 +1482,7 @@ def dispatch(
             or proc.stderr.strip()
             or f"claude exited with code {proc.returncode} and produced no output"
         )
-        error_type = _classify_error(error_text)
-        error_text += _classification_hint(agent_name, error_type, error_text)
+        error_type, error_text, hint = _classify_failure(agent_name, error_text)
         return DispatchResult(
             agent=agent_name,
             success=False,
@@ -1478,6 +1492,7 @@ def dispatch(
             session_id=session_uuid,
             error=error_text,
             error_type=error_type,
+            hint=hint,
         )
 
     denied = _extract_denied_tools(data)
@@ -1521,6 +1536,7 @@ def dispatch_stream(
     goal: str | None = None,
     response_format: str | None = None,
     on_proc: Callable[[subprocess.Popen], None] | None = None,
+    session_id: str | None = None,
     _use_session_flag: bool = True,
 ) -> DispatchResult:
     """Run a task via claude -p with streaming output and progress callbacks.
@@ -1532,6 +1548,8 @@ def dispatch_stream(
     *on_proc* is called with the Popen handle right after spawn — callers use
     it to register the process for external cancellation (it may be called a
     second time if the old-CLI retry respawns).
+
+    *session_id* continues an existing session for a background job.
 
     ``_use_session_flag`` is internal: set to False on the one-shot retry when
     the installed claude CLI rejects ``--session-id`` (old version).
@@ -1569,8 +1587,10 @@ def dispatch_stream(
 
     full_task = _build_prompt(task, context, caller, goal, response_format)
 
-    # Pre-generate session id so a timed-out stream is resumable (see dispatch()).
-    new_session = str(uuid.uuid4()) if _use_session_flag else None
+    # A fresh run gets a session id so a timeout is resumable (see dispatch()).
+    new_session = str(uuid.uuid4()) if _use_session_flag and not session_id else None
+    session_uuid = session_id or new_session
+    prior_total = _prior_session_total(session_id, claude_path, settings)
     timeout = agent.timeout or settings.default_timeout
 
     try:
@@ -1579,6 +1599,7 @@ def dispatch_stream(
             full_task,
             agent,
             settings,
+            session_id,
             new_session_id=new_session,
             system_prompt=_build_system_prompt(
                 agent_name, agent, settings, timeout, caller=caller, response_format=response_format
@@ -1847,7 +1868,8 @@ def dispatch_stream(
                 denied,
                 agent,
                 settings,
-                session_fallback=new_session,
+                session_fallback=session_uuid,
+                prior_total=prior_total,
             )
         return _build_success_result(
             agent_name,
@@ -1855,9 +1877,10 @@ def dispatch_stream(
             denied,
             agent,
             settings,
-            session_fallback=new_session,
+            session_fallback=session_uuid,
             response_format=response_format,
             extra_hint=_KILLED_AFTER_RESULT if timed_out.is_set() else None,
+            prior_total=prior_total,
         )
 
     if timed_out.is_set():
@@ -1865,8 +1888,8 @@ def dispatch_stream(
             agent=agent_name,
             success=False,
             result="",
-            session_id=new_session,
-            error=_timeout_error(agent_name, timeout, new_session),
+            session_id=session_uuid,
+            error=_timeout_error(agent_name, timeout, session_uuid),
             error_type="timeout",
         )
 
@@ -1893,13 +1916,13 @@ def dispatch_stream(
             _use_session_flag=False,
         )
     error_text = stderr.strip() or f"No result received (exit code {proc.returncode})"
-    error_type = _classify_error(error_text)
-    error_text += _classification_hint(agent_name, error_type, error_text)
+    error_type, error_text, hint = _classify_failure(agent_name, error_text)
     return DispatchResult(
         agent=agent_name,
         success=False,
         result="",
-        session_id=new_session,
+        session_id=session_uuid,
         error=error_text,
         error_type=error_type,
+        hint=hint,
     )

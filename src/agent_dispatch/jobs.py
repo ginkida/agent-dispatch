@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "failed", "cancelled"})
+_STALE_RUNNING_SECONDS = 3600
 
 # Job IDs are uuid4().hex — 32 lowercase hex chars. Anything else (notably
 # values containing "/" or "..") is rejected so a caller-supplied ref/job_id
@@ -74,6 +75,8 @@ class Job(BaseModel):
     # Kept after completion as a post-mortem trace of what the agent did.
     progress: list[str] | None = None
     progress_updated_at: float | None = Field(default=None, allow_inf_nan=False)
+    resume_session_id: str | None = None
+    return_ref: bool | None = None
 
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
@@ -104,6 +107,17 @@ class Job(BaseModel):
                 self.result.error_type if self.result and self.result.error_type else "cli_error"
             )
         return entry
+
+
+class ActiveSessionJobError(Exception):
+    """A pending or running job already reserved the requested session."""
+
+    def __init__(self, job: Job, age: float):
+        self.job_id = job.id
+        super().__init__(
+            f"Session already has an active job {job.id} ({job.status}, age {age:.0f}s). "
+            "Wait for it to finish or use dispatch_session."
+        )
 
 
 class JobStore:
@@ -155,6 +169,8 @@ class JobStore:
         context: str | None = None,
         caller: str | None = None,
         goal: str | None = None,
+        resume_session_id: str | None = None,
+        return_ref: bool = False,
     ) -> Job:
         """Create a new pending job, persist it, return it."""
         job = Job(
@@ -164,8 +180,26 @@ class JobStore:
             context=context,
             caller=caller,
             goal=goal,
+            resume_session_id=resume_session_id or None,
+            return_ref=return_ref or None,
         )
         with self._lock:
+            # Both the check and publication must hold the same lock across servers.
+            if job.resume_session_id:
+                now = time.time()
+                for path in self.directory.glob("*.json"):
+                    existing = self._read(path)
+                    if (
+                        existing is not None
+                        and not existing.is_terminal()
+                        and existing.resume_session_id == job.resume_session_id
+                    ):
+                        if existing.status == "running" and self._running_is_stale(
+                            existing, now, _STALE_RUNNING_SECONDS
+                        ):
+                            continue
+                        age = now - (existing.started_at or existing.created_at)
+                        raise ActiveSessionJobError(existing, age)
             self._write(job)
         return job
 
@@ -336,7 +370,13 @@ class JobStore:
         except (OSError, ValueError):  # pragma: no cover - racing unlink
             return False
 
-    def recover_stale(self, stale_threshold_seconds: float = 3600) -> int:
+    def _running_is_stale(self, job: Job, now: float, threshold: float) -> bool:
+        # A recent progress write protects long-running jobs whose start time
+        # is already beyond the recovery threshold.
+        age = now - (job.started_at or job.created_at)
+        return age > threshold and not self._touched_after(job.id, now - threshold)
+
+    def recover_stale(self, stale_threshold_seconds: float = _STALE_RUNNING_SECONDS) -> int:
         """Mark jobs abandoned in 'running' or 'pending' beyond the threshold as failed.
 
         Async workers are daemon threads — if the server dies mid-dispatch the
@@ -363,22 +403,9 @@ class JobStore:
             # Claude Code session, routinely 14+.
             for job in self.list():
                 if job.status == "running":
+                    if not self._running_is_stale(job, now, stale_threshold_seconds):
+                        continue
                     age = now - (job.started_at or job.created_at)
-                    if age <= stale_threshold_seconds:
-                        continue
-                    # `started_at` alone does not prove abandonment: a dispatch
-                    # may legitimately run up to the 7200s timeout ceiling, so
-                    # any other server starting up would flip a live 2-hour job
-                    # to 'failed' — and finish() then refuses it, losing an
-                    # already-paid-for result. A live worker rewrites the file
-                    # at least once per progress interval, so a recently
-                    # *modified* file means someone is still on it. This can
-                    # only ever skip a recovery (a genuinely abandoned job is
-                    # picked up on a later start), never add one. Only 'running'
-                    # gets this check: nothing rewrites a pending job's file, so
-                    # there its mtime is just created_at by another name.
-                    if self._touched_after(job.id, now - stale_threshold_seconds):
-                        continue
                 elif job.status == "pending":
                     age = now - job.created_at
                     if age <= pending_threshold:

@@ -234,7 +234,7 @@ class DispatchResult(BaseModel):
     # Journal-only telemetry: never inflate tool responses or persisted jobs.
     token_usage: dict[str, Any] | None = Field(default=None, exclude=True)
     error: str | None = None
-    error_type: str | None = None  # permission, timeout, recursion, not_found, budget, cli_error
+    error_type: str | None = None  # e.g. permission, timeout, usage_limit, cli_error
     # Set when response_format="json" was requested AND the agent's result
     # parsed cleanly. None means: not requested, or requested but unparseable.
     parsed_result: Any | None = None
@@ -242,8 +242,7 @@ class DispatchResult(BaseModel):
     # JSON output). Non-empty even on success=True — the agent may have
     # completed with an incomplete answer because a tool was blocked.
     denied_tools: list[str] | None = None
-    # Advisory, non-fatal guidance (e.g. "result may be incomplete, grant X").
-    # Errors stay in `error`; hint is for successful-but-degraded results.
+    # Actionable guidance for a degraded result or account usage limit.
     hint: str | None = None
     # True when cost_usd exceeded the agent's max_budget_usd (or the settings
     # default). Post-hoc only — the money is already spent, the dispatch is
