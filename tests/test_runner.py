@@ -382,9 +382,16 @@ class TestDispatch:
         assert "timed out" in result.error.lower()
         assert result.error_type == "timeout"
 
-    @pytest.mark.parametrize("output", [
-        "", "partial answer", '{"type":"result",', '{"result":"unfinished"}', "[]",
-    ])
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "",
+            "partial answer",
+            '{"type":"result",',
+            '{"result":"unfinished"}',
+            "[]",
+        ],
+    )
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner._run_captured")
     def test_timeout_requires_a_complete_cli_result(self, mock_run, _which, output):
@@ -398,11 +405,16 @@ class TestDispatch:
     @patch("agent_dispatch.runner._run_captured")
     def test_budget_result_outranks_cleanup_timeout(self, mock_run, _which):
         payload = {
-            "type": "result", "is_error": True, "subtype": "error_max_budget_usd",
-            "session_id": "paid-session", "total_cost_usd": 0.42,
+            "type": "result",
+            "is_error": True,
+            "subtype": "error_max_budget_usd",
+            "session_id": "paid-session",
+            "total_cost_usd": 0.42,
         }
         mock_run.side_effect = subprocess.TimeoutExpired(
-            [], 10, output=json.dumps(payload).encode(),
+            [],
+            10,
+            output=json.dumps(payload).encode(),
         )
         result = dispatch("test", "task", self.agent, self.settings)
         assert not result.success
@@ -1003,23 +1015,37 @@ class TestDispatchStream:
         assert result.cost_usd == pytest.approx(0.1)
         assert usage.session_total("s1") == pytest.approx(0.5)
 
-    @pytest.mark.parametrize("event", [
-        None, [], 42, "noise",
-        {"type": "assistant", "message": None},
-        {"type": "assistant", "message": []},
-        {"type": "assistant", "message": {"content": [None, "noise", 42]}},
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": 42}]}},
-    ])
+    @pytest.mark.parametrize(
+        "event",
+        [
+            None,
+            [],
+            42,
+            "noise",
+            {"type": "assistant", "message": None},
+            {"type": "assistant", "message": []},
+            {"type": "assistant", "message": {"content": [None, "noise", 42]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": 42}]}},
+        ],
+    )
     @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
     @patch("agent_dispatch.runner.subprocess.Popen")
     def test_malformed_progress_preserves_result(self, mock_popen, _which, event):
         answer = {"type": "result", "result": "paid answer", "total_cost_usd": 0.42}
-        mock_popen.return_value = _FakePopen([
-            json.dumps(event), json.dumps(answer), json.dumps(event),
-        ])
+        mock_popen.return_value = _FakePopen(
+            [
+                json.dumps(event),
+                json.dumps(answer),
+                json.dumps(event),
+            ]
+        )
         progress = []
         result = dispatch_stream(
-            "test", "task", self.agent, self.settings, on_progress=progress.append,
+            "test",
+            "task",
+            self.agent,
+            self.settings,
+            on_progress=progress.append,
         )
         assert result.success
         assert result.result == "paid answer"
@@ -1790,7 +1816,10 @@ class TestOnProc:
 
         with pytest.raises(OSError, match="job storage unavailable"):
             dispatch_stream(
-                "test", "task", AgentConfig(directory="/tmp"), Settings(),
+                "test",
+                "task",
+                AgentConfig(directory="/tmp"),
+                Settings(),
                 on_proc=fail_registration,
             )
         proc.kill.assert_called_once()
@@ -2096,7 +2125,6 @@ class TestStreamPipeHandling:
         assert not result.success
         assert "everything is on fire" in result.error
 
-
     @staticmethod
     def _kill_pid_file(pid_file: Path) -> None:
         """Teardown for descendants a test leaves behind on purpose."""
@@ -2149,7 +2177,7 @@ class TestStreamPipeHandling:
         cli = self._stderr_holder_cli(
             tmp_path,
             pid_file,
-            "sys.stderr.write(\"You've hit your session limit \\u00b7 resets 6pm\\n\")\n"
+            'sys.stderr.write("You\'ve hit your session limit \\u00b7 resets 6pm\\n")\n'
             "sys.stderr.flush()\nsys.exit(1)\n",
         )
         agent = AgentConfig(directory=tmp_path, timeout=5)
@@ -2639,51 +2667,71 @@ def _ok_stdout(**extra) -> str:
 
 class TestTokenUsage:
     def test_real_payload(self):
-        assert _token_usage({
-            "total_cost_usd": 0.5664,
-            "num_turns": 1,
-            "usage": {
-                "input_tokens": 2, "cache_creation_input_tokens": 35247,
-                "cache_read_input_tokens": 11382, "output_tokens": 4, "other": 999,
-            },
-            "modelUsage": {"claude-fable-5-2": {"inputTokens": 2, "costUSD": 0.5664}},
-        }) == {"in": 2, "out": 4, "cr": 11382, "cw": 35247, "model": "claude-fable-5-2"}
+        assert _token_usage(
+            {
+                "total_cost_usd": 0.5664,
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 2,
+                    "cache_creation_input_tokens": 35247,
+                    "cache_read_input_tokens": 11382,
+                    "output_tokens": 4,
+                    "other": 999,
+                },
+                "modelUsage": {"claude-fable-5-2": {"inputTokens": 2, "costUSD": 0.5664}},
+            }
+        ) == {"in": 2, "out": 4, "cr": 11382, "cw": 35247, "model": "claude-fable-5-2"}
 
     @pytest.mark.parametrize("value", [None, [], "junk", True, 1e400])
     def test_non_dict_usage_blocks(self, value):
         assert _token_usage({"usage": value, "modelUsage": value}) is None
         assert _token_usage(value) is None
 
-    @pytest.mark.parametrize("value", ["2", "abc", -1, -0.5, None, True, False, 1e400,
-                                      float("nan"), 10**400, 10**12, [], {}])
+    @pytest.mark.parametrize(
+        "value",
+        ["2", "abc", -1, -0.5, None, True, False, 1e400, float("nan"), 10**400, 10**12, [], {}],
+    )
     def test_invalid_counts_are_omitted(self, value):
-        assert _token_usage({"usage": {
-            "input_tokens": value, "output_tokens": value,
-            "cache_read_input_tokens": value, "cache_creation_input_tokens": value,
-        }}) is None
+        assert (
+            _token_usage(
+                {
+                    "usage": {
+                        "input_tokens": value,
+                        "output_tokens": value,
+                        "cache_read_input_tokens": value,
+                        "cache_creation_input_tokens": value,
+                    }
+                }
+            )
+            is None
+        )
 
     def test_valid_counts_are_bounded_ints_and_missing_fields_stay_absent(self):
         assert _token_usage({"usage": {"input_tokens": 0, "output_tokens": 10**12 - 1}}) == {
-            "in": 0, "out": 999999999999,
+            "in": 0,
+            "out": 999999999999,
         }
         assert _token_usage({"usage": {"input_tokens": 2.9}}) == {"in": 2}
         assert _token_usage({}) is None
 
-    @pytest.mark.parametrize(("models", "expected"), [
-        ({}, None),
-        ({"first": {}, "second": {}}, "first"),
-        ({"first": {"costUSD": 1}, "second": {"costUSD": 1}}, "first"),
-        ({"first": {"costUSD": float("nan")}, "second": {"costUSD": 2}}, "second"),
-        ({"first": None, "second": {"costUSD": float("nan")}}, "first"),
-        ({"first": {"costUSD": 0.1}, "second": {"costUSD": 0.5}}, "second"),
-        ({"first": {"costUSD": True}, "second": {"costUSD": 0}}, "second"),
-        ({"first": {"costUSD": "9"}, "second": {"costUSD": 0}}, "second"),
-        ({"first": {"costUSD": 10**400}, "second": {"costUSD": 0}}, "second"),
-        ({"first": {"costUSD": float("inf")}, "second": {"costUSD": 0}}, "second"),
-        ({"first": {"costUSD": -2}, "second": {"costUSD": -1}}, "second"),
-        ({"x" * 100: []}, "x" * 60),
-        ({1: {"costUSD": 10}, "valid": {}}, "valid"),
-    ])
+    @pytest.mark.parametrize(
+        ("models", "expected"),
+        [
+            ({}, None),
+            ({"first": {}, "second": {}}, "first"),
+            ({"first": {"costUSD": 1}, "second": {"costUSD": 1}}, "first"),
+            ({"first": {"costUSD": float("nan")}, "second": {"costUSD": 2}}, "second"),
+            ({"first": None, "second": {"costUSD": float("nan")}}, "first"),
+            ({"first": {"costUSD": 0.1}, "second": {"costUSD": 0.5}}, "second"),
+            ({"first": {"costUSD": True}, "second": {"costUSD": 0}}, "second"),
+            ({"first": {"costUSD": "9"}, "second": {"costUSD": 0}}, "second"),
+            ({"first": {"costUSD": 10**400}, "second": {"costUSD": 0}}, "second"),
+            ({"first": {"costUSD": float("inf")}, "second": {"costUSD": 0}}, "second"),
+            ({"first": {"costUSD": -2}, "second": {"costUSD": -1}}, "second"),
+            ({"x" * 100: []}, "x" * 60),
+            ({1: {"costUSD": 10}, "valid": {}}, "valid"),
+        ],
+    )
     def test_model_selection(self, models, expected):
         assert _token_usage({"modelUsage": models}) == (
             {"model": expected} if expected is not None else None
@@ -2701,10 +2749,15 @@ class TestUsageJournaling:
     @pytest.mark.parametrize("error", [None, "cli_error", "budget"])
     def test_tokens_reach_the_journal_on_both_paths(self, stream, error):
         payload = {
-            "type": "result", "is_error": error is not None,
+            "type": "result",
+            "is_error": error is not None,
             "result": "paid answer" if error is None else "failed",
-            "usage": {"input_tokens": 2, "output_tokens": 4,
-                      "cache_read_input_tokens": 11382, "cache_creation_input_tokens": 35247},
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 11382,
+                "cache_creation_input_tokens": 35247,
+            },
             "modelUsage": {"cheap": {"costUSD": 0.01}, "main": {"costUSD": 0.5}},
         }
         if error == "budget":
@@ -2712,16 +2765,24 @@ class TestUsageJournaling:
             payload["subtype"] = "error_max_budget_usd"
         with patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude"):
             if stream:
-                with patch("agent_dispatch.runner.subprocess.Popen",
-                           return_value=_FakePopen([json.dumps(payload)])):
+                with patch(
+                    "agent_dispatch.runner.subprocess.Popen",
+                    return_value=_FakePopen([json.dumps(payload)]),
+                ):
                     result = dispatch_stream("infra", "go", self.agent, self.settings)
             else:
-                with patch("agent_dispatch.runner._run_captured", return_value=
-                           subprocess.CompletedProcess([], 0, json.dumps(payload), "")):
+                with patch(
+                    "agent_dispatch.runner._run_captured",
+                    return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), ""),
+                ):
                     result = dispatch("infra", "go", self.agent, self.settings)
         (entry,) = usage.load()
         assert {key: entry[key] for key in ("in", "out", "cr", "cw", "model")} == {
-            "in": 2, "out": 4, "cr": 11382, "cw": 35247, "model": "main",
+            "in": 2,
+            "out": 4,
+            "cr": 11382,
+            "cw": 35247,
+            "model": "main",
         }
         assert result.success is (error is None)
         assert result.error_type == error

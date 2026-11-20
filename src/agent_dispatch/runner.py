@@ -434,8 +434,10 @@ def _token_usage(data: dict) -> dict | None:
     counts = data.get("usage")
     if isinstance(counts, dict):
         for source, key in (
-            ("input_tokens", "in"), ("output_tokens", "out"),
-            ("cache_read_input_tokens", "cr"), ("cache_creation_input_tokens", "cw"),
+            ("input_tokens", "in"),
+            ("output_tokens", "out"),
+            ("cache_read_input_tokens", "cr"),
+            ("cache_creation_input_tokens", "cw"),
         ):
             value = counts.get(source)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -452,7 +454,8 @@ def _token_usage(data: dict) -> dict | None:
             cost = details.get("costUSD") if isinstance(details, dict) else None
             number = (
                 usage.as_float(cost, default=-math.inf)
-                if isinstance(cost, (int, float)) and not isinstance(cost, bool) else -math.inf
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                else -math.inf
             )
             # Missing/nonfinite costs fall back to the first model; strict >
             # preserves that order on ties, including when no cost is valid.
@@ -953,7 +956,11 @@ def _close_quiet(stream: object) -> None:
 
 
 def _run_captured(
-    cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float,
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
 ) -> subprocess.CompletedProcess[str]:
     """Capture both pipes with a deadline covering the child and its descendants.
 
@@ -964,7 +971,11 @@ def _run_captured(
     immediately, including a flushed JSON result without a trailing newline.
     """
     proc = subprocess.Popen(
-        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         start_new_session=True,
     )
     deadline = time.monotonic() + timeout
@@ -985,7 +996,7 @@ def _run_captured(
                 if limit is None:
                     chunks.append(chunk)
                 elif kept < limit:
-                    chunks.append(chunk[:limit - kept])
+                    chunks.append(chunk[: limit - kept])
                     kept += len(chunk)
         except (OSError, ValueError):
             logger.debug("Captured pipe drain ended early")
@@ -994,10 +1005,13 @@ def _run_captured(
 
     try:
         for pipe, chunks, limit in (
-            (proc.stdout, stdout, None), (proc.stderr, stderr, _MAX_STDERR_CAPTURE),
+            (proc.stdout, stdout, None),
+            (proc.stderr, stderr, _MAX_STDERR_CAPTURE),
         ):
             reader = threading.Thread(
-                target=capture, args=(pipe, chunks, limit), daemon=True,
+                target=capture,
+                args=(pipe, chunks, limit),
+                daemon=True,
                 name="dispatch-capture",
             )
             reader.start()
@@ -1048,7 +1062,7 @@ def _run_captured(
                 reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
         # Pipes without a started reader (e.g. thread creation failed) still
         # belong to this thread and can safely be closed here.
-        for pipe in (proc.stdout, proc.stderr)[len(readers):]:
+        for pipe in (proc.stdout, proc.stderr)[len(readers) :]:
             _close_quiet(pipe)
         collecting.clear()
 

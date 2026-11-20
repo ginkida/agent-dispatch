@@ -1618,8 +1618,11 @@ class TestDispatchGC:
         store.create("infra", "pending")
         data = json.loads(await server.dispatch_gc(max_age_days=7, dry_run=True))
         assert data == {
-            "dry_run": True, "purged": 0, "would_purge": 1,
-            "job_ids": [job.id], "max_age_days": 7,
+            "dry_run": True,
+            "purged": 0,
+            "would_purge": 1,
+            "job_ids": [job.id],
+            "max_age_days": 7,
         }
         assert store.get(job.id) == job
         assert json.loads(await server.dispatch_gc(max_age_days=7))["purged"] == 1
@@ -2637,10 +2640,12 @@ class TestParallelNumericValidation:
             patch.object(server, "_get_config", return_value=_make_config(tmp_path)),
             patch.object(server.runner, "dispatch") as run,
         ):
-            payload = json.dumps([
-                {"agent": "infra", "task": "valid task"},
-                {"agent": "db", "task": "invalid task", field: value},
-            ])
+            payload = json.dumps(
+                [
+                    {"agent": "infra", "task": "valid task"},
+                    {"agent": "db", "task": "invalid task", field: value},
+                ]
+            )
             result = json.loads(await server.dispatch_parallel(payload))
         assert field in result["error"]
         run.assert_not_called()
@@ -2755,8 +2760,7 @@ class TestCancelRunningJob:
     async def test_failed_progress_writes_do_not_cost_the_result(self, tmp_path):
         config = _make_config(tmp_path)
 
-        def fake_stream(name, task, agent_config, settings, context=None,
-                        on_progress=None, **kw):
+        def fake_stream(name, task, agent_config, settings, context=None, on_progress=None, **kw):
             on_progress("working")
             return _ok_dispatch_result(name)
 
@@ -3501,7 +3505,10 @@ class TestReturnRefOnCacheHit:
 class TestConfigMutationInvalidatesCache:
     @pytest.mark.parametrize("surface", ["single", "parallel"])
     async def test_external_config_edits_refresh_only_affected_agent(
-        self, tmp_path, monkeypatch, surface,
+        self,
+        tmp_path,
+        monkeypatch,
+        surface,
     ):
         from agent_dispatch.config import save_config
 
@@ -3513,9 +3520,11 @@ class TestConfigMutationInvalidatesCache:
         async def dispatch(name):
             if surface == "single":
                 return json.loads(await server.dispatch(name, "task"))
-            result = json.loads(await server.dispatch_parallel(
-                json.dumps([{"agent": name, "task": "task"}]),
-            ))
+            result = json.loads(
+                await server.dispatch_parallel(
+                    json.dumps([{"agent": name, "task": "task"}]),
+                )
+            )
             return result[0]
 
         def fake_dispatch(name, task, agent, settings, *args, **kwargs):
@@ -4180,7 +4189,8 @@ class TestSharedProcessLimit:
             finally:
                 release.set()
                 await asyncio.wait_for(
-                    asyncio.gather(first, *([second] if second else [])), timeout=5,
+                    asyncio.gather(first, *([second] if second else [])),
+                    timeout=5,
                 )
             assert calls == ["first", "second"]
 
@@ -4214,8 +4224,9 @@ class TestSharedProcessLimit:
             try:
                 await wait_for_calls(old_limit)
                 config.settings.max_concurrency = new_limit
-                tasks.extend(asyncio.create_task(server.dispatch("infra", f"new-{i}"))
-                             for i in range(2))
+                tasks.extend(
+                    asyncio.create_task(server.dispatch("infra", f"new-{i}")) for i in range(2)
+                )
                 expected = max(old_limit, new_limit)
                 await wait_for_calls(expected)
                 await asyncio.sleep(0.15)
