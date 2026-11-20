@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
+The background-continuation round: an async job can now continue a session,
+join a group and hand back a reference instead of the full text, and polling a
+job no longer returns the whole task and context on every call.
+
+### Added
+- `dispatch_async(session_id=...)` continues an existing agent session in the
+  background (the streaming runner now passes `--resume`, with the same
+  per-call cost accounting as `dispatch_session`). A session holds at most one
+  pending or running job: a second `dispatch_async` for it returns `error` plus
+  `active_job_id`, and the error names the `dispatch_wait` / `dispatch_cancel`
+  calls for that job. The check and the new record are published under the
+  cross-process job lock. A running job whose start time and last file update
+  are both over an hour old no longer holds the session.
+  Limit: `dispatch_session` does not check this reservation.
+- `group=` on `dispatch_async` and `dispatch_session`: membership is validated
+  before anything runs, and the group's `shared_context` goes before the
+  caller's context — the same string in the job record and in the prompt.
+- `dispatch_async(return_ref=True)`: a successful job's `result` in
+  `dispatch_status` / `dispatch_wait` is `{ref, summary, session_id, ...}`
+  instead of the full text; `fetch_result(ref)` reads it. Failed jobs keep their
+  error and result inline.
+- A `usage_limit` failure also carries its advice in `hint` (it stays in
+  `error` too), so a caller can act on it without parsing the error text.
+
+### Changed
+- **Polling payload shape.** `dispatch_status`, `dispatch_wait` and
+  `fetch_result` on a job without a result return `task_preview` and
+  `context_preview` (first 120 characters, one line) instead of the full `task`
+  and `context`. The job file and `agent-dispatch job <id> --json` keep the
+  complete text. A caller that read `task` / `context` from these tools must
+  switch to the previews or to the CLI.
+- The usage-limit hint names the limit Claude reported — a model
+  ("Fable limit") or a period ("weekly limit") — and its reset time. It no
+  longer claims the limit is account-wide: a model limit is not.
+
+### Fixed
+- Model and period limits (`You've hit your Fable limit`, `Weekly limit
+  reached`, `5-hour limit reached ∙ resets 3pm`) were reported as `cli_error`;
+  they are `usage_limit` now. A period phrase counts only in the shape Claude
+  prints it, so another service's `daily limit of 5000 requests reached`, or
+  `Permission denied while changing the daily limit`, is not mistaken for it.
+- A worker thread that cannot start fails its job instead of leaving it
+  `pending`.
+
 ## [0.17.0] - 2026-11-10
 
 The cost round, driven by measurements on the live CLI rather than by reading
@@ -938,7 +984,8 @@ cache bounding, and stale-job recovery.
 - Dependabot for `pip` + `github-actions`, GitHub Actions pinned to
   commit SHAs for supply-chain integrity.
 
-[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/ginkida/agent-dispatch/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/ginkida/agent-dispatch/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/ginkida/agent-dispatch/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/ginkida/agent-dispatch/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/ginkida/agent-dispatch/compare/v0.15.0...v0.15.1

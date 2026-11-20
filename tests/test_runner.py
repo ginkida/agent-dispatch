@@ -3082,6 +3082,33 @@ class TestUsageLimitClassification:
         assert _classify_error("permission denied for tool Bash") == "permission"
 
     @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            # Someone else's limit, reported by a tool the agent called.
+            ("Yandex Metrika API: daily limit of 5000 requests reached", "cli_error"),
+            ("Reached maximum number of turns (40) — session limit not configured", "cli_error"),
+            # The limit check runs before the permission patterns, so a loose
+            # period match also swallowed the permission hint.
+            ("Permission denied while changing the daily limit", "permission"),
+        ],
+    )
+    def test_a_period_limit_in_other_text_is_not_claudes_limit(self, message, expected):
+        assert _classify_error(message) == expected
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Weekly limit reached",
+            "5-hour limit reached ∙ resets 3pm",
+            "Opus weekly limit reached ∙ resets Nov 24, 9am",
+            "Session limit · resets 6pm (Asia/Almaty)",
+            "You've hit your weekly limit",
+        ],
+    )
+    def test_claudes_own_period_wording_still_classifies(self, message):
+        assert _classify_error(message) == "usage_limit"
+
+    @pytest.mark.parametrize(
         ("output", "message", "scope", "reset"),
         [
             ("stderr", "You've hit your Fable limit · resets 3pm", "Fable", "3pm"),

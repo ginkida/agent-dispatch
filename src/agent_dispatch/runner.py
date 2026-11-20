@@ -213,9 +213,17 @@ _USAGE_LIMIT_PATTERNS = [
     "too many requests",
     "quota exceeded",
 ]
+# A bare "<period> limit" is not enough: this text is whatever the subprocess
+# printed, and "Metrika API: daily limit of 5000 requests reached" or
+# "Permission denied while changing the daily limit" would be journaled as
+# Claude's limit and answered with "wait for the reset" — ahead of the
+# permission patterns, so the permission hint was lost too. A period counts
+# only in the shape Claude prints it: "<period> limit reached" or
+# "<period> limit · resets …".
 _SCOPED_USAGE_LIMIT_RE = re.compile(
     r"\bhit\s+your\s+(?:(?P<name>[\w-]+(?:\s+[\w-]+){0,2}?)\s+)?limit\b"
-    r"|\b(?P<period>session|hourly|daily|weekly|monthly|\d+-(?:hour|day|week|month))\s+limit\b",
+    r"|\b(?P<period>session|hourly|daily|weekly|monthly|\d+-(?:hour|day|week|month))\s+limit"
+    r"(?:\s+(?:reached|exceeded|hit)\b|\s*[·∙]\s*resets?\b)",
     re.IGNORECASE,
 )
 # A result can describe rate limiting from a tool's API.

@@ -472,7 +472,7 @@ Async dispatch returns a `job_id` immediately. It accepts `agent`, `task`, `cont
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `group` | string | `""` | Require group membership and prepend the group's `shared_context` to `context`. An unknown group or non-member is rejected before creating a job. |
-| `session_id` | string | `""` | Continue an existing session for the same agent. A conflict returns `error` and `active_job_id`. The error gives the job's status and age and points to `dispatch_session`. |
+| `session_id` | string | `""` | Continue an existing session for the same agent. A conflict returns `error` and `active_job_id`. The error gives the job's status and age and names the `dispatch_wait` / `dispatch_cancel` calls for that job. `dispatch_session` does not check this reservation, so do not use it to get around a busy session. |
 | `return_ref` | bool | `False` | On success, `dispatch_status` and `dispatch_wait` return `result.ref` and `result.summary` in place of `result.result`. Call `fetch_result(ref)` for the full text. Failed jobs retain their error and result. |
 
 ```

@@ -114,9 +114,14 @@ class ActiveSessionJobError(Exception):
 
     def __init__(self, job: Job, age: float):
         self.job_id = job.id
+        # Name only calls that respect the reservation. dispatch_session does
+        # not check it: suggesting it here sent callers into two concurrent
+        # --resume runs of one session. dispatch_cancel is the way out when the
+        # job's worker is gone (a pending job is not swept for a day).
         super().__init__(
             f"Session already has an active job {job.id} ({job.status}, age {age:.0f}s). "
-            "Wait for it to finish or use dispatch_session."
+            f'Wait for it with dispatch_wait(job_id="{job.id}"), or cancel it with '
+            f'dispatch_cancel(job_id="{job.id}"), then retry.'
         )
 
 

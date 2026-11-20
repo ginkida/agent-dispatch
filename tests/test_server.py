@@ -1227,7 +1227,11 @@ class TestDispatchAsync:
                 assert conflict.keys() == {"error", "active_job_id"}
                 assert conflict["active_job_id"] == job_id
                 assert status in conflict["error"]
-                assert "or use dispatch_session" in conflict["error"]
+                # The remedy must name calls that respect the reservation:
+                # dispatch_session does not check it.
+                assert f'dispatch_wait(job_id="{job_id}")' in conflict["error"]
+                assert f'dispatch_cancel(job_id="{job_id}")' in conflict["error"]
+                assert "dispatch_session" not in conflict["error"]
             assert len(server._get_job_store().list()) == 1
             assert runner.call_count == 1
 
