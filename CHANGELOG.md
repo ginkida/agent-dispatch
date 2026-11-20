@@ -21,8 +21,10 @@ job no longer returns the whole task and context on every call.
   `active_job_id`, and the error names the `dispatch_wait` / `dispatch_cancel`
   calls for that job. The check and the new record are published under the
   cross-process job lock. A running job whose start time and last file update
-  are both over an hour old no longer holds the session.
-  Limit: `dispatch_session` does not check this reservation.
+  are both over an hour old no longer holds the session; a pending job older
+  than a day is failed and replaced (the bounds startup recovery already uses).
+  Limit: `dispatch_session` does not check this reservation — do not use it on
+  a session whose async job is still active.
 - `group=` on `dispatch_async` and `dispatch_session`: membership is validated
   before anything runs, and the group's `shared_context` goes before the
   caller's context — the same string in the job record and in the prompt.
@@ -47,11 +49,21 @@ job no longer returns the whole task and context on every call.
 ### Fixed
 - Model and period limits (`You've hit your Fable limit`, `Weekly limit
   reached`, `5-hour limit reached ∙ resets 3pm`) were reported as `cli_error`;
-  they are `usage_limit` now. A period phrase counts only in the shape Claude
-  prints it, so another service's `daily limit of 5000 requests reached`, or
-  `Permission denied while changing the daily limit`, is not mistaken for it.
+  they are `usage_limit` now. A period phrase counts only in the shapes Claude
+  prints (`… limit reached`, `… limit · resets …`, `… session limit resets …`),
+  so another service's `daily limit of 5000 requests reached` or `Daily Limit
+  Exceeded`, or `Permission denied while changing the daily limit`, is not
+  mistaken for it.
 - A worker thread that cannot start fails its job instead of leaving it
   `pending`.
+- A running job whose agent stayed silent for over an hour — one long tool
+  call, such as a nested dispatch — looked abandoned: the next server to start
+  marked it failed, and the worker's result, already paid for, was then
+  refused. The worker now touches its job file once a minute, so liveness no
+  longer depends on the agent emitting progress.
+- A task, context or group `shared_context` containing a NUL character raised
+  out of `dispatch` / `dispatch_session` / `dispatch_stream` instead of
+  returning a `cli_error` result.
 
 ## [0.17.0] - 2026-11-10
 

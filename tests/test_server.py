@@ -1270,6 +1270,46 @@ class TestDispatchAsync:
         assert int(conflict["error"].split("age ", 1)[1].split("s", 1)[0]) >= 4000
 
     @pytest.mark.asyncio
+    async def test_a_running_job_is_kept_alive_while_the_agent_is_silent(self, tmp_path):
+        # The fake emits no progress at all — the state of an agent inside one
+        # long tool call. Only the heartbeat may refresh the job file.
+        config = _make_config(tmp_path)
+        started, release = threading.Event(), threading.Event()
+
+        def silent(name, task, agent_config, settings, context=None, on_progress=None, **kw):
+            started.set()
+            release.wait(5)
+            return _ok_dispatch_result("infra")
+
+        with (
+            patch.object(server, "_get_config", return_value=config),
+            patch.object(server, "_JOB_HEARTBEAT_INTERVAL", 0.01),
+            patch.object(server.runner, "dispatch_stream", side_effect=silent),
+        ):
+            job_id = json.loads(await server.dispatch_async("infra", "long"))["job_id"]
+            beat = f"dispatch-hb-{job_id[:8]}"
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                path = server._get_job_store().directory / f"{job_id}.json"
+                old = time.time() - 7200
+                os.utime(path, (old, old))
+                deadline = time.monotonic() + 2
+                while path.stat().st_mtime < old + 3600 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert path.stat().st_mtime > old + 3600
+            finally:
+                release.set()
+            assert (await _wait_terminal(job_id)).status == "done"
+
+            # The heartbeat ends with the dispatch, not with the process.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and any(
+                t.name == beat for t in threading.enumerate()
+            ):
+                await asyncio.sleep(0.01)
+            assert not any(t.name == beat for t in threading.enumerate())
+
+    @pytest.mark.asyncio
     async def test_resume_can_retry_after_worker_thread_fails_to_start(self, tmp_path):
         config = _make_config(tmp_path)
         result = _ok_dispatch_result("infra")

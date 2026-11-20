@@ -88,7 +88,9 @@ mcp = FastMCP(
         "ASYNC DISPATCH (don't block on long tasks):\n"
         "- dispatch_async(agent, task, group?, session_id?, return_ref?) — "
         "start a background job and return job_id. A pending or running job for the supplied "
-        "session_id is reported as an error with active_job_id.\n"
+        "session_id is reported as an error with active_job_id: wait for that job or cancel "
+        "it. dispatch_session does not check this, so never use it on a session whose async "
+        "job is still active.\n"
         "- dispatch_status(job_id) — check state, task and context previews, and progress\n"
         "- dispatch_wait(job_id, timeout_seconds?) — wait for completion. "
         "A wait timeout leaves the job running so you can wait again.\n"
@@ -135,6 +137,7 @@ _MIN_TIMEOUT_OVERRIDE = 10  # seconds; floor for per-call timeout_seconds
 _MAX_TIMEOUT_OVERRIDE = 7200  # seconds; ceiling for per-call timeout_seconds
 _JOB_PROGRESS_MAX_LINES = 20  # rolling tail kept in the job file
 _JOB_PROGRESS_WRITE_INTERVAL = 1.0  # seconds between progress file writes
+_JOB_HEARTBEAT_INTERVAL = 60.0  # seconds between liveness touches of a running job's file
 
 
 class ConfigLoadError(RuntimeError):
@@ -2006,6 +2009,20 @@ def _run_owned_job(
             elif job.is_terminal():
                 runner._kill_process_tree(proc)
 
+    # Liveness is independent of progress: see JobStore.touch. The thread
+    # lives exactly as long as the dispatch below; if it cannot start the job
+    # still runs, it is merely as exposed as before to a quiet hour.
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(_JOB_HEARTBEAT_INTERVAL):
+            store.touch(job_id)
+
+    try:
+        threading.Thread(target=heartbeat, daemon=True, name=f"dispatch-hb-{job_id[:8]}").start()
+    except RuntimeError:
+        logger.warning("Async job %s: heartbeat thread did not start", job_id)
+
     try:
         result = runner.dispatch_stream(
             agent,
@@ -2041,6 +2058,8 @@ def _run_owned_job(
             # Same full disk, most likely. recover_stale fails the job later;
             # a daemon thread that raises here just dies unreported.
             logger.exception("Async job %s: could not record the crash", job_id)
+    finally:
+        stop_heartbeat.set()
 
 
 @mcp.tool()

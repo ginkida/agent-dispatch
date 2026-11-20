@@ -218,12 +218,15 @@ _USAGE_LIMIT_PATTERNS = [
 # "Permission denied while changing the daily limit" would be journaled as
 # Claude's limit and answered with "wait for the reset" — ahead of the
 # permission patterns, so the permission hint was lost too. A period counts
-# only in the shape Claude prints it: "<period> limit reached" or
-# "<period> limit · resets …".
+# only in the shapes Claude prints (code.claude.com/docs/en/errors, read
+# 2026-11-20): "<period> limit reached", "<period> limit · resets …" and
+# "· your session limit resets 3:45pm". Not "exceeded": that is Google's
+# "Daily Limit Exceeded", not Claude's.
 _SCOPED_USAGE_LIMIT_RE = re.compile(
-    r"\bhit\s+your\s+(?:(?P<name>[\w-]+(?:\s+[\w-]+){0,2}?)\s+)?limit\b"
+    # The dot is for model versions: "hit your Opus 4.6 limit".
+    r"\bhit\s+your\s+(?:(?P<name>[\w.-]+(?:\s+[\w.-]+){0,2}?)\s+)?limit\b"
     r"|\b(?P<period>session|hourly|daily|weekly|monthly|\d+-(?:hour|day|week|month))\s+limit"
-    r"(?:\s+(?:reached|exceeded|hit)\b|\s*[·∙]\s*resets?\b)",
+    r"(?:\s+(?:reached|resets?)\b|\s*[·∙]\s*resets?\b)",
     re.IGNORECASE,
 )
 # A result can describe rate limiting from a tool's API.
@@ -1435,9 +1438,16 @@ def dispatch(
                 error=f"{e}{_permission_hint(agent_name)}",
                 error_type="permission",
             )
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # ValueError: Popen rejects an argument with an embedded NUL (a
+            # task, context or group shared_context can carry one). It is not
+            # an OSError, so it used to leave the runner as a raised exception.
             return DispatchResult(
-                agent=agent_name, success=False, result="", error=str(e), error_type="cli_error"
+                agent=agent_name,
+                success=False,
+                result="",
+                error=f"Could not start claude: {e}",
+                error_type="cli_error",
             )
         # Self-heal on old claude CLIs that don't know --session-id: strip the
         # flag and retry once. Timed-out dispatches lose resumability, but
@@ -1682,12 +1692,12 @@ def dispatch_stream(
             error=str(e),
             error_type="permission",
         )
-    except OSError as e:
+    except (OSError, ValueError) as e:  # ValueError: embedded NUL, see dispatch()
         return DispatchResult(
             agent=agent_name,
             success=False,
             result="",
-            error=str(e),
+            error=f"Could not start claude: {e}",
             error_type="cli_error",
         )
 

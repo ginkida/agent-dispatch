@@ -117,11 +117,14 @@ class ActiveSessionJobError(Exception):
         # Name only calls that respect the reservation. dispatch_session does
         # not check it: suggesting it here sent callers into two concurrent
         # --resume runs of one session. dispatch_cancel is the way out when the
-        # job's worker is gone (a pending job is not swept for a day).
+        # job's worker is gone (a pending job is not swept for a day). The
+        # text does not say "retry": a caller re-sending a request whose first
+        # response was lost should collect that job's result, not run it twice.
         super().__init__(
             f"Session already has an active job {job.id} ({job.status}, age {age:.0f}s). "
-            f'Wait for it with dispatch_wait(job_id="{job.id}"), or cancel it with '
-            f'dispatch_cancel(job_id="{job.id}"), then retry.'
+            f'Before sending this session another turn, wait for it with dispatch_wait(job_id="'
+            f'{job.id}") or cancel it with dispatch_cancel(job_id="{job.id}") — a running job '
+            "can only be cancelled by the server that started it."
         )
 
 
@@ -192,6 +195,7 @@ class JobStore:
             # Both the check and publication must hold the same lock across servers.
             if job.resume_session_id:
                 now = time.time()
+                expired: list[Job] = []
                 for path in self.directory.glob("*.json"):
                     existing = self._read(path)
                     if (
@@ -203,8 +207,27 @@ class JobStore:
                             existing, now, _STALE_RUNNING_SECONDS
                         ):
                             continue
+                        # Same bound recover_stale uses, applied here because
+                        # recovery only runs when some server starts: without
+                        # it a job whose worker died in the queue held the
+                        # session for as long as no server restarted. The job
+                        # is failed, not merely skipped — a skipped one stays
+                        # runnable, and a worker that does reach it later
+                        # would resume the session alongside its replacement.
+                        if existing.status == "pending" and (
+                            now - existing.created_at
+                            > _STALE_RUNNING_SECONDS * self._PENDING_STALE_MULTIPLIER
+                        ):
+                            expired.append(existing)
+                            continue
                         age = now - (existing.started_at or existing.created_at)
                         raise ActiveSessionJobError(existing, age)
+                for old in expired:
+                    self.fail(
+                        old.id,
+                        f"Abandoned in 'pending' for {now - old.created_at:.0f}s — "
+                        f"job {job.id} took over its session.",
+                    )
             self._write(job)
         return job
 
@@ -375,9 +398,26 @@ class JobStore:
         except (OSError, ValueError):  # pragma: no cover - racing unlink
             return False
 
+    def touch(self, job_id: str) -> None:
+        """Heartbeat: bump the job file's mtime without rewriting the record.
+
+        The mtime is the liveness signal `_running_is_stale` reads. Progress
+        writes alone are not one: an agent inside a single long tool call (a
+        nested dispatch can take two hours) emits nothing, and after an hour
+        of that silence the job looked abandoned — a second job could resume
+        the same session, and another server's startup recovery failed the
+        job, after which finish() refused the paid result. No lock: utime is
+        one syscall, and landing on a file that a concurrent write is about to
+        replace is harmless (the replacement carries a fresh mtime itself).
+        """
+        try:
+            os.utime(self._path(job_id))
+        except (OSError, ValueError):
+            logger.debug("Could not touch job %s", job_id)
+
     def _running_is_stale(self, job: Job, now: float, threshold: float) -> bool:
-        # A recent progress write protects long-running jobs whose start time
-        # is already beyond the recovery threshold.
+        # A recent write or heartbeat (see touch) protects long-running jobs
+        # whose start time is already beyond the recovery threshold.
         age = now - (job.started_at or job.created_at)
         return age > threshold and not self._touched_after(job.id, now - threshold)
 

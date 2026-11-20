@@ -3090,6 +3090,8 @@ class TestUsageLimitClassification:
             # The limit check runs before the permission patterns, so a loose
             # period match also swallowed the permission hint.
             ("Permission denied while changing the daily limit", "permission"),
+            # Google Drive's quota wording. Claude says "reached", never "exceeded".
+            ("dailyLimitExceeded: Daily Limit Exceeded", "cli_error"),
         ],
     )
     def test_a_period_limit_in_other_text_is_not_claudes_limit(self, message, expected):
@@ -3103,10 +3105,39 @@ class TestUsageLimitClassification:
             "Opus weekly limit reached ∙ resets Nov 24, 9am",
             "Session limit · resets 6pm (Asia/Almaty)",
             "You've hit your weekly limit",
+            # The tail Claude appends to a spend-cap message when a plan
+            # window ran out too: no "hit your", no separator before "resets".
+            "You've hit your org's monthly spend limit · your session limit resets 3:45pm",
         ],
     )
     def test_claudes_own_period_wording_still_classifies(self, message):
         assert _classify_error(message) == "usage_limit"
+
+    def test_a_model_version_with_a_dot_is_still_a_model_limit(self):
+        from agent_dispatch.runner import _classify_failure
+
+        error_type, _, hint = _classify_failure(
+            "infra", "You've hit your Opus 4.6 limit · resets 3pm"
+        )
+        assert error_type == "usage_limit"
+        assert "Opus 4.6 limit is exhausted" in hint
+        assert "It resets 3pm." in hint
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @patch("agent_dispatch.runner.shutil.which", return_value="/usr/bin/claude")
+    def test_an_argument_popen_rejects_is_a_result_not_an_exception(self, _which, streaming):
+        # Popen raises ValueError (not OSError) for an embedded NUL, which a
+        # task, a context or a group's shared_context can all carry.
+        boom = ValueError("embedded null byte")
+        if streaming:
+            with patch("agent_dispatch.runner.subprocess.Popen", side_effect=boom):
+                result = dispatch_stream("infra", "a\x00b", self.agent, self.settings)
+        else:
+            with patch("agent_dispatch.runner._run_captured", side_effect=boom):
+                result = dispatch("infra", "a\x00b", self.agent, self.settings)
+        assert not result.success
+        assert result.error_type == "cli_error"
+        assert "embedded null byte" in result.error
 
     @pytest.mark.parametrize(
         ("output", "message", "scope", "reset"),

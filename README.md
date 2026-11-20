@@ -498,7 +498,7 @@ dispatch_wait(job_id="8f3a...e1", timeout_seconds=120)
 
 Both polling tools show one-line previews of the first 120 characters as `task_preview` and, when a context was supplied or added by a group, `context_preview`. The job file and `agent-dispatch job <id> --json` retain the complete task and context. Use the completed job's `result.session_id` for a follow-up with `dispatch_async` or `dispatch_session`.
 
-Async continuation skips a stale running job when its start time and last file update are both at least an hour old.
+Async continuation skips a stale running job when its start time and last file update are both at least an hour old; a pending job older than a day is marked failed and replaced. A live worker touches its job file once a minute, so a job whose agent is silent inside one long tool call is not mistaken for an abandoned one.
 
 `dispatch_cancel(job_id)` cancels a **pending** job, and also kills a **running** job's `claude` process group when the job was started by the same server instance (the job is marked `cancelled` first, so the worker's trailing write can't undo it; partial work is lost but the progress tail is preserved). On POSIX, descendants in that process group are killed too, releasing inherited pipes and the concurrency slot. A cancel that lands after the job was claimed but before its process spawned is honored too: the process is killed as soon as it starts. A compatibility retry that races cancellation is killed when it registers. A running job started by a *previous* server run can't be killed safely and is left to finish. The response carries an `outcome` of `cancelled`, `cancelled_running`, `running` (not owned by this server), `already_terminal`, or `not_found`.
 

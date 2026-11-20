@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_dispatch.jobs import Job, JobStore, is_valid_job_id
+from agent_dispatch.jobs import ActiveSessionJobError, Job, JobStore, is_valid_job_id
 from agent_dispatch.models import DispatchResult
 
 
@@ -791,6 +791,90 @@ class TestRecoverStalePending:
         store.recover_stale(3600)
         assert store.gc(max_age_seconds=0) == 1
         assert store.get(job.id) is None
+
+
+class TestSessionReservation:
+    """One active job per resumed session — and what may release that hold."""
+
+    def _quiet_running(self, store: JobStore, seconds: float) -> Job:
+        job = store.mark_running(store.create("infra", "t", resume_session_id="s1").id)
+        job.started_at = time.time() - seconds
+        store._write(job)
+        _abandon(store, job.id, seconds)
+        return job
+
+    def test_a_heartbeat_keeps_a_quiet_running_job_alive(self, store: JobStore):
+        # Two hours inside one tool call: no progress write, so only the
+        # heartbeat says the worker is still there.
+        job = self._quiet_running(store, 7200)
+        assert store._running_is_stale(job, time.time(), 3600)
+
+        store.touch(job.id)
+
+        with pytest.raises(ActiveSessionJobError):
+            store.create("infra", "next", resume_session_id="s1")
+        assert store.recover_stale() == 0
+        # ...so the paid result still lands when the worker returns.
+        done = store.finish(job.id, DispatchResult(agent="infra", success=True, result="ok"))
+        assert done is not None and done.status == "done"
+
+    def test_without_a_heartbeat_the_same_job_is_released(self, store: JobStore):
+        job = self._quiet_running(store, 7200)
+        assert store.create("infra", "next", resume_session_id="s1").id != job.id
+
+    def test_touch_never_raises(self, store: JobStore):
+        store.touch("../../etc/passwd")
+        store.touch("0" * 32)
+
+    @pytest.mark.parametrize(("hours", "blocked"), [(5, True), (25, False)])
+    def test_a_pending_job_holds_the_session_only_up_to_the_sweep_bound(
+        self, store: JobStore, hours: int, blocked: bool
+    ):
+        # recover_stale applies this bound only when a server starts; the
+        # reservation check must not depend on that happening.
+        job = store.create("infra", "queued", resume_session_id="s1")
+        job.created_at = time.time() - hours * 3600
+        store._write(job)
+
+        if blocked:
+            with pytest.raises(ActiveSessionJobError) as exc:
+                store.create("infra", "next", resume_session_id="s1")
+            assert f'dispatch_cancel(job_id="{job.id}")' in str(exc.value)
+        else:
+            assert store.create("infra", "next", resume_session_id="s1").status == "pending"
+            # Released means failed, not skipped: a worker that reaches the
+            # old job later must not resume the session beside its successor.
+            assert store.get(job.id).status == "failed"
+            assert store.mark_running(job.id) is None
+
+    def test_the_check_and_the_write_are_one_critical_section(self, store: JobStore):
+        # Every submitter arrives before any record exists. If the scan ran
+        # outside the lock they would all see an empty directory and all
+        # publish; the slow write keeps that window wide open.
+        real_write = store._write
+
+        def slow_write(job: Job) -> None:
+            time.sleep(0.02)
+            real_write(job)
+
+        store._write = slow_write  # type: ignore[method-assign]
+        barrier = threading.Barrier(8)
+        outcomes: list[str] = []
+
+        def submit() -> None:
+            barrier.wait(5)
+            try:
+                store.create("infra", "t", resume_session_id="s1")
+                outcomes.append("created")
+            except ActiveSessionJobError:
+                outcomes.append("refused")
+
+        threads = [threading.Thread(target=submit) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert sorted(outcomes) == ["created"] + ["refused"] * 7
 
 
 class TestJobStoreLocking:
